@@ -1,0 +1,409 @@
+# Сохраните этот текст как facies_boundary.py и запустите:
+#     python facies_boundary.py
+# Если библиотек нет, один раз выполните:
+#     pip install PySide6 opencv-python numpy
+#
+# Программа не определяет название фации и не показывает проценты.
+# Она находит столбики керна и обводит устойчивые изменения текстуры.
+
+from __future__ import annotations
+
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import cv2
+import numpy as np
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QStatusBar,
+    QVBoxLayout,
+    QWidget,
+)
+
+
+@dataclass(frozen=True)
+class TextureInterval:
+    column_index: int
+    left: int
+    right: int
+    top: int
+    bottom: int
+    polygon: tuple[tuple[int, int], ...]
+    evidence: str
+
+
+class TextureBoundaryDetector:
+    """Ищет границы устойчивых текстурных пакетов без классификации фаций."""
+
+    def analyse(self, source_bgr: np.ndarray) -> tuple[np.ndarray, list[TextureInterval]]:
+        if source_bgr is None or source_bgr.size == 0:
+            raise ValueError("Пустое изображение")
+        if source_bgr.ndim != 3 or source_bgr.shape[2] != 3:
+            raise ValueError("Ожидается цветное изображение")
+
+        columns = self._find_core_columns(source_bgr)
+        intervals: list[TextureInterval] = []
+        for index, (left, top, right, bottom) in enumerate(columns, start=1):
+            intervals.extend(self._split_column(source_bgr, index, left, top, right, bottom))
+        return self._render(source_bgr, intervals), intervals
+
+    @staticmethod
+    def _find_core_columns(image: np.ndarray) -> list[tuple[int, int, int, int]]:
+        """Находит длинные серые столбики керна на обычном фоне коробки."""
+        height, width = image.shape[:2]
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        saturation = hsv[:, :, 1]
+        value = hsv[:, :, 2]
+
+        # Керн обычно менее насыщен по цвету, чем коричневая коробка, и темнее белого фона.
+        candidate = (saturation < 70) & (value < 235)
+        column_score = TextureBoundaryDetector._smooth(candidate.mean(axis=0).astype(np.float32), 7)
+        active_columns = column_score >= 0.48
+        min_width = max(10, int(width * 0.018))
+        boxes: list[tuple[int, int, int, int]] = []
+
+        for left, right in TextureBoundaryDetector._runs(active_columns):
+            if right - left < min_width or right - left > width * 0.30:
+                continue
+            row_score = TextureBoundaryDetector._smooth(candidate[:, left:right].mean(axis=1).astype(np.float32), 15)
+            row_runs = TextureBoundaryDetector._runs(row_score >= 0.24)
+            if not row_runs:
+                continue
+            top, bottom = max(row_runs, key=lambda run: run[1] - run[0])
+            if bottom - top < height * 0.25:
+                continue
+            boxes.append((max(0, left - 1), max(0, top - 1), min(width, right + 1), min(height, bottom + 1)))
+
+        if boxes:
+            return boxes
+        return TextureBoundaryDetector._fallback_component_boxes(candidate.astype(np.uint8) * 255)
+
+    @staticmethod
+    def _fallback_component_boxes(candidate: np.ndarray) -> list[tuple[int, int, int, int]]:
+        """Запасной путь для фото, где коробка и керн имеют похожий цвет."""
+        height, width = candidate.shape
+        connected = cv2.morphologyEx(
+            candidate,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (5, max(17, int(height * 0.075)))),
+        )
+        count, _, stats, _ = cv2.connectedComponentsWithStats(connected, connectivity=8)
+        boxes: list[tuple[int, int, int, int]] = []
+        for component in range(1, count):
+            left, top, box_width, box_height, area = stats[component]
+            aspect = box_height / max(box_width, 1)
+            if (
+                box_width >= max(10, int(width * 0.018))
+                and box_width <= width * 0.30
+                and box_height >= height * 0.25
+                and 2.0 <= aspect <= 35.0
+                and area >= box_width * box_height * 0.20
+            ):
+                boxes.append((int(left), int(top), int(left + box_width), int(top + box_height)))
+        return sorted(boxes, key=lambda item: item[0])
+
+    def _split_column(
+        self,
+        image: np.ndarray,
+        column_index: int,
+        left: int,
+        top: int,
+        right: int,
+        bottom: int,
+    ) -> list[TextureInterval]:
+        height = bottom - top
+        width = right - left
+        inset = max(1, int(width * 0.08))
+        analysis_left = min(right - 2, left + inset)
+        analysis_right = max(analysis_left + 2, right - inset)
+
+        roi = image[top:bottom, analysis_left:analysis_right]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        if gray.shape[0] < 20 or gray.shape[1] < 3:
+            return []
+
+        # 35-й перцентиль снижает влияние белых этикеток с номерами проб.
+        row_brightness = np.quantile(gray, 0.35, axis=1)
+        vertical_gradient = np.zeros_like(row_brightness)
+        vertical_gradient[1:] = np.mean(np.abs(np.diff(gray, axis=0)), axis=1)
+
+        brightness = self._smooth(row_brightness, self._odd(max(9, height // 70)))
+        lamination = self._smooth(vertical_gradient, self._odd(max(7, height // 95)))
+        brightness_z = self._robust_scale(brightness)
+        lamination_z = self._robust_scale(lamination)
+
+        # Граница возможна только при устойчивой смене яркости или слоистости.
+        change = np.abs(np.diff(brightness_z, prepend=brightness_z[0])) + 0.65 * np.abs(
+            np.diff(lamination_z, prepend=lamination_z[0])
+        )
+        change = self._smooth(change, self._odd(max(5, height // 160)))
+        boundaries = self._persistent_boundaries(change, height)
+        edges = [0, *boundaries, height]
+        boundary_curves = self._boundary_curves(gray, boundaries, analysis_left)
+
+        intervals: list[TextureInterval] = []
+        for local_top, local_bottom in zip(edges[:-1], edges[1:]):
+            if local_bottom - local_top < max(8, height // 120):
+                continue
+            mean_brightness = float(np.mean(brightness_z[local_top:local_bottom]))
+            mean_lamination = float(np.mean(lamination_z[local_top:local_bottom]))
+            intervals.append(
+                TextureInterval(
+                    column_index=column_index,
+                    left=left,
+                    right=right,
+                    top=top + local_top,
+                    bottom=top + local_bottom,
+                    polygon=self._package_polygon(
+                        left, right, analysis_left, analysis_right, top,
+                        local_top, local_bottom, boundary_curves,
+                    ),
+                    evidence=self._texture_evidence(mean_brightness, mean_lamination),
+                )
+            )
+        return intervals
+
+    @staticmethod
+    def _persistent_boundaries(change: np.ndarray, height: int) -> list[int]:
+        # Не считать отдельную тонкую ламинацию самостоятельной фацией.
+        minimum_package_height = max(28, int(height * 0.075))
+        median = float(np.median(change))
+        mad = float(np.median(np.abs(change - median)))
+        threshold = max(float(np.quantile(change, 0.94)), median + 1.85 * mad)
+        candidates = [
+            index
+            for index in range(2, len(change) - 2)
+            if change[index] >= threshold and change[index] >= change[index - 1] and change[index] >= change[index + 1]
+        ]
+
+        accepted: list[int] = []
+        for index in sorted(candidates, key=lambda item: float(change[item]), reverse=True):
+            if index < minimum_package_height or height - index < minimum_package_height:
+                continue
+            if all(abs(index - existing) >= minimum_package_height for existing in accepted):
+                accepted.append(index)
+        return sorted(accepted)
+
+    @staticmethod
+    def _boundary_curves(
+        gray: np.ndarray,
+        boundaries: list[int],
+        image_x_start: int,
+    ) -> dict[int, list[tuple[int, int]]]:
+        """Превращает прямую границу в сглаженную кривую по локальной текстуре."""
+        height, width = gray.shape
+        vertical_edges = np.abs(np.diff(gray, axis=0))
+        vertical_edges = cv2.GaussianBlur(vertical_edges, (5, 9), 0)
+        curves: dict[int, list[tuple[int, int]]] = {}
+        search_radius = max(5, min(14, height // 30))
+
+        for boundary in boundaries:
+            low = max(1, boundary - search_radius)
+            high = min(height - 2, boundary + search_radius)
+            picks = []
+            for x in range(width):
+                profile = vertical_edges[low:high + 1, x]
+                picks.append(float(low + int(np.argmax(profile))))
+            smooth_picks = TextureBoundaryDetector._smooth(np.asarray(picks, dtype=np.float32), 17)
+            curves[boundary] = [
+                (image_x_start + x, int(np.clip(round(y), low, high)))
+                for x, y in enumerate(smooth_picks)
+            ]
+        return curves
+
+    @staticmethod
+    def _package_polygon(
+        left: int,
+        right: int,
+        analysis_left: int,
+        analysis_right: int,
+        image_top: int,
+        local_top: int,
+        local_bottom: int,
+        curves: dict[int, list[tuple[int, int]]],
+    ) -> tuple[tuple[int, int], ...]:
+        width = analysis_right - analysis_left
+        if local_top in curves:
+            top_curve = [(x, image_top + y) for x, y in curves[local_top]]
+        else:
+            top_curve = [(analysis_left + x, image_top + local_top) for x in range(width)]
+        if local_bottom in curves:
+            bottom_curve = [(x, image_top + y) for x, y in curves[local_bottom]]
+        else:
+            bottom_curve = [(analysis_left + x, image_top + local_bottom) for x in range(width)]
+
+        return tuple([
+            (left, top_curve[0][1]),
+            *top_curve,
+            (right - 1, top_curve[-1][1]),
+            (right - 1, bottom_curve[-1][1]),
+            *reversed(bottom_curve),
+            (left, bottom_curve[0][1]),
+        ])
+
+    @staticmethod
+    def _texture_evidence(brightness: float, lamination: float) -> str:
+        if lamination >= 0.58:
+            return "high lamination density"
+        if brightness >= 0.64:
+            return "pale comparatively uniform texture"
+        if brightness <= 0.35:
+            return "dark comparatively uniform texture"
+        return "persistent change of visual texture"
+
+    @staticmethod
+    def _render(source: np.ndarray, intervals: list[TextureInterval]) -> np.ndarray:
+        result = source.copy()
+        overlay = result.copy()
+        color = (240, 190, 40)  # Один нейтральный цвет; это не код фации.
+        for interval in intervals:
+            cv2.rectangle(overlay, (interval.left, interval.top), (interval.right - 1, interval.bottom - 1), color, -1)
+        result = cv2.addWeighted(overlay, 0.16, result, 0.84, 0)
+        for interval in intervals:
+            cv2.rectangle(result, (interval.left, interval.top), (interval.right - 1, interval.bottom - 1), color, 2)
+        return result
+
+    @staticmethod
+    def _smooth(values: np.ndarray, window: int) -> np.ndarray:
+        if window <= 1:
+            return values.copy()
+        padded = np.pad(values, (window // 2, window // 2), mode="edge")
+        return np.convolve(padded, np.ones(window, dtype=np.float32) / window, mode="valid")
+
+    @staticmethod
+    def _robust_scale(values: np.ndarray) -> np.ndarray:
+        lower, upper = np.quantile(values, [0.05, 0.95])
+        if upper - lower < 1e-6:
+            return np.full_like(values, 0.5)
+        return np.clip((values - lower) / (upper - lower), 0.0, 1.0)
+
+    @staticmethod
+    def _odd(value: int) -> int:
+        return value if value % 2 else value + 1
+
+    @staticmethod
+    def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
+        padded = np.pad(mask.astype(np.int8), (1, 1))
+        changes = np.diff(padded)
+        starts = np.flatnonzero(changes == 1)
+        ends = np.flatnonzero(changes == -1)
+        return list(zip(starts.tolist(), ends.tolist()))
+
+
+class BoundaryWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Границы текстурных пакетов керна")
+        self.resize(1440, 860)
+        self.detector = TextureBoundaryDetector()
+        self.source_path: Path | None = None
+        self.annotated_bgr: np.ndarray | None = None
+
+        root = QWidget(self)
+        layout = QVBoxLayout(root)
+        controls = QHBoxLayout()
+        open_button = QPushButton("Загрузить фото")
+        open_button.clicked.connect(self.open_image)
+        save_button = QPushButton("Сохранить результат")
+        save_button.clicked.connect(self.save_image)
+        self.summary = QLabel("Загрузите фотографию керна. Справа появятся только контуры пакетов.")
+        self.summary.setWordWrap(True)
+        controls.addWidget(open_button)
+        controls.addWidget(save_button)
+        controls.addWidget(self.summary, 1)
+        layout.addLayout(controls)
+
+        images = QHBoxLayout()
+        self.original = self._image_label("Исходное фото")
+        self.result = self._image_label("Границы текстурных пакетов")
+        images.addWidget(self._scrollable(self.original), 1)
+        images.addWidget(self._scrollable(self.result), 1)
+        layout.addLayout(images, 1)
+        self.setCentralWidget(root)
+        self.setStatusBar(QStatusBar(self))
+        self.statusBar().showMessage("Алгоритм не определяет фацию — он показывает только устойчивую смену текстуры.")
+
+    @staticmethod
+    def _image_label(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setMinimumSize(500, 600)
+        label.setStyleSheet("QLabel { background: #f4f4f4; border: 1px solid #cfcfcf; }")
+        return label
+
+    @staticmethod
+    def _scrollable(label: QLabel) -> QScrollArea:
+        area = QScrollArea()
+        area.setWidget(label)
+        area.setWidgetResizable(True)
+        return area
+
+    def open_image(self) -> None:
+        file_name, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выберите фотографию керна",
+            str(self.source_path.parent if self.source_path else Path.home()),
+            "Images (*.png *.jpg *.jpeg *.tif *.tiff *.bmp)",
+        )
+        if not file_name:
+            return
+        image = cv2.imdecode(np.fromfile(file_name, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            QMessageBox.critical(self, "Ошибка", "Не удалось открыть изображение.")
+            return
+        try:
+            annotated, intervals = self.detector.analyse(image)
+        except Exception as error:
+            QMessageBox.critical(self, "Ошибка анализа", str(error))
+            return
+
+        self.source_path = Path(file_name)
+        self.annotated_bgr = annotated
+        self._show_image(self.original, image)
+        self._show_image(self.result, annotated)
+        if intervals:
+            columns = len({item.column_index for item in intervals})
+            self.summary.setText(f"Найдено столбиков: {columns}; текстурных пакетов: {len(intervals)}.")
+        else:
+            self.summary.setText("Столбики керна не найдены. Попробуйте более контрастную фотографию.")
+
+    def save_image(self) -> None:
+        if self.annotated_bgr is None or self.source_path is None:
+            QMessageBox.information(self, "Нет результата", "Сначала загрузите фотографию.")
+            return
+        default = self.source_path.with_name(self.source_path.stem + "_boundaries.png")
+        file_name, _ = QFileDialog.getSaveFileName(self, "Сохранить разметку", str(default), "PNG (*.png)")
+        if not file_name:
+            return
+        ok, encoded = cv2.imencode(".png", self.annotated_bgr)
+        if not ok:
+            QMessageBox.critical(self, "Ошибка", "Не удалось подготовить PNG.")
+            return
+        encoded.tofile(file_name)
+        self.statusBar().showMessage("Сохранено: " + file_name)
+
+    @staticmethod
+    def _show_image(label: QLabel, bgr: np.ndarray) -> None:
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        height, width, channels = rgb.shape
+        qimage = QImage(rgb.data, width, height, channels * width, QImage.Format.Format_RGB888).copy()
+        pixmap = QPixmap.fromImage(qimage)
+        label.setPixmap(pixmap)
+        label.resize(pixmap.size())
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = BoundaryWindow()
+    window.show()
+    raise SystemExit(app.exec())
