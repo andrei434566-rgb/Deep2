@@ -25,6 +25,10 @@
   завершения скачайте артефакт `DeepCore_2-Windows`, распакуйте его и запускайте
   `DeepCore_2.exe`.
 
+При отправке тега вида `v1.0.0` GitHub также создаёт постоянный Release с
+файлом `DeepCore_2-Windows.zip`. Его можно скачать по адресу
+`https://github.com/andrei434566-rgb/Deep2/releases/latest/download/DeepCore_2-Windows.zip`.
+
 На другой ПК нужно переносить всю распакованную папку сборки, а не только один
 `.exe`: PySide6, YOLO и модель находятся в соседней папке `_internal`.
 

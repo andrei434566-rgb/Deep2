@@ -4,9 +4,10 @@ on:
   workflow_dispatch:
   push:
     branches: [main, master]
+    tags: ['v*']
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -45,3 +46,15 @@ jobs:
           path: dist/DeepCore_2
           if-no-files-found: error
           retention-days: 30
+
+      - name: Create ZIP for GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: Compress-Archive -Path dist/DeepCore_2/* -DestinationPath DeepCore_2-Windows.zip
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: DeepCore_2-Windows.zip
