@@ -944,7 +944,8 @@ class PhotoItem(QGraphicsObject):
         painter.setPen(QPen(QColor("#7169df") if self.isSelected() else QColor("#dfe3ec"), 2 if self.isSelected() else 1))
         painter.drawRoundedRect(self._rect, 8, 8)
         painter.setPen(QColor("#5149ca"))
-        painter.drawText(QRectF(8, 3, self.CARD_WIDTH - 16, 17), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, f"\u0421\u041a\u0412. {self.record.well_name or '\u0421\u043a\u0432\u0430\u0436\u0438\u043d\u0430 1'}")
+        well_name = self.record.well_name or "\u0421\u043a\u0432\u0430\u0436\u0438\u043d\u0430 1"
+        painter.drawText(QRectF(8, 3, self.CARD_WIDTH - 16, 17), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, "\u0421\u041a\u0412. " + well_name)
         painter.setPen(QColor("#34394c"))
         painter.drawText(QRectF(8, 20, self.CARD_WIDTH - 16, 20), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.record.path.split("/")[-1].split("\\")[-1])
         painter.drawPixmap(self.preview_rect.toRect(), self.record.pixmap)
