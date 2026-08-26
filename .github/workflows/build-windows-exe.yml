@@ -31,8 +31,11 @@ jobs:
         run: >-
           python -m PyInstaller --noconfirm --clean --onedir --windowed
           --name DeepCore_2
+          --paths .
           --add-data "models\\best.pt;models"
+          --add-data "app;app"
           --hidden-import app.ui.widgets.workspace_canvas
+          --collect-submodules app
           --collect-all PySide6
           --collect-all ultralytics
           --collect-all torch

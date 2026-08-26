@@ -11,8 +11,11 @@ py -3.11 -m pip install -r requirements.txt pyinstaller
 if errorlevel 1 goto :error
 
 py -3.11 -m PyInstaller --noconfirm --clean --onedir --windowed --name DeepCore_2 ^
+  --paths . ^
   --add-data "models\best.pt;models" ^
+  --add-data "app;app" ^
   --hidden-import app.ui.widgets.workspace_canvas ^
+  --collect-submodules app ^
   --collect-all PySide6 ^
   --collect-all ultralytics ^
   --collect-all torch ^
