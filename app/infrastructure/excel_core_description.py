@@ -106,21 +106,21 @@ def read_description_workbook(path: Path) -> tuple[list[DescriptionLayer], list[
     issues: list[ImportIssue] = []
     for sheet in workbook.worksheets:
         columns = _find_columns(sheet)
-        required = {"well", "facies_top", "facies_base"}
-        if not required.issubset(columns):
+        has_pair = {"facies_top", "facies_base"}.issubset(columns)
+        has_range = "facies_interval" in columns
+        sheet_well = _well_from_sheet_title(sheet.title) if "well" not in columns else ""
+        if not (has_pair or has_range) or ("well" not in columns and not sheet_well):
             continue
-        for row in range(1, sheet.max_row + 1):
-            try:
-                top = _as_float(sheet.cell(row, columns["facies_top"]).value)
-                base = _as_float(sheet.cell(row, columns["facies_base"]).value)
-            except ValueError:
-                continue
+        last_well = ""
+        for row in range(columns.get("data_start", 1), sheet.max_row + 1):
+            top, base = _row_interval(sheet, row, columns)
             if top is None or base is None or base <= top:
                 continue
-            well = _display_text(sheet.cell(row, columns["well"]).value)
+            well = _display_text(_cell_value(sheet, row, columns.get("well"))) or last_well or sheet_well
             if not well:
                 issues.append(ImportIssue(f"{sheet.title}!{row}", "Не указан номер скважины."))
                 continue
+            last_well = well
             name = _display_text(_cell_value(sheet, row, columns.get("facies_name")))
             code = _display_text(_cell_value(sheet, row, columns.get("facies_code")))
             index = _display_text(_cell_value(sheet, row, columns.get("facies_index")))
@@ -130,6 +130,8 @@ def read_description_workbook(path: Path) -> tuple[list[DescriptionLayer], list[
                 for field in EXCEL_FACIES_ATTRIBUTE_FIELDS
                 if (value := _display_text(_cell_value(sheet, row, columns.get(f"attribute:{field}"))))
             }
+            if _looks_like_column_number_row(name, code, index, description):
+                continue
             if not (name or code or index):
                 issues.append(ImportIssue(f"{sheet.title}!{row}", "Нет названия, индекса или кода фации."))
                 continue
@@ -151,8 +153,8 @@ def read_description_workbook(path: Path) -> tuple[list[DescriptionLayer], list[
             )
     if not layers:
         raise ValueError(
-            "Не найдены строки с интервалом фации. Нужны колонки «№ скв.», "
-            "«Интервал фации по бурению: Кровля/Подошва» и название либо код фации."
+            "Не найдены строки с интервалом фации. Укажите скважину, верх/низ "
+            "(или один столбец с интервалом) и название, код либо индекс фации."
         )
     return sorted(layers, key=lambda item: (_well_key(item.well), item.top, item.base)), issues
 
@@ -255,40 +257,91 @@ def create_depth_bound_detections(
 
 
 def _find_columns(sheet) -> dict[str, int]:
-    """Locate semantic columns despite the form's merged multi-row headings."""
-    header_rows = min(24, sheet.max_row)
-    columns: dict[str, int] = {}
-    descriptions: list[tuple[int, str]] = []
-    for column in range(1, sheet.max_column + 1):
-        text = " ".join(
-            _normalized(_merged_value(sheet, row, column))
-            for row in range(1, header_rows + 1)
-            if _merged_value(sheet, row, column) is not None
+    """Find description fields by meaning instead of a fixed Excel template.
+
+    Excel descriptions in the field commonly have two or three header rows,
+    merged group labels and slightly different wording.  We combine only the
+    actual header rows, then score each column for every required role.  This
+    keeps "Кровля" of the *facies* interval separate from core/GIS intervals.
+    """
+    header_end = _header_end_row(sheet)
+    descriptions = [
+        (
+            column,
+            " ".join(
+                _normalized(_merged_value(sheet, row, column))
+                for row in range(1, header_end + 1)
+                if _merged_value(sheet, row, column) is not None
+            ),
         )
-        descriptions.append((column, text))
-    for column, text in descriptions:
-        if "название фации" in text:
-            columns["facies_name"] = column
-        elif "код фации" in text:
-            columns["facies_code"] = column
-        elif "индекс фации" in text:
-            columns["facies_index"] = column
-        elif "краткое описание" in text:
-            columns["description"] = column
-        elif "№ скв" in text or "no скв" in text or "номер скваж" in text:
-            columns["well"] = column
-        elif "интервал фации" in text and "кровля" in text:
-            columns["facies_top"] = column
-        elif "интервал фации" in text and "подошва" in text:
-            columns["facies_base"] = column
-        elif "интервал отбора керна" in text and "кровля" in text:
-            columns["core_top"] = column
-        elif "интервал отбора керна" in text and "подошва" in text:
-            columns["core_base"] = column
-        for field in EXCEL_FACIES_ATTRIBUTE_FIELDS:
-            if _normalized(field) in text:
+        for column in range(1, sheet.max_column + 1)
+    ]
+    columns: dict[str, int] = {"data_start": header_end + 1}
+    for role in ("well", "facies_name", "facies_code", "facies_index", "description", "facies_top", "facies_base", "core_top", "core_base"):
+        if column := _best_column(descriptions, role):
+            columns[role] = column
+    # A number of exports put both limits in one cell: "3915,00–3915,55".
+    # Use it only when a top/base pair was not identified.
+    if not {"facies_top", "facies_base"}.issubset(columns):
+        if column := _best_column(descriptions, "facies_interval"):
+            columns["facies_interval"] = column
+    for field in EXCEL_FACIES_ATTRIBUTE_FIELDS:
+        needle = _normalized(field)
+        for column, text in descriptions:
+            if needle in text:
                 columns[f"attribute:{field}"] = column
+                break
     return columns
+
+
+def _header_end_row(sheet) -> int:
+    """Return the final header row without treating the data area as a header."""
+    limit = min(30, sheet.max_row)
+    header_words = ("скваж", "скв", "интервал", "кровл", "подошв", "глубин", "описан", "depth", "well", "from", "to", "индекс", "код", "название")
+    last = 1
+    for row in range(1, limit + 1):
+        text = " ".join(_normalized(_merged_value(sheet, row, column)) for column in range(1, sheet.max_column + 1))
+        if any(word in text for word in header_words):
+            last = row
+    return last
+
+
+def _best_column(descriptions: list[tuple[int, str]], role: str) -> int | None:
+    scored = [(column, _column_score(text, role)) for column, text in descriptions]
+    column, score = max(scored, key=lambda item: item[1], default=(0, 0))
+    return column if score > 0 else None
+
+
+def _column_score(text: str, role: str) -> int:
+    def has(*needles: str) -> bool:
+        return any(needle in text for needle in needles)
+
+    facies_group = 90 if has("интервал фаци", "facies interval", "facies depth") else 0
+    generic_interval = 35 if has("интервал", "глубин", "depth") else 0
+    core_group = 70 if has("отбор керна", "core interval", "керн") else 0
+    direction_top = 30 if has("кровл", "верх", "от", "from", "top") else 0
+    direction_base = 30 if has("подошв", "низ", "до", "to", "base", "bottom") else 0
+    if role == "well":
+        return 100 if has("скваж", "№ скв", "no скв", "well") else 0
+    if role == "facies_name":
+        return 100 if has("название фаци", "наименование фаци", "facies name") else (55 if has("литофаци", "фация") and not has("индекс", "код", "ассоциац") else 0)
+    if role == "facies_code":
+        return 100 if has("код фаци", "facies code") or ("фациальн" in text and "код" in text) else 0
+    if role == "facies_index":
+        return 100 if has("индекс фаци", "facies index") or ("фациальн" in text and "индекс" in text) else 0
+    if role == "description":
+        return 100 if has("краткое описание") else (70 if has("описан", "характерист", "description") else 0)
+    if role == "facies_top":
+        return facies_group + direction_top if facies_group and direction_top else (generic_interval + direction_top if direction_top else 0)
+    if role == "facies_base":
+        return facies_group + direction_base if facies_group and direction_base else (generic_interval + direction_base if direction_base else 0)
+    if role == "core_top":
+        return core_group + direction_top if core_group and direction_top else 0
+    if role == "core_base":
+        return core_group + direction_base if core_group and direction_base else 0
+    if role == "facies_interval":
+        return facies_group or generic_interval
+    return 0
 
 
 def _merged_value(sheet, row: int, column: int):
@@ -302,7 +355,41 @@ def _merged_value(sheet, row: int, column: int):
 
 
 def _cell_value(sheet, row: int, column: int | None):
-    return sheet.cell(row, column).value if column is not None else None
+    return _merged_value(sheet, row, column) if column is not None else None
+
+
+def _row_interval(sheet, row: int, columns: dict[str, int]) -> tuple[float | None, float | None]:
+    top = _as_float(_cell_value(sheet, row, columns.get("facies_top")))
+    base = _as_float(_cell_value(sheet, row, columns.get("facies_base")))
+    if top is not None and base is not None:
+        return top, base
+    value = _cell_value(sheet, row, columns.get("facies_interval"))
+    return _as_interval(value)
+
+
+def _as_interval(value) -> tuple[float | None, float | None]:
+    """Read a pair such as ``3915,00–3915,55`` from one Excel cell."""
+    text = _display_text(value).replace("−", "-").replace("–", "-").replace("—", "-")
+    # The hyphen between two positive depths is a separator, not a minus sign.
+    # (Negative depths are still handled by separate top/base columns.)
+    values = re.findall(r"\d+(?:[.,]\d+)?", text)
+    if len(values) < 2:
+        return None, None
+    return _as_float(values[0]), _as_float(values[1])
+
+
+def _looks_like_column_number_row(*values: str) -> bool:
+    """Ignore form rows like 1, 2, …, 23 printed beneath a header."""
+    present = [value for value in values if value]
+    return bool(present) and all(re.fullmatch(r"\d{1,2}", value) for value in present)
+
+
+def _well_from_sheet_title(title: str) -> str:
+    """Use a sheet title only when it plausibly identifies a well."""
+    text = _display_text(title)
+    if not text or _normalized(text) in {"лист1", "sheet1", "sheet", "данные"}:
+        return ""
+    return text
 
 
 def _attributes_from_description(layer: DescriptionLayer) -> dict[str, str]:
@@ -362,4 +449,6 @@ def _normalized(value) -> str:
 
 
 def _well_key(value: str) -> str:
-    return re.sub(r"[^a-zа-я0-9]+", "", _normalized(value))
+    text = _normalized(value)
+    text = re.sub(r"\b(?:скважина|скв|well)\b", "", text)
+    return re.sub(r"[^a-zа-я0-9]+", "", text)
