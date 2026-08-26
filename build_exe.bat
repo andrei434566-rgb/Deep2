@@ -12,6 +12,7 @@ if errorlevel 1 goto :error
 
 py -3.11 -m PyInstaller --noconfirm --clean --onedir --windowed --name DeepCore_2 ^
   --add-data "models\best.pt;models" ^
+  --hidden-import app.ui.widgets.workspace_canvas ^
   --collect-all PySide6 ^
   --collect-all ultralytics ^
   --collect-all torch ^
