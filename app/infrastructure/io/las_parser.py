@@ -1,4 +1,4 @@
-"""Small LAS reader transferred from the DeepCore project."""
+"""Small LAS reader transferred from the Kern Analyzer project."""
 
 from __future__ import annotations
 

@@ -7,7 +7,7 @@ from app.domain.facies_catalog import FACIES_CATALOG, facies_metadata, facies_ti
 from app.domain.lithology_attributes import LITHOLOGY_ATTRIBUTE_OPTIONS
 
 
-CUSTOM_VALUE = "__deepcore_custom_value__"
+CUSTOM_VALUE = "__kern_analyzer_custom_value__"
 FACIES_REFERENCE_FIELDS = {
     "Код фации",
     "Индекс фации",
@@ -47,7 +47,7 @@ class FaciesDialog(QDialog):
             and key not in {"Цвет насыщения", "Цвет литологии"}
             and key not in FACIES_REFERENCE_FIELDS
         }
-        self.settings = QSettings("DeepCore", "DeepCore2")
+        self.settings = QSettings("Kern Analyzer", "KernAnalyzer")
         self.attribute_combos: dict[str, QComboBox] = {}
 
         layout = QVBoxLayout(self)

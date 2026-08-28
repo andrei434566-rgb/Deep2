@@ -1,1 +1,1 @@
-"""File readers used by the DeepCore 2 workspace."""
+"""File readers used by the Kern Analyzer workspace."""

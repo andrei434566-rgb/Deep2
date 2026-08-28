@@ -1,4 +1,4 @@
-"""Folder-based project persistence for DeepCore 2."""
+"""Folder-based project persistence for Kern Analyzer."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ def save_project(
             shutil.copy2(source, target)
             record.path = str(target)
     payload = {
-        "format": "deepcore2-project",
+        "format": "kern_analyzer-project",
         "title": title,
         "wells": list(wells or []),
         "photos": [
@@ -49,6 +49,7 @@ def save_project(
                 "photo_depth_from": record.photo_depth_from,
                 "photo_depth_to": record.photo_depth_to,
                 "depth_segments": record.depth_segments,
+                "core_columns": record.core_columns,
                 "display_size": [record.pixmap.width(), record.pixmap.height()],
                 "position": [positions.get(record.identifier, QPointF()).x(), positions.get(record.identifier, QPointF()).y()],
                 "detections": [
@@ -76,8 +77,8 @@ def save_project(
 def load_project(folder: Path) -> tuple[str, list[PhotoRecord], dict[str, QPointF], list[str], list[dict]]:
     manifest = folder / MANIFEST_NAME
     payload = json.loads(manifest.read_text(encoding="utf-8"))
-    if payload.get("format") != "deepcore2-project":
-        raise ValueError("Выбранная папка не является проектом DeepCore 2")
+    if payload.get("format") != "kern_analyzer-project":
+        raise ValueError("Выбранная папка не является проектом Kern Analyzer")
 
     records: list[PhotoRecord] = []
     positions: dict[str, QPointF] = {}
@@ -126,6 +127,14 @@ def load_project(folder: Path) -> tuple[str, list[PhotoRecord], dict[str, QPoint
                     }
                     for segment in item.get("depth_segments", [])
                     if isinstance(segment, dict)
+                ],
+                core_columns=[
+                    {
+                        str(key): float(value) * (x_scale if str(key) in {"left", "right"} else y_scale if str(key) in {"top", "bottom"} else 1.0)
+                        for key, value in column.items()
+                    }
+                    for column in item.get("core_columns", [])
+                    if isinstance(column, dict)
                 ],
             )
         )

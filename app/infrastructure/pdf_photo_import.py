@@ -1,4 +1,4 @@
-"""Render PDF pages into image files that DeepCore can annotate."""
+"""Render PDF pages into image files that Kern Analyzer can annotate."""
 
 from __future__ import annotations
 

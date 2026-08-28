@@ -144,23 +144,32 @@ def _layer_rows(well: dict) -> list[tuple[str, str, str]]:
     return rows
 
 
-EXPORTED_FACIES_FIELDS = (
-    "Энергия среды",
-    "Гидродинамический режим",
-    *LITHOLOGY_ATTRIBUTE_OPTIONS.keys(),
-)
+# The field guide contains 16 lithological parameters.  The client template
+# keeps them as one readable description, rather than widening the Excel form
+# with sixteen technical columns.
+LITHOLOGY_DESCRIPTION_FIELDS = tuple(LITHOLOGY_ATTRIBUTE_OPTIONS.keys())
 
 OFFICIAL_HEADERS = (
     "Месторождение", "№ скв.", "№ долбления", "Интервал отбора керна, м\nКровля",
     "Интервал отбора керна, м\nПодошва", "Проходка, м", "Вынос керна, м", "Вынос, %",
     "Интервал фации, м\nКровля", "Интервал фации, м\nПодошва", "№ слоя",
     "Толщина фации, м", "Индекс фации", "Название фации", "Код фации",
-    "Краткое описание", "Примечание", *EXPORTED_FACIES_FIELDS,
+    "Краткое описание", "Примечание", "Литологическое описание (16 параметров)",
 )
 
 
 def _text(value: object, default: str = "") -> str:
     return default if value in (None, "") else str(value)
+
+
+def _lithology_description(attributes: dict[str, object]) -> str:
+    """Render all selected guide parameters into one editable cell."""
+    lines = [
+        f"{field}: {_text(attributes.get(field))}"
+        for field in LITHOLOGY_DESCRIPTION_FIELDS
+        if _text(attributes.get(field))
+    ]
+    return "\n".join(lines)
 
 
 def _official_rows(project_title: str, wells: list[dict]) -> list[list[object]]:
@@ -189,7 +198,7 @@ def _official_rows(project_title: str, wells: list[dict]) -> list[list[object]]:
                 if core_interval[0] is not None and core_interval[1] is not None else "",
                 "", "", top, base, layer_index, thickness, facies, name,
                 _text(attributes.get("Код фации")), description, _text(attributes.get("Примечание")),
-                *[_text(attributes.get(field)) for field in EXPORTED_FACIES_FIELDS],
+                _lithology_description(attributes),
             ])
     return rows
 
@@ -235,17 +244,17 @@ def _export_xlsx(file_path: Path, project_title: str, wells: list[dict]) -> None
             cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
     sheet.row_dimensions[1].height = 28
     sheet.row_dimensions[3].height = 30
-    sheet.row_dimensions[4].height = 42
+    sheet.row_dimensions[4].height = 54
     for row_number, row in enumerate(_official_rows(project_title, wells), 5):
         for column, value in enumerate(row, 1):
             cell = sheet.cell(row_number, column, value)
             cell.font = Font(name="Times New Roman", size=9)
             cell.alignment = Alignment(horizontal="center" if column < 16 else "left", vertical="top", wrap_text=True)
             cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
-        sheet.row_dimensions[row_number].height = max(34, min(130, 13 * (1 + len(str(row[15])) // 80)))
+        text_length = max(len(str(row[15])), len(str(row[17])))
+        sheet.row_dimensions[row_number].height = max(34, min(180, 13 * (1 + text_length // 65)))
     widths = (
-        18, 12, 11, 11, 11, 11, 12, 9, 11, 11, 9, 11, 14, 22, 11, 32, 24,
-        *[max(16, min(28, round(len(field) * 0.85))) for field in EXPORTED_FACIES_FIELDS],
+        18, 12, 11, 11, 11, 11, 12, 9, 11, 11, 9, 11, 14, 22, 11, 32, 24, 48,
     )
     for index, width in enumerate(widths, 1):
         sheet.column_dimensions[get_column_letter(index)].width = width
@@ -351,12 +360,12 @@ def _export_docx(file_path: Path, project_title: str, wells: list[dict]) -> None
         style.font.size = Pt(size)
         style.font.color.rgb = RGBColor.from_string(color)
     header = section.header.paragraphs[0]
-    header.text = "DeepCore 2 | Керн и описание"
+    header.text = "Kern Analyzer | Керн и описание"
     header.style = styles["Normal"]
     header.runs[0].font.color.rgb = RGBColor(100, 110, 130)
     footer = section.footer.paragraphs[0]
     footer.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    footer.add_run("Сформировано DeepCore 2")
+    footer.add_run("Сформировано Kern Analyzer")
 
     title = document.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -371,7 +380,7 @@ def _export_docx(file_path: Path, project_title: str, wells: list[dict]) -> None
     subtitle.add_run(f"Проект: {project_title or 'Без названия'}\nСформировано: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
     subtitle.paragraph_format.space_after = Pt(14)
 
-    with TemporaryDirectory(prefix="deepcore-report-") as temp_dir:
+    with TemporaryDirectory(prefix="kern_analyzer-report-") as temp_dir:
         temp = Path(temp_dir)
         for well_index, well in enumerate(wells, 1):
             if well_index > 1:
@@ -437,8 +446,8 @@ def _export_pdf(file_path: Path, project_title: str, wells: list[dict]) -> None:
         Path("C:/Windows/Fonts/calibri.ttf"),
     ):
         if candidate.exists():
-            pdfmetrics.registerFont(TTFont("DeepCoreReport", str(candidate)))
-            font_name = "DeepCoreReport"
+            pdfmetrics.registerFont(TTFont("Kern AnalyzerReport", str(candidate)))
+            font_name = "Kern AnalyzerReport"
             break
     document = SimpleDocTemplate(
         str(file_path),
@@ -447,20 +456,20 @@ def _export_pdf(file_path: Path, project_title: str, wells: list[dict]) -> None:
         rightMargin=12 * mm,
         topMargin=12 * mm,
         bottomMargin=12 * mm,
-        title=f"DeepCore 2 - {project_title}",
+        title=f"Kern Analyzer - {project_title}",
     )
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("DeepCoreTitle", parent=styles["Title"], fontName=font_name, fontSize=18, leading=22, textColor=colors.HexColor("#1f4d78"), alignment=1, spaceAfter=5 * mm)
-    heading_style = ParagraphStyle("DeepCoreHeading", parent=styles["Heading1"], fontName=font_name, fontSize=14, leading=17, textColor=colors.HexColor("#2e74b5"), spaceBefore=5 * mm, spaceAfter=3 * mm)
-    body_style = ParagraphStyle("DeepCoreBody", parent=styles["BodyText"], fontName=font_name, fontSize=8.5, leading=11, textColor=colors.HexColor("#303846"))
-    small_style = ParagraphStyle("DeepCoreSmall", parent=body_style, fontSize=7, leading=9)
+    title_style = ParagraphStyle("Kern AnalyzerTitle", parent=styles["Title"], fontName=font_name, fontSize=18, leading=22, textColor=colors.HexColor("#1f4d78"), alignment=1, spaceAfter=5 * mm)
+    heading_style = ParagraphStyle("Kern AnalyzerHeading", parent=styles["Heading1"], fontName=font_name, fontSize=14, leading=17, textColor=colors.HexColor("#2e74b5"), spaceBefore=5 * mm, spaceAfter=3 * mm)
+    body_style = ParagraphStyle("Kern AnalyzerBody", parent=styles["BodyText"], fontName=font_name, fontSize=8.5, leading=11, textColor=colors.HexColor("#303846"))
+    small_style = ParagraphStyle("Kern AnalyzerSmall", parent=body_style, fontSize=7, leading=9)
     story = [
         Paragraph("ОТЧЁТ ПО КЕРНУ И ОПИСАНИЮ", title_style),
         Paragraph(f"Проект: {project_title or 'Без названия'}<br/>Сформировано: {datetime.now().strftime('%d.%m.%Y %H:%M')}", body_style),
         Spacer(1, 3 * mm),
     ]
     available_width = document.width
-    with TemporaryDirectory(prefix="deepcore-report-pdf-") as temp_dir:
+    with TemporaryDirectory(prefix="kern_analyzer-report-pdf-") as temp_dir:
         temp = Path(temp_dir)
         for well_index, well in enumerate(wells, 1):
             if well_index > 1:
@@ -545,7 +554,7 @@ def _export_docx_official_form(file_path: Path, project_title: str, wells: list[
     subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
     table = document.add_table(rows=1, cols=len(OFFICIAL_HEADERS))
     table.style = "Table Grid"
-    widths = [900, 650, 580, 620, 620, 580, 620, 460, 620, 620, 440, 560, 720, 1250, 620, 3000, 1200]
+    widths = [900, 650, 580, 620, 620, 580, 620, 460, 620, 620, 440, 560, 720, 1250, 620, 2600, 1200, 3400]
     _set_table_widths(table, widths)
     for cell, header in zip(table.rows[0].cells, OFFICIAL_HEADERS):
         cell.text = header
@@ -583,8 +592,8 @@ def _export_pdf_official_form(file_path: Path, project_title: str, wells: list[d
     font_name = "Helvetica"
     for candidate in (Path("C:/Windows/Fonts/arial.ttf"), Path("C:/Windows/Fonts/calibri.ttf")):
         if candidate.exists():
-            pdfmetrics.registerFont(TTFont("DeepCoreOfficial", str(candidate)))
-            font_name = "DeepCoreOfficial"
+            pdfmetrics.registerFont(TTFont("Kern AnalyzerOfficial", str(candidate)))
+            font_name = "Kern AnalyzerOfficial"
             break
     document = SimpleDocTemplate(
         str(file_path), pagesize=landscape(A3), leftMargin=7 * mm, rightMargin=7 * mm,
@@ -606,7 +615,7 @@ def _export_pdf_official_form(file_path: Path, project_title: str, wells: list[d
             Paragraph("" if value is None else str(value).replace("\n", "<br/>"), description_style if index >= 15 else text_style)
             for index, value in enumerate(row)
         ])
-    widths = [16, 12, 11, 12, 12, 11, 12, 9, 12, 12, 9, 11, 14, 24, 12, 60, 27]
+    widths = [16, 12, 11, 12, 12, 11, 12, 9, 12, 12, 9, 11, 14, 24, 12, 48, 24, 65]
     table = Table(table_data, colWidths=[value * mm for value in widths], repeatRows=1)
     table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#D9EAD3")),

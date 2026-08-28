@@ -33,3 +33,7 @@ class PhotoRecord:
     # Per-column calibration is required when one photograph contains several
     # core columns read from left to right. Coordinates are in pixmap pixels.
     depth_segments: list[dict[str, float]] = field(default_factory=list)
+    # Optional interpreter-corrected physical core bounds.  They are kept
+    # separately from depth calibration so segmentation can ignore rulers,
+    # labels and slag even before depth intervals are assigned.
+    core_columns: list[dict[str, float]] = field(default_factory=list)

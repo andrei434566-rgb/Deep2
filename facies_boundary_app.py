@@ -33,7 +33,7 @@ from app.infrastructure.ml.rule_based_facies import RuleBasedFaciesDetector, Tex
 class FaciesBoundaryWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("DeepCore — границы текстурных пакетов")
+        self.setWindowTitle("Kern Analyzer — границы текстурных пакетов")
         self.resize(1440, 860)
         self._detector = RuleBasedFaciesDetector()
         self._source_bgr: np.ndarray | None = None

@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
-title DeepCore 2 - запуск
+title Kern Analyzer - запуск
 
 set "PYTHON_CMD="
 py -3.11 -c "import sys" >nul 2>nul && set "PYTHON_CMD=py -3.11"
@@ -17,7 +17,7 @@ if not defined PYTHON_CMD (
 )
 
 if not exist ".venv\Scripts\python.exe" (
-    echo Создаю локальное окружение DeepCore 2...
+    echo Создаю локальное окружение Kern Analyzer...
     %PYTHON_CMD% -m venv .venv
     if errorlevel 1 goto :error
 )
@@ -25,7 +25,7 @@ if not exist ".venv\Scripts\python.exe" (
 set "APP_PYTHON=.venv\Scripts\python.exe"
 "%APP_PYTHON%" -c "import PySide6, ultralytics, cv2, docx, reportlab, openpyxl" >nul 2>nul
 if errorlevel 1 (
-    echo Загружаю компоненты DeepCore 2. Это выполняется только при первом запуске...
+    echo Загружаю компоненты Kern Analyzer. Это выполняется только при первом запуске...
     "%APP_PYTHON%" -m pip install --upgrade pip
     if errorlevel 1 goto :error
     "%APP_PYTHON%" -m pip install -r requirements.txt
@@ -49,7 +49,7 @@ if not exist "models\best.pt" (
     exit /b 1
 )
 
-echo DeepCore 2 запускается...
+echo Kern Analyzer запускается...
 if exist ".venv\Scripts\pythonw.exe" (
     start "" ".venv\Scripts\pythonw.exe" run.py
 ) else (
@@ -59,6 +59,6 @@ exit /b 0
 
 :error
 echo.
-echo Не удалось подготовить DeepCore 2. Проверьте подключение к интернету и повторите запуск.
+echo Не удалось подготовить Kern Analyzer. Проверьте подключение к интернету и повторите запуск.
 pause
 exit /b 1

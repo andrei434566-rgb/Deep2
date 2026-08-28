@@ -1,10 +1,10 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-title DeepCore - Facies boundaries
+title Kern Analyzer - Facies boundaries
 
 if not exist ".venv\Scripts\python.exe" (
-    echo Preparing DeepCore for the first launch...
+    echo Preparing Kern Analyzer for the first launch...
     py -3.11 -m venv .venv 2>nul
     if errorlevel 1 py -3 -m venv .venv 2>nul
 )

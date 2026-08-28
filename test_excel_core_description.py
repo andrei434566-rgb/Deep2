@@ -8,7 +8,11 @@ from pathlib import Path
 
 from openpyxl import Workbook
 
-from app.infrastructure.excel_core_description import read_description_workbook
+from app.infrastructure.excel_core_description import (
+    _attributes_from_description,
+    photo_interval_from_filename,
+    read_description_workbook,
+)
 
 
 class ExcelDescriptionImportTests(unittest.TestCase):
@@ -75,6 +79,30 @@ class ExcelDescriptionImportTests(unittest.TestCase):
         self.assertEqual(1, len(layers))
         self.assertEqual("A", layers[0].facies_code)
         self.assertAlmostEqual(1800.5, layers[0].base)
+
+    def test_reads_short_free_form_description_and_common_attribute_headers(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Р-41"
+        sheet.append(["Верх", "Низ", "Порода", "Окраска", "Описание"])
+        sheet.append([2500.0, 2500.4, "Песчаник", "Серый", "Цемент: карбонатный; слоистость: волнистая"])
+
+        layers, issues = self._read(workbook)
+
+        self.assertEqual(1, len(layers))
+        self.assertEqual("Песчаник", layers[0].facies_name)
+        self.assertTrue(issues)
+        attributes = _attributes_from_description(layers[0])
+        self.assertEqual("Песчаник", attributes["Название породы"])
+        self.assertEqual("Серый", attributes["Цвет"])
+        self.assertEqual("карбонатный", attributes["Цемент"])
+
+    def test_reads_interval_from_flexible_photo_filename(self):
+        interval = photo_interval_from_filename(Path("Р-31 3002,00–3004,96 (1).jpg"))
+
+        self.assertEqual("Р-31", interval.well)
+        self.assertAlmostEqual(3002.0, interval.top)
+        self.assertAlmostEqual(3004.96, interval.base)
 
 
 if __name__ == "__main__":

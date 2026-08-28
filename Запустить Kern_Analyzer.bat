@@ -1,10 +1,10 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-title DeepCore 2
+title Kern Analyzer
 
 if not exist ".venv\Scripts\python.exe" (
-    echo Preparing DeepCore 2 for the first launch...
+    echo Preparing Kern Analyzer for the first launch...
     py -3.11 -m venv .venv 2>nul
     if errorlevel 1 (
         py -3 -m venv .venv 2>nul
@@ -20,7 +20,7 @@ if not exist ".venv\Scripts\python.exe" (
 
 ".venv\Scripts\python.exe" -c "import PySide6, ultralytics, docx, reportlab, openpyxl" >nul 2>nul
 if errorlevel 1 (
-    echo Installing DeepCore 2 components...
+    echo Installing Kern Analyzer components...
     ".venv\Scripts\python.exe" -m pip install -r requirements.txt
     if errorlevel 1 (
         echo.

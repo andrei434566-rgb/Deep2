@@ -11,29 +11,37 @@ from uuid import uuid4
 
 from PySide6.QtCore import QPointF, QSettings, QThread, Qt
 from PySide6.QtGui import QAction, QColor, QCursor, QPolygonF
-from PySide6.QtWidgets import QColorDialog, QFileDialog, QDockWidget, QFrame, QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu, QMessageBox, QProgressBar, QProgressDialog, QPushButton, QSpinBox, QStatusBar, QTabWidget, QToolBar, QToolButton, QTreeWidget, QTreeWidgetItem
+from PySide6.QtWidgets import QApplication, QColorDialog, QFileDialog, QDockWidget, QFrame, QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu, QMessageBox, QProgressBar, QProgressDialog, QPushButton, QSpinBox, QStatusBar, QTabWidget, QToolBar, QToolButton, QTreeWidget, QTreeWidgetItem
 
 from app.domain.models import PhotoRecord
 from app.infrastructure.io.las_parser import parse_las_file
 from app.infrastructure.core_report_export import export_core_description_report
-from app.infrastructure.cvat_coco_import import import_cvat_coco_zip
-from app.infrastructure.excel_core_description import create_depth_bound_detections, layers_for_photo, photo_interval_from_filename, read_description_workbook
+from app.infrastructure.cvat_coco_import import CvatImagesMissingError, import_cvat_coco_zip, import_cvat_coco_zips
+from app.infrastructure.excel_core_description import CoreInterval, create_automatic_interval_detections, create_depth_bound_detections, layers_for_photo, photo_interval_from_filename, read_description_workbook
+from app.infrastructure.facies_postprocess import postprocess_detections
 from app.infrastructure.image_loading import load_working_pixmap
+from app.infrastructure.lithology_attribute_service import LithologyAttributeService
 from app.infrastructure.ml.fine_tune_worker import FineTuneWorker
+from app.infrastructure.ml.rule_based_facies import RuleBasedFaciesDetector
 from app.infrastructure.ml.yolo_model_service import SegmentationWorker
 from app.infrastructure.pdf_photo_import import render_pdf_pages
+from app.infrastructure.photo_caption_ocr import read_caption_metadata
 from app.infrastructure.project_storage import MANIFEST_NAME, load_project, save_project
 from app.infrastructure.training_dataset import MIN_TRAINING_SAMPLES, automatic_samples_count, export_training_dataset, unlabeled_manual_samples_count, verified_samples_count
+from app.infrastructure.training_quality import review_queue, training_quality
 from app.runtime_paths import bundled_root, user_data_root
 from app.ui.dialogs.depth_range_dialog import DepthRangeDialog
+from app.ui.dialogs.core_columns_dialog import CoreColumnsDialog
 from app.ui.dialogs.facies_dialog import FaciesDialog
 from app.ui.dialogs.log_editor_dialog import LogEditorDialog
+from app.ui.dialogs.photo_interval_dialog import PhotoIntervalDialog
+from app.ui.dialogs.photo_interval_mapping_dialog import PhotoIntervalMappingDialog
 from app.ui.dialogs.well_depth_dialog import WellDepthDialog
 from app.ui.widgets.workspace_canvas import StackColumnItem, WorkspaceCanvas
 
 
 class MainWindow(QMainWindow):
-    """DeepCore 2 board built with the PySide patterns of the original app."""
+    """Kern Analyzer board built with the PySide patterns of the original app."""
 
     TREE_KIND_ROLE = Qt.ItemDataRole.UserRole
     TREE_VALUE_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -50,6 +58,7 @@ class MainWindow(QMainWindow):
         self._training_worker: FineTuneWorker | None = None
         self._training_epoch_current = 0
         self._training_epoch_total = 0
+        self._fine_tune_success_model: Path | None = None
         self._activity_dialog: QProgressDialog | None = None
         self._segmentation_updated_count = 0
         self._deleted_records: list[tuple[PhotoRecord, int, object]] = []
@@ -59,7 +68,9 @@ class MainWindow(QMainWindow):
         self._selected_model_path: Path | None = None
         self._gis_data: dict | None = None
         self._rigis_data: dict | None = None
-        self._settings = QSettings("DeepCore", "DeepCore2")
+        self._settings = QSettings("Kern Analyzer", "KernAnalyzer")
+        self._confidence_threshold = self._read_confidence_threshold()
+        self._segmentation_profile = self._read_segmentation_profile()
         self._well_logs: dict[str, dict[str, dict]] = {}
         self._empty_wells: list[str] = []
         self._well_order: list[str] = []
@@ -72,7 +83,7 @@ class MainWindow(QMainWindow):
         self._project_folder: Path | None = None
         self._project_title = "Новый проект"
 
-        self.setWindowTitle("DeepCore 2")
+        self.setWindowTitle("Kern Analyzer")
         self.setMinimumSize(960, 640)
         self.setStatusBar(QStatusBar(self))
         self.statusBar().showMessage("ЛКМ — переместить фото · зажатое колёсико — двигать доску · колёсико — масштаб")
@@ -113,7 +124,7 @@ class MainWindow(QMainWindow):
         toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
 
-        title = QLabel("  DEEPCORE 2  ")
+        title = QLabel("  KERN ANALYZER  ")
         title.setObjectName("appTitle")
         toolbar.addWidget(title)
         toolbar.addSeparator()
@@ -126,7 +137,10 @@ class MainWindow(QMainWindow):
                     ("Сохранить проект", self.save_project, "Сохранить текущий проект", "Ctrl+S"),
                     ("Сохранить проект как…", self.save_project_as, "Сохранить проект в новой папке", "Ctrl+Shift+S"),
                     ("Загрузить фото/PDF…", self.open_images, "Выбрать изображения или PDF; каждая страница PDF станет отдельным фото", "Ctrl+O"),
+                    ("Настроить колонки керна на фото…", self.configure_core_columns, "Вручную задать границы керна; фон, линейки и шлак будут исключены"),
+                    ("Автоматически определить интервалы на фото…", self.detect_photo_intervals, "Выделить на фото устойчивые визуальные интервалы и заполнить строки без назначения фаций"),
                     ("Импорт разметки CVAT (COCO ZIP)…", self.import_cvat_coco, "Создать проект из фото, контуров и классов из выгрузки CVAT"),
+                    ("Импорт нескольких CVAT ZIP…", self.import_cvat_coco_batch, "Последовательно объединить несколько COCO ZIP с защитой памяти и дубликатов"),
                     ("Импорт Excel + JPG для обучения…", self.import_excel_photo_batch, "Сопоставить интервалы описания Excel с подписями на фото керна"),
                     ("Сохранить послойное описание (Excel/Word/PDF)…", self.export_core_description_report, "Сформировать послойное описание по вкладке «Керн и описание»"),
                 ],
@@ -136,7 +150,15 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(
             self._create_toolbar_menu(
                 "Модель",
-                [("Выбрать модель сегментации…", self.select_detection_model, "Выбрать файл модели .pt")],
+                [
+                    ("Выбрать модель сегментации…", self.select_detection_model, "Выбрать файл модели .pt"),
+                    ("История дообучений…", self.show_training_history, "Сравнить сохранённые модели по validation-метрикам"),
+                    ("Проверить датасет перед обучением…", self.show_training_quality, "Проверить малые классы, дубликаты и размер масок"),
+                    ("Порог уверенности масок…", self.select_confidence_threshold, "Ниже порог — больше масок для ручной проверки"),
+                    ("Режим сегментации…", self.select_segmentation_profile, "Быстрый, стандартный или детальный режим обработки фото"),
+                    ("Проверить сомнительные маски…", self.review_uncertain_masks, "Открыть очередь автоматических масок с низкой уверенностью"),
+                    ("Подобрать атрибуты пород…", self.suggest_lithology_attributes, "Отдельно от фаций предложить цвет, зернистость и слоистость внутри масок"),
+                ],
                 "Модель детекции и сегментации",
             )
         )
@@ -217,6 +239,9 @@ class MainWindow(QMainWindow):
         self._training_epochs.setValue(int(self._settings.value("training/epochs", 20)))
         self._training_epochs.setToolTip("Сколько эпох выполнить при следующем дообучении")
         self._training_epochs.valueChanged.connect(lambda value: self._settings.setValue("training/epochs", value))
+        self._training_recommendation_label = QLabel(bar)
+        self._training_recommendation_label.setObjectName("trainingCount")
+        self._training_recommendation_label.setToolTip("Оценка по числу вручную проверенных слоёв; её можно изменить вручную.")
         self._training_progress_label = QLabel("⏳ Обучение…", bar)
         self._training_progress_label.setObjectName("trainingProgressLabel")
         self._training_progress = QProgressBar(bar)
@@ -229,6 +254,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._training_count_label)
         layout.addWidget(self._training_epochs_label)
         layout.addWidget(self._training_epochs)
+        layout.addWidget(self._training_recommendation_label)
         layout.addWidget(self._training_progress_label)
         layout.addWidget(self._training_progress)
         layout.addWidget(self._training_button)
@@ -273,10 +299,14 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "_training_count_label"):
             return
         count = self._training_examples_count()
+        quality = training_quality(self._records)
         automatic_count = self._automatic_examples_count()
         unlabeled_count = self._unlabeled_manual_examples_count()
         needed = max(0, MIN_TRAINING_SAMPLES - count)
         self._training_count_label.setText(f"Для обучения: {count} · новые: {unlabeled_count} · авто: {automatic_count}")
+        self._training_count_label.setToolTip(quality.summary)
+        recommended_epochs = self._recommended_training_epochs(count)
+        self._training_recommendation_label.setText(f"рекомендовано: {recommended_epochs}")
         is_busy = self._segmentation_thread is not None or self._training_thread is not None
         is_training = self._training_thread is not None
         self._training_progress_label.setVisible(is_training)
@@ -298,6 +328,19 @@ class MainWindow(QMainWindow):
         else:
             self._training_button.setToolTip("Собрать разметки и дообучить копию выбранной модели")
 
+    @staticmethod
+    def _recommended_training_epochs(examples: int) -> int:
+        """Conservative starting point for a small, manually reviewed dataset."""
+        if examples < 20:
+            return 80
+        if examples < 50:
+            return 60
+        if examples < 100:
+            return 45
+        if examples < 250:
+            return 35
+        return 25
+
     def _build_project_sidebar(self) -> None:
         sidebar = QDockWidget("ПРОЕКТЫ", self)
         sidebar.setObjectName("projectSidebar")
@@ -315,7 +358,7 @@ class MainWindow(QMainWindow):
         self._refresh_project_tree()
 
     def _create_toolbar_menu(self, title: str, actions, tooltip: str | None = None) -> QToolButton:
-        """The QToolBar + QToolButton + QMenu construction used in DeepCore."""
+        """The QToolBar + QToolButton + QMenu construction used in Kern Analyzer."""
         menu = QMenu(title, self)
         menu.setObjectName("toolbarDropdown")
         for entry in actions:
@@ -418,7 +461,7 @@ class MainWindow(QMainWindow):
         root = self._projects_root()
         if root.is_dir():
             for folder in sorted((item for item in root.iterdir() if (item / MANIFEST_NAME).is_file()), key=lambda item: item.name.casefold()):
-                item = QTreeWidgetItem([folder.name.removesuffix(".deepcore2")])
+                item = QTreeWidgetItem([folder.name.removesuffix(".kern_analyzer")])
                 item.setData(0, self.TREE_KIND_ROLE, "project")
                 item.setData(0, self.TREE_VALUE_ROLE, str(folder))
                 item.setToolTip(0, str(folder))
@@ -490,13 +533,13 @@ class MainWindow(QMainWindow):
         self._well_intervals.clear()
         self._well_interpretations.clear()
         self._active_well_name = "Скважина 1"
-        self.setWindowTitle("DeepCore 2 — Новый проект")
+        self.setWindowTitle("Kern Analyzer — Новый проект")
         self._refresh_project_tree()
         self._refresh_training_bar()
         self.statusBar().showMessage("Создан новый проект")
 
     def open_project_dialog(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Открыть проект DeepCore 2", str(self._projects_root()))
+        folder = QFileDialog.getExistingDirectory(self, "Открыть проект Kern Analyzer", str(self._projects_root()))
         if folder:
             self._open_project(Path(folder))
 
@@ -513,8 +556,8 @@ class MainWindow(QMainWindow):
         self._records = records
         self._deleted_records.clear()
         self._project_folder = folder
-        self._selected_model_path = self._latest_project_model(folder)
         self._project_title = title
+        self._selected_model_path = self._best_project_model(folder)
         self._gis_data = None
         self._rigis_data = None
         self._well_logs.clear()
@@ -555,7 +598,7 @@ class MainWindow(QMainWindow):
             self.workspace.restore_photo(record, positions.get(record.identifier, QPointF()))
         if records:
             self._show_stack()
-        self.setWindowTitle(f"DeepCore 2 — {title}")
+        self.setWindowTitle(f"Kern Analyzer — {title}")
         self._refresh_project_tree()
         self._refresh_training_bar()
         message = f"Открыт проект: {title} · фото: {len(records)}"
@@ -579,7 +622,7 @@ class MainWindow(QMainWindow):
         if not safe_title:
             QMessageBox.warning(self, "Название проекта", "Укажите допустимое название.")
             return
-        folder = self._projects_root() / f"{safe_title}.deepcore2"
+        folder = self._projects_root() / f"{safe_title}.kern_analyzer"
         if folder.exists() and (folder / MANIFEST_NAME).is_file():
             answer = QMessageBox.question(
                 self,
@@ -600,7 +643,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Не удалось сохранить проект", str(exc))
             return
         self._project_folder = folder
-        self.setWindowTitle(f"DeepCore 2 — {self._project_title}")
+        self.setWindowTitle(f"Kern Analyzer — {self._project_title}")
         self._refresh_project_tree()
         self.statusBar().showMessage(f"Проект сохранён: {folder.name}")
 
@@ -645,7 +688,7 @@ class MainWindow(QMainWindow):
 
         if not image_paths:
             detail = "\n".join(pdf_errors)
-            QMessageBox.warning(self, "DeepCore 2", f"Не удалось открыть выбранные изображения.\n{detail}".strip())
+            QMessageBox.warning(self, "Kern Analyzer", f"Не удалось открыть выбранные изображения.\n{detail}".strip())
             return
         message = f"Поставлено в очередь фото: {len(image_paths)} · загружаю партиями по {self.PHOTO_LOAD_BATCH_SIZE}…"
         if pdf_errors:
@@ -682,7 +725,7 @@ class MainWindow(QMainWindow):
         self.run_segmentation(records)
 
     def import_cvat_coco(self) -> None:
-        """Create a clean DeepCore project from a human-marked CVAT COCO ZIP."""
+        """Create a clean Kern Analyzer project from a human-marked CVAT COCO ZIP."""
         if self._segmentation_thread is not None or self._training_thread is not None:
             QMessageBox.information(self, "Импорт CVAT", "Дождитесь окончания текущей операции.")
             return
@@ -709,9 +752,41 @@ class MainWindow(QMainWindow):
         project_folder = self._projects_root() / f"cvat_{Path(archive_path).stem}_{stamp}"
         try:
             records, summary = import_cvat_coco_zip(Path(archive_path), project_folder / "images")
+        except CvatImagesMissingError as exc:
+            images_folder = QFileDialog.getExistingDirectory(
+                self,
+                "В ZIP нет изображений — выберите папку исходной задачи CVAT",
+                str(Path(archive_path).parent),
+            )
+            if not images_folder:
+                QMessageBox.information(self, "Импорт CVAT", str(exc))
+                return
+            try:
+                records, summary = import_cvat_coco_zip(
+                    Path(archive_path), project_folder / "images", Path(images_folder),
+                )
+            except Exception as retry_exc:
+                QMessageBox.critical(self, "Импорт CVAT", str(retry_exc))
+                return
         except Exception as exc:
             QMessageBox.critical(self, "Импорт CVAT", str(exc))
             return
+
+        report_path = project_folder / "cvat_import_report.txt"
+        report_path.write_text(
+            "\n".join([
+                f"Архив: {archive_path}",
+                f"COCO JSON: {summary.get('annotation_file', '')}",
+                f"Фото импортировано: {summary['images']}",
+                f"Контуры импортировано: {summary['contours']}",
+                f"Классы: {summary['classes']}",
+                f"Изображения не найдены: {summary.get('missing_images', 0)}",
+                f"Изображения не открылись: {summary.get('unreadable_images', 0)}",
+                f"Аннотации пропущены: {summary.get('skipped_annotations', 0)}",
+                "",
+            ]),
+            encoding="utf-8",
+        )
 
         well_name, accepted = QInputDialog.getText(
             self,
@@ -749,9 +824,106 @@ class MainWindow(QMainWindow):
             (
                 f"Фото: {summary['images']}\n"
                 f"Контуры: {summary['contours']}\n"
-                f"Классы: {summary['classes']}\n\n"
-                "Контуры уже отмечены как проверенные. Откройте слой и заполните 16 параметров описания."
+                f"Классы: {summary['classes']}\n"
+                f"Пропущено аннотаций: {summary.get('skipped_annotations', 0)}\n\n"
+                "Контуры уже отмечены как проверенные. Откройте слой и заполните 16 параметров описания.\n\n"
+                f"Диагностика: {report_path}"
             ),
+        )
+
+    def import_cvat_coco_batch(self) -> None:
+        """Sequentially import several COCO ZIPs; never unpack the full batch in memory."""
+        if self._segmentation_thread is not None or self._training_thread is not None:
+            QMessageBox.information(self, "Импорт CVAT", "Дождитесь окончания текущей операции.")
+            return
+        archive_paths, _ = QFileDialog.getOpenFileNames(
+            self, "Импорт нескольких разметок CVAT", "", "CVAT COCO ZIP (*.zip);;Все файлы (*)",
+        )
+        if not archive_paths:
+            return
+        if self._records:
+            answer = QMessageBox.question(
+                self, "Импорт CVAT", "Импорт создаст новый проект и заменит текущую рабочую область. Продолжить?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        paths = [Path(path) for path in archive_paths]
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        project_folder = self._projects_root() / f"cvat_batch_{stamp}"
+
+        def progress(current: int, total: int, label: str) -> None:
+            self._update_activity(label, current, total)
+            QApplication.processEvents()
+
+        self._show_activity("Импорт CVAT", f"Подготовка {len(paths)} ZIP…", len(paths))
+        try:
+            records, summary = import_cvat_coco_zips(paths, project_folder / "images", progress=progress)
+        except CvatImagesMissingError as exc:
+            self._close_activity()
+            images_folder = QFileDialog.getExistingDirectory(
+                self, "В ZIP нет изображений — выберите общую папку исходных фото CVAT", str(paths[0].parent),
+            )
+            if not images_folder:
+                QMessageBox.information(self, "Импорт CVAT", str(exc))
+                return
+            self._show_activity("Импорт CVAT", f"Подготовка {len(paths)} ZIP…", len(paths))
+            try:
+                records, summary = import_cvat_coco_zips(
+                    paths, project_folder / "images", Path(images_folder), progress,
+                )
+            except Exception as retry_exc:
+                QMessageBox.critical(self, "Импорт CVAT", str(retry_exc))
+                return
+        except Exception as exc:
+            QMessageBox.critical(self, "Импорт CVAT", str(exc))
+            return
+        finally:
+            self._close_activity()
+
+        well_name, accepted = QInputDialog.getText(
+            self, "Импорт CVAT", "Название скважины для импортированных фото:", text="Скважина 1",
+        )
+        if not accepted or not well_name.strip():
+            return
+        for record in records:
+            record.well_name = well_name.strip()
+        report_path = project_folder / "cvat_batch_import_report.txt"
+        report_path.write_text(
+            "\n".join([
+                *[f"Архив: {path}" for path in paths],
+                f"Фото импортировано: {summary['images']}",
+                f"Контуры импортировано: {summary.get('contours', 0)}",
+                f"Дубликаты фото: {summary.get('duplicate_images', 0)}",
+                f"Пропущено аннотаций: {summary.get('skipped_annotations', 0)}",
+                "",
+            ]), encoding="utf-8",
+        )
+        self.workspace.clear_workspace()
+        self._records = records
+        self._deleted_records.clear()
+        self._project_folder = project_folder
+        self._project_title = f"CVAT · пакет {len(paths)} ZIP"
+        self._well_logs.clear()
+        self._empty_wells.clear()
+        self._well_order = [well_name.strip()]
+        self._well_depth_ranges.clear()
+        self._well_depth_references.clear()
+        self._well_depth_settings.clear()
+        self._well_intervals.clear()
+        self._well_interpretations.clear()
+        self._active_well_name = well_name.strip()
+        # ``add_photos`` remains the only long-lived image holder. Archives
+        # have already been closed, and photos are on disk in per-job folders.
+        self.workspace.add_photos(records)
+        self._save_current_project(project_folder)
+        self._show_stack()
+        self._refresh_project_tree()
+        self._refresh_training_bar()
+        QMessageBox.information(
+            self, "Пакетный импорт CVAT завершён",
+            f"ZIP: {len(paths)}\nФото: {summary['images']}\nКонтуры: {summary.get('contours', 0)}\n"
+            f"Дубликаты: {summary.get('duplicate_images', 0)}\n\nДиагностика: {report_path}",
         )
 
     def import_excel_photo_batch(self) -> None:
@@ -805,16 +977,32 @@ class MainWindow(QMainWindow):
         project_folder = self._projects_root() / f"excel_jpg_{Path(excel_path).stem}_{stamp}"
         images_folder = project_folder / "images"
         records: list[PhotoRecord] = []
+        wells_in_excel = sorted({layer.well for layer in layers}, key=str.casefold)
+        default_well = wells_in_excel[0] if len(wells_in_excel) == 1 else ""
+        mapping_rows = [
+            (path, *self._detect_photo_interval(path, default_well))
+            for path in photo_paths
+        ]
+        mapping_dialog = PhotoIntervalMappingDialog(mapping_rows, self)
+        while mapping_dialog.exec() == mapping_dialog.DialogCode.Accepted:
+            try:
+                photo_mappings = mapping_dialog.mappings()
+                break
+            except ValueError as exc:
+                QMessageBox.warning(self, "Проверка интервалов", str(exc))
+        else:
+            return
+
         report: list[str] = [
             f"Excel: {excel_path}",
             f"Фото найдено: {len(photo_paths)}",
-            "Интервал каждого JPG взят из его имени и сопоставлен с Excel.",
+            "Сопоставление выполнено только по подтверждённым интервалам (имена файлов не используются как идентификатор).",
             "",
         ]
         report.extend(f"[Excel] {issue.source}: {issue.message}" for issue in workbook_issues)
-        for number, photo_path in enumerate(photo_paths, start=1):
+        for number, (photo_path, photo_interval) in enumerate(photo_mappings, start=1):
             try:
-                photo_interval = photo_interval_from_filename(photo_path)
+                report.append(f"[Интервал] {photo_path.name}: {photo_interval.top:g}–{photo_interval.base:g} м (подтверждено пользователем)")
                 matching_layers = layers_for_photo(
                     layers,
                     photo_interval.well,
@@ -855,6 +1043,10 @@ class MainWindow(QMainWindow):
                         photo_depth_from=photo_interval.top,
                         photo_depth_to=photo_interval.base,
                         depth_segments=depth_segments,
+                        core_columns=[
+                            {key: value for key, value in segment.items() if key in {"left", "top", "right", "bottom"}}
+                            for segment in depth_segments
+                        ],
                     )
                 )
             except Exception as exc:
@@ -900,6 +1092,44 @@ class MainWindow(QMainWindow):
             ),
         )
 
+    def _photo_interval_for_excel_import(self, photo_path: Path, default_well: str) -> tuple[CoreInterval | None, str]:
+        """Use filename first, then the printed caption, then an explicit user interval."""
+        try:
+            return photo_interval_from_filename(photo_path), "имя файла"
+        except ValueError:
+            pass
+        try:
+            caption = read_caption_metadata(photo_path)
+            return CoreInterval(caption.well or default_well, caption.top, caption.base), "OCR подписи"
+        except Exception as exc:
+            ocr_reason = str(exc)
+        dialog = PhotoIntervalDialog(photo_path.name, well=default_well, parent=self)
+        while dialog.exec() == dialog.DialogCode.Accepted:
+            try:
+                well, top, base = dialog.values()
+                return CoreInterval(well, top, base), "введено вручную"
+            except ValueError as exc:
+                QMessageBox.warning(self, "Интервал фотографии", str(exc))
+        self.statusBar().showMessage(f"Пропущено фото без интервала: {photo_path.name} · OCR: {ocr_reason}")
+        return None, "не задан"
+
+    def _detect_photo_interval(self, photo_path: Path, default_well: str) -> tuple[CoreInterval | None, str]:
+        """Non-interactive prefill for the batch mapping table.
+
+        The resulting value is always displayed for human confirmation; no
+        filename or OCR guess can silently bind masks to an Excel layer.
+        """
+        try:
+            interval = photo_interval_from_filename(photo_path)
+            return CoreInterval(interval.well or default_well, interval.top, interval.base), "интервал найден в имени — подтвердите"
+        except ValueError:
+            pass
+        try:
+            caption = read_caption_metadata(photo_path)
+            return CoreInterval(caption.well or default_well, caption.top, caption.base), "OCR подписи — подтвердите"
+        except Exception as exc:
+            return None, f"интервал не найден: {exc}"
+
     def _remove_photo(self, identifier: str, position) -> None:
         for index, record in enumerate(self._records):
             if record.identifier != identifier:
@@ -929,7 +1159,7 @@ class MainWindow(QMainWindow):
     def run_segmentation(self, records: list[PhotoRecord] | None = None) -> None:
         records = list(records or self._records)
         if not records:
-            QMessageBox.information(self, "DeepCore 2", "Сначала загрузите фотографии через File → Загрузить фотографии.")
+            QMessageBox.information(self, "Kern Analyzer", "Сначала загрузите фотографии через File → Загрузить фотографии.")
             return
         if self._segmentation_thread is not None:
             self._queued_records.extend(records)
@@ -941,7 +1171,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(
                 self,
                 "Модель не найдена",
-                "Не найден models/best.pt. Скопируйте модель из исходного DeepCore в папку models этого проекта.",
+                "Не найден models/best.pt. Скопируйте модель из исходного Kern Analyzer в папку models этого проекта.",
             )
             return
 
@@ -952,7 +1182,10 @@ class MainWindow(QMainWindow):
         self._segmentation_thread = QThread(self)
         self._segmentation_worker = SegmentationWorker(
             model_path,
-            [(record.path, record.pixmap.width(), record.pixmap.height()) for record in records],
+            [(record.path, record.pixmap.width(), record.pixmap.height(), record.core_columns or None) for record in records],
+            self._confidence_threshold,
+            self._segmentation_options()["image_size"],
+            self._segmentation_options()["max_detections"],
         )
         self._segmentation_worker.moveToThread(self._segmentation_thread)
         self._segmentation_thread.started.connect(self._segmentation_worker.run)
@@ -965,29 +1198,86 @@ class MainWindow(QMainWindow):
         self._segmentation_thread.finished.connect(self._segmentation_thread.deleteLater)
         self._segmentation_thread.start()
 
+    def detect_photo_intervals(self) -> None:
+        """Create editable visual interval rows when no description is available."""
+        if self._segmentation_thread is not None or self._training_thread is not None:
+            QMessageBox.information(self, "Автоинтервалы", "Дождитесь окончания текущей операции.")
+            return
+        if not self._records:
+            QMessageBox.information(self, "Автоинтервалы", "Сначала добавьте фотографии керна.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Автоматически определить интервалы",
+            "Текущие маски на фото будут заменены визуальными интервалами без назначенной фации. "
+            "Глубины будут заполнены, если они указаны в имени фотографии. Продолжить?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        total = len(self._records)
+        created = 0
+        failed: list[str] = []
+        self._show_activity("Определение интервалов", f"Подготовка {total} фото…", total)
+        for index, record in enumerate(self._records, start=1):
+            self._update_activity(f"Интервалы {index}/{total}: {Path(record.path).name}", index, total)
+            try:
+                photo_top, photo_base = self._record_photo_interval(record)
+                detections, segments = create_automatic_interval_detections(
+                    Path(record.path), record.pixmap, photo_top, photo_base,
+                )
+                record.detections = detections
+                record.depth_segments = segments
+                created += len(detections)
+                self.workspace.update_photo_detections(record)
+            except Exception as exc:
+                failed.append(f"{Path(record.path).name}: {exc}")
+        self._close_activity()
+        self._show_stack()
+        self._refresh_project_tree()
+        self._refresh_training_bar()
+        if self._project_folder is not None:
+            self._save_current_project(self._project_folder)
+        detail = "" if not failed else f"\n\nНе обработано: {len(failed)}. Первое: {failed[0]}"
+        QMessageBox.information(
+            self,
+            "Автоинтервалы готовы",
+            f"Создано интервалов: {created}.\nНазначьте фацию в карточке нужного интервала, чтобы добавить его в обучение.{detail}",
+        )
+
     def _resolve_model_path(self) -> Path | None:
         root = bundled_root()
         candidates = [
             self._selected_model_path,
-            self._latest_project_model(self._project_folder),
+            self._best_project_model(self._project_folder),
             root / "models" / "best.pt",
             root.parent / "deep core" / "core-analyzer" / "models" / "best.pt",
         ]
         return next((path for path in candidates if path is not None and path.is_file()), None)
 
-    @staticmethod
-    def _latest_project_model(project_folder: Path | None) -> Path | None:
-        """Return the latest *completed* fine-tuned model in a project.
-
-        Ultralytics writes a temporary ``best.pt`` while epochs are still
-        running.  The facies catalog is copied next to the weights only after
-        a successful completion, so it is also a reliable completion marker.
-        """
+    def _best_project_model(self, project_folder: Path | None) -> Path | None:
+        """Prefer the published model with best held-out mAP, never a partial run."""
         if project_folder is None:
             return None
+        root = self._trained_models_root() / self._safe_folder_name(self._project_title)
+        ranked: list[tuple[float, float, Path]] = []
+        for info_path in root.glob("*/training_info.json"):
+            try:
+                import json
+
+                info = json.loads(info_path.read_text(encoding="utf-8"))
+                score = float(dict(info.get("metrics") or {}).get("mAP50-95", -1))
+                model = info_path.parent / "best.pt"
+                if model.is_file() and (info_path.parent / "facies_catalog.json").is_file():
+                    ranked.append((score, model.stat().st_mtime, model))
+            except (OSError, ValueError, TypeError):
+                continue
+        if ranked:
+            return max(ranked, key=lambda item: (item[0], item[1]))[2]
         candidates = [
-            path
-            for path in project_folder.glob("training/runs/*/fine_tune/weights/best.pt")
+            path for path in project_folder.glob("training/runs/*/fine_tune/weights/best.pt")
             if (path.parent / "facies_catalog.json").is_file()
         ]
         return max(candidates, key=lambda path: path.stat().st_mtime, default=None)
@@ -1004,6 +1294,219 @@ class MainWindow(QMainWindow):
         self._selected_model_path = Path(file_path)
         self.statusBar().showMessage(f"Выбрана модель: {self._selected_model_path.name}")
 
+    def show_training_history(self) -> None:
+        """Show locally saved validation metrics without depending on a server."""
+        root = self._trained_models_root() / self._safe_folder_name(self._project_title)
+        items: list[tuple[float, str]] = []
+        for info_path in root.glob("*/training_info.json"):
+            try:
+                import json
+
+                info = json.loads(info_path.read_text(encoding="utf-8"))
+                metrics = dict(info.get("metrics") or {})
+            except (OSError, ValueError, TypeError):
+                continue
+            m_ap = metrics.get("mAP50-95")
+            comparison = dict(info.get("comparison") or {})
+            delta = comparison.get("mAP50-95")
+            delta_text = "" if delta is None else f" · к исходной: {float(delta):+.1%}"
+            metric_text = "нет validation-метрик" if m_ap is None else (
+                f"mAP50-95: {float(m_ap):.1%} · "
+                f"precision: {float(metrics.get('precision', 0)):.1%} · "
+                f"recall: {float(metrics.get('recall', 0)):.1%}{delta_text}"
+            )
+            sample_counts = dict(info.get("dataset_summary") or {}).get("class_counts", {})
+            counts_text = " · ".join(f"{name}: {count}" for name, count in sample_counts.items())
+            recommendation = info.get("recommended_epochs")
+            suffix = f"\n  фации: {counts_text}" if counts_text else ""
+            if recommendation:
+                suffix += f" · рекомендовано эпох: {recommendation}"
+            items.append((float(m_ap) if m_ap is not None else -1.0, f"{info_path.parent.name}: {metric_text}{suffix}"))
+        if not items:
+            QMessageBox.information(self, "История дообучений", "В этом проекте ещё нет завершённых дообучений с метриками.")
+            return
+        lines = [text for _, text in sorted(items, reverse=True)]
+        QMessageBox.information(self, "История дообучений", "\n".join(lines))
+
+    def show_training_quality(self) -> None:
+        """An explicit pre-flight review, also run automatically before training."""
+        quality = training_quality(self._records)
+        if quality.blocking_reasons:
+            detail = "\n\nОбучение сейчас заблокировано: " + "; ".join(quality.blocking_reasons) + "."
+        else:
+            detail = "\n\nКритических блокировок нет. Проверьте предупреждения перед запуском."
+        QMessageBox.information(self, "Проверка датасета", quality.summary + detail)
+
+    def select_confidence_threshold(self) -> None:
+        """Let an interpreter trade precision for recall without code changes."""
+        value, accepted = QInputDialog.getDouble(
+            self,
+            "Порог уверенности масок",
+            "Показывать маски с уверенностью от 0,01 до 0,99:\n"
+            "меньше значение — больше кандидатов, больше ручной проверки.",
+            self._confidence_threshold,
+            0.01,
+            0.99,
+            2,
+        )
+        if not accepted:
+            return
+        self._confidence_threshold = round(float(value), 2)
+        self._settings.setValue("segmentation/confidence_threshold", self._confidence_threshold)
+        self.statusBar().showMessage(
+            f"Порог масок: {self._confidence_threshold:.0%}. Запустите сегментацию повторно для применения."
+        )
+
+    def select_segmentation_profile(self) -> None:
+        profiles = {
+            "Быстро · 512 px": "fast",
+            "Стандарт · 640 px": "standard",
+            "Детально · 1024 px": "detailed",
+        }
+        current = next((index for index, value in enumerate(profiles.values()) if value == self._segmentation_profile), 1)
+        selected, accepted = QInputDialog.getItem(
+            self,
+            "Режим сегментации",
+            "Детальный режим точнее на небольших слоях, но требует больше GPU-памяти и времени:",
+            list(profiles),
+            current,
+            False,
+        )
+        if not accepted:
+            return
+        self._segmentation_profile = profiles[selected]
+        self._settings.setValue("segmentation/profile", self._segmentation_profile)
+        settings = self._segmentation_options()
+        self._confidence_threshold = settings["confidence"]
+        self._settings.setValue("segmentation/confidence_threshold", self._confidence_threshold)
+        self.statusBar().showMessage(
+            f"Режим сегментации: {selected} · порог {settings['confidence']:.0%} · до {settings['max_detections']} масок. "
+            "Запустите сегментацию повторно для применения."
+        )
+
+    def _read_segmentation_profile(self) -> str:
+        value = str(self._settings.value("segmentation/profile", "standard"))
+        return value if value in {"fast", "standard", "detailed"} else "standard"
+
+    def _segmentation_image_size(self) -> int:
+        return int(self._segmentation_options()["image_size"])
+
+    def _segmentation_options(self) -> dict[str, int | float]:
+        """One predictable quality/speed preset, including detection density."""
+        profiles = {
+            "fast": {"image_size": 512, "confidence": 0.60, "max_detections": 300},
+            "standard": {"image_size": 640, "confidence": 0.50, "max_detections": 1000},
+            "detailed": {"image_size": 1024, "confidence": 0.35, "max_detections": 2000},
+        }
+        return profiles[self._segmentation_profile]
+
+    def configure_core_columns(self) -> None:
+        """Persist interpreter-corrected core bounds and re-run only that photo."""
+        if self._segmentation_thread is not None or self._training_thread is not None:
+            QMessageBox.information(self, "Колонки керна", "Дождитесь завершения текущей обработки.")
+            return
+        if not self._records:
+            QMessageBox.information(self, "Колонки керна", "Сначала добавьте хотя бы одну фотографию.")
+            return
+        choices = [f"{index + 1}. {Path(record.path).name}" for index, record in enumerate(self._records)]
+        selected, accepted = QInputDialog.getItem(self, "Колонки керна", "Выберите фотографию:", choices, 0, False)
+        if not accepted:
+            return
+        record = self._records[choices.index(selected)]
+        columns = record.core_columns or self._suggest_core_columns(record)
+        dialog = CoreColumnsDialog(columns, (record.pixmap.width(), record.pixmap.height()), self)
+        if dialog.exec() != CoreColumnsDialog.DialogCode.Accepted:
+            return
+        corrected = dialog.columns()
+        if not corrected:
+            QMessageBox.warning(self, "Колонки керна", "Укажите хотя бы одну корректную колонку (право > лево, низ > верх).")
+            return
+        record.core_columns = corrected
+        if self._project_folder is not None:
+            self._save_current_project(self._project_folder)
+        self.statusBar().showMessage("Границы колонок сохранены · повторно сегментирую это фото…")
+        self.run_segmentation([record])
+
+    @staticmethod
+    def _suggest_core_columns(record: PhotoRecord) -> list[dict[str, float]]:
+        """Populate the editor from the automatic detector; user remains final authority."""
+        try:
+            import cv2
+            import numpy as np
+
+            image = cv2.imdecode(np.frombuffer(Path(record.path).read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
+            if image is None:
+                return []
+            height, width = image.shape[:2]
+            x_scale = record.pixmap.width() / max(1, width)
+            y_scale = record.pixmap.height() / max(1, height)
+            return [
+                {"left": left * x_scale, "top": top * y_scale, "right": right * x_scale, "bottom": bottom * y_scale}
+                for left, top, right, bottom in RuleBasedFaciesDetector._find_core_columns(image)
+            ]
+        except (ImportError, OSError):
+            return []
+
+    def review_uncertain_masks(self) -> None:
+        """Open the highest-value automatic candidate for human verification."""
+        queue = review_queue(self._records)
+        if not queue:
+            QMessageBox.information(
+                self,
+                "Проверка масок",
+                "Нет непроверенных автоматических масок. Запустите сегментацию или добавьте новые фото.",
+            )
+            return
+        record, detection = queue[0]
+        self.workspace.focus_facies(record, detection)
+        self._open_facies_editor(record, detection)
+        QMessageBox.information(
+            self,
+            "Очередь ручной проверки",
+            f"Открыта самая сомнительная маска. Всего в очереди: {len(queue)}.\n"
+            "После сохранения откройте этот пункт снова — будет показана следующая.",
+        )
+
+    def suggest_lithology_attributes(self) -> None:
+        """Run the independent attribute recognizer without replacing facies."""
+        if not self._records:
+            QMessageBox.information(self, "Атрибуты пород", "Сначала добавьте фото и получите маски фаций.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Подобрать атрибуты пород",
+            "Будут заполнены только пустые поля «Цвет», «Зернистость» и «Слоистость» внутри существующих масок. "
+            "Это визуальные рекомендации — проверьте их в карточке фации перед дообучением.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        service = LithologyAttributeService()
+        changed = 0
+        for record in self._records:
+            for detection in record.detections:
+                suggestions = service.suggest(record, detection)
+                for field, value in suggestions.items():
+                    if value and not str(detection.attributes.get(field) or "").strip():
+                        detection.attributes[field] = value
+                        changed += 1
+            self.workspace.update_photo_detections(record)
+        if self._project_folder is not None:
+            self._save_current_project(self._project_folder)
+        QMessageBox.information(
+            self,
+            "Атрибуты пород",
+            f"Добавлено рекомендаций: {changed}. Фации и их границы не изменялись.",
+        )
+
+    def _read_confidence_threshold(self) -> float:
+        try:
+            value = float(self._settings.value("segmentation/confidence_threshold", 0.50))
+        except (TypeError, ValueError):
+            value = 0.50
+        return max(0.01, min(0.99, value))
+
     def start_fine_tune(self) -> None:
         """Export reviewed contours and fine-tune a separate copy of the model."""
         if self._segmentation_thread is not None:
@@ -1019,6 +1522,35 @@ class MainWindow(QMainWindow):
                 f"Нужно минимум {MIN_TRAINING_SAMPLES} вручную проверенных слоёв. Сейчас: {examples}.",
             )
             return
+        quality = training_quality(self._records)
+        if quality.blocking_reasons:
+            QMessageBox.critical(
+                self,
+                "Дообучение заблокировано",
+                "Обучение не начато, потому что модель начнёт игнорировать редкую фацию:\n\n"
+                f"{quality.summary}\n\n"
+                "Добавьте и проверьте маски редких фаций, затем повторите проверку.",
+            )
+            return
+        if (
+            quality.underrepresented
+            or quality.unnamed_manual
+            or quality.missing_depth
+            or quality.duplicate_masks
+            or quality.too_small_masks
+            or quality.too_large_masks
+        ):
+            answer = QMessageBox.question(
+                self,
+                "Проверка качества разметки",
+                "Перед дообучением обнаружены пункты, которые могут ухудшить качество модели:\n\n"
+                f"{quality.summary}\n\n"
+                "Продолжить всё равно?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
         model_path = self._resolve_model_path()
         if model_path is None:
             QMessageBox.critical(
@@ -1027,13 +1559,24 @@ class MainWindow(QMainWindow):
                 "Выберите исходную модель .pt через меню «Модель» перед дообучением.",
             )
             return
+        device, device_label = FineTuneWorker._best_device()
+        if device == "cpu":
+            QMessageBox.critical(
+                self,
+                "Нужна GPU для дообучения",
+                "CUDA-видеокарта не доступна в этой версии приложения. Дообучение на CPU отключено, "
+                "чтобы не перегружать компьютер. Установите/соберите версию с CUDA PyTorch и обновите драйвер NVIDIA.",
+            )
+            return
         epochs = self._training_epochs.value()
+        recommended_epochs = self._recommended_training_epochs(examples)
         answer = QMessageBox.question(
             self,
             "Запустить дообучение?",
             (
                 f"Будет создан датасет из {examples} вручную проверенных слоёв и обучена "
-                f"новая копия модели ({epochs} эпох). Исходный файл модели не изменится."
+                f"новая копия модели ({epochs} эпох, рекомендовано: {recommended_epochs}).\n"
+                f"Устройство: {device_label}. Исходный файл модели не изменится."
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Yes,
@@ -1041,14 +1584,16 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
 
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # A second-level timestamp can collide after a failed/retried launch.
+        # Make every dataset/run/output directory unambiguously unique.
+        stamp = f"{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:8]}"
         if self._project_folder is None:
-            project_folder = self._projects_root() / f"{self._safe_folder_name(self._project_title)}_{stamp}.deepcore2"
+            project_folder = self._projects_root() / f"{self._safe_folder_name(self._project_title)}_{stamp}.kern_analyzer"
             self._save_current_project(project_folder)
         elif self._project_folder is not None:
             # Copy externally selected photos into the project before the
             # dataset is exported, so this exact training session remains
-            # reproducible after a file is moved or deleted outside DeepCore.
+            # reproducible after a file is moved or deleted outside Kern Analyzer.
             self._save_current_project(self._project_folder)
         if self._project_folder is None:
             return
@@ -1068,9 +1613,16 @@ class MainWindow(QMainWindow):
             training_root / "runs" / stamp,
             published_dir,
             epochs=epochs,
+            dataset_summary={
+                "sample_count": dataset["sample_count"],
+                "class_counts": dataset["class_counts"],
+                "quality": quality.summary,
+            },
+            recommended_epochs=recommended_epochs,
         )
         self._training_epoch_current = 0
         self._training_epoch_total = epochs
+        self._fine_tune_success_model = None
         self._show_activity("Дообучение модели", f"Подготовка: 0 из {epochs} эпох…", epochs)
         self._training_worker.moveToThread(self._training_thread)
         self._training_thread.started.connect(self._training_worker.run)
@@ -1091,6 +1643,7 @@ class MainWindow(QMainWindow):
     def _on_fine_tune_succeeded(self, model_path: str) -> None:
         self._close_activity()
         self._selected_model_path = Path(model_path)
+        self._fine_tune_success_model = self._selected_model_path
         self.statusBar().showMessage(f"Дообучение завершено · новая модель сохранена: {self._selected_model_path}")
         QMessageBox.information(
             self,
@@ -1098,11 +1651,11 @@ class MainWindow(QMainWindow):
             "Новая модель и справочник фаций сохранены в понятной папке:\n"
             f"{self._selected_model_path.parent}",
         )
-        self.statusBar().showMessage("Новая модель выбрана · повторно выделяю фации на сохранённых фотографиях…")
-        self.run_segmentation(self._records)
+        self.statusBar().showMessage("Новая модель выбрана · повторная сегментация начнётся после корректного завершения обучения…")
 
     def _on_fine_tune_failed(self, message: str) -> None:
         self._close_activity()
+        self._fine_tune_success_model = None
         QMessageBox.critical(self, "Ошибка дообучения", message)
 
     def _on_training_epoch_progress(self, current: int, total: int) -> None:
@@ -1119,11 +1672,18 @@ class MainWindow(QMainWindow):
 
     def _on_fine_tune_finished(self) -> None:
         self._close_activity()
+        completed_model = self._fine_tune_success_model
         self._training_thread = None
         self._training_worker = None
         self._training_epoch_current = 0
         self._training_epoch_total = 0
         self._refresh_training_bar()
+        if completed_model is not None and self._records:
+            # Do not initialize another CUDA model until Ultralytics and the
+            # training QThread have both exited; concurrent initialization was
+            # a frequent source of post-training application crashes.
+            self.statusBar().showMessage("Дообучение завершено · запускаю повторную сегментацию новой моделью…")
+            self.run_segmentation(self._records)
 
     def import_las_file(self) -> None:
         self._import_log_file("gis")
@@ -1870,7 +2430,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Интерпретационный интервал удалён")
 
     def export_presentation_png(self) -> None:
-        default_name = f"{self._project_title or 'deepcore'}_presentation.png"
+        default_name = f"{self._project_title or 'kern_analyzer'}_presentation.png"
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Экспорт для презентации",
@@ -1932,7 +2492,7 @@ class MainWindow(QMainWindow):
         if not self._well_names():
             QMessageBox.information(self, "Отчёт", "Сначала добавьте хотя бы одну скважину или фотографии керна.")
             return
-        default = (self._project_folder or self._projects_root()) / f"{self._project_title or 'deepcore'}_послойное_описание.xlsx"
+        default = (self._project_folder or self._projects_root()) / f"{self._project_title or 'kern_analyzer'}_послойное_описание.xlsx"
         path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Сохранить послойное седиментологическое описание",
@@ -2040,7 +2600,7 @@ class MainWindow(QMainWindow):
         record = next((item for item in self._records if item.path == image_path), None)
         if record is None:
             return
-        record.detections = list(detections)
+        record.detections = postprocess_detections(record, list(detections))
         self.workspace.update_photo_detections(record)
         self._segmentation_updated_count += 1
         if self._segmentation_updated_count % 10 == 0:
@@ -2071,7 +2631,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Сегментация завершена · фаций: {count} · общий столбик справа от фотографий создан")
 
     def _open_facies_editor(self, record: PhotoRecord, detection) -> None:
-        # Correlation editing is deliberately disabled while DeepCore focuses
+        # Correlation editing is deliberately disabled while Kern Analyzer focuses
         # on core description and creation of a training dataset.
         if False:
             menu = QMenu(self)

@@ -25,40 +25,60 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: python -m pip install --upgrade pip; python -m pip install -r requirements.txt pyinstaller
+        run: >-
+          python -m pip install --upgrade pip;
+          python -m pip install -r requirements.txt pyinstaller;
+          python -m pip install --upgrade --force-reinstall torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu126;
+          python -c "import torch; print('PyTorch:', torch.__version__, 'CUDA build:', torch.version.cuda)"
 
-      - name: Build portable DeepCore 2
+      - name: Build portable Kern Analyzer
         run: >-
           python -m PyInstaller --noconfirm --clean --onedir --windowed
-          --name DeepCore_2
+          --name Kern_Analyzer
           --paths .
           --add-data "models\\best.pt;models"
           --add-data "app;app"
+          --runtime-hook "app\\qt_runtime_hook.py"
           --hidden-import app.ui.widgets.workspace_canvas
+          --hidden-import PySide6.QtCore
+          --hidden-import PySide6.QtGui
+          --hidden-import PySide6.QtWidgets
           --collect-submodules app
           --collect-all PySide6
+          --collect-binaries shiboken6
           --collect-all ultralytics
           --collect-all torch
           --collect-all torchvision
           --collect-all cv2
+          --collect-all openpyxl
+          --collect-all docx
+          --collect-all reportlab
+          --collect-all numpy
+          --collect-all pytesseract
           run.py
+
+      - name: Remove incompatible ICU DLLs
+        shell: pwsh
+        run: |
+          Remove-Item -LiteralPath dist/Kern_Analyzer/_internal/icuuc.dll -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath dist/Kern_Analyzer/_internal/icudt78.dll -Force -ErrorAction SilentlyContinue
 
       - name: Upload portable application
         uses: actions/upload-artifact@v4
         with:
-          name: DeepCore_2-Windows
-          path: dist/DeepCore_2
+          name: Kern_Analyzer-Windows
+          path: dist/Kern_Analyzer
           if-no-files-found: error
           retention-days: 30
 
       - name: Create ZIP for GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
-        run: Compress-Archive -Path dist/DeepCore_2/* -DestinationPath DeepCore_2-Windows.zip
+        run: Compress-Archive -Path dist/Kern_Analyzer/* -DestinationPath Kern_Analyzer-Windows.zip
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: DeepCore_2-Windows.zip
+          files: Kern_Analyzer-Windows.zip

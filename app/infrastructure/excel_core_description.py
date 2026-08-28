@@ -6,6 +6,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -25,6 +26,28 @@ EXCEL_FACIES_ATTRIBUTE_FIELDS = (
     "Примечание",
     *LITHOLOGY_ATTRIBUTE_OPTIONS.keys(),
 )
+
+# These aliases occur often in field descriptions.  The import deliberately
+# accepts both a formal 16-column template and a short table such as
+# ``Интервал | Порода | Цвет | Описание``.
+ATTRIBUTE_HEADER_ALIASES = {
+    "Название породы": ("название породы", "порода", "литология", "литотип"),
+    "Цвет": ("цвет", "окраска"),
+    "Зернистость": ("зернистость", "размер зерна"),
+    "Примесь другой фракции": ("примесь", "другая фракция"),
+    "Флюидонасыщение": ("флюид", "насыщение"),
+    "Цемент": ("цемент", "цементация"),
+    "Слоистость": ("слоистость",),
+    "Текстура": ("текстура",),
+    "Биотурбация": ("биотурбация",),
+    "Включения": ("включения",),
+    "Органические остатки": ("органические остатки", "остатки"),
+    "Пустотное пространство. Трещиноватость": ("трещин", "пустот"),
+    "Степень цементации": ("степень цементации",),
+    "Контакт": ("контакт",),
+    "Ориентация контакта": ("ориентация контакта",),
+    "Целостность": ("целостность",),
+}
 
 
 @dataclass(frozen=True)
@@ -64,15 +87,16 @@ def photo_interval_from_filename(path: Path) -> CoreInterval:
     Expected filename form: ``Р-31_3002,00-3004,96.jpg``.  The well prefix
     is deliberately permissive, while both depths must be explicit numbers.
     """
-    match = re.fullmatch(
-        r"(?P<well>.+)_(?P<top>\d+(?:[.,]\d+)?)-(?P<base>\d+(?:[.,]\d+)?)",
+    # Accept real-world names too: ``Р-31 3002,00–3004,96 (1).jpg`` and
+    # ``Р-31_3002,00-3004,96.jpg``.  The old full-match rejected both even
+    # though their interval was unambiguous.
+    match = re.search(
+        r"(?P<well>.+?)[_\s]+(?P<top>\d+(?:[.,]\d+)?)\s*[-–—]\s*(?P<base>\d+(?:[.,]\d+)?)",
         path.stem,
     )
     if not match:
-        raise ValueError(
-            "В имени JPG не найден интервал. Ожидается формат «Скв_Кровля-Подошва.jpg»."
-        )
-    well = _display_text(match.group("well"))
+        raise ValueError("В имени JPG не найден интервал. Пример: «Скв_Кровля-Подошва.jpg».")
+    well = _display_text(match.group("well")).rstrip(" _-")
     top = _as_float(match.group("top"))
     base = _as_float(match.group("base"))
     if base is not None and top is not None and base <= top:
@@ -99,7 +123,7 @@ def read_description_workbook(path: Path) -> tuple[list[DescriptionLayer], list[
     try:
         from openpyxl import load_workbook
     except ImportError as exc:
-        raise RuntimeError("Не установлен пакет openpyxl. Выполните обновление зависимостей DeepCore.") from exc
+        raise RuntimeError("Не установлен пакет openpyxl. Выполните обновление зависимостей Kern Analyzer.") from exc
 
     workbook = load_workbook(path, read_only=False, data_only=True)
     layers: list[DescriptionLayer] = []
@@ -132,9 +156,15 @@ def read_description_workbook(path: Path) -> tuple[list[DescriptionLayer], list[
             }
             if _looks_like_column_number_row(name, code, index, description):
                 continue
+            # A field notebook frequently contains only an interval and free
+            # text.  Keep it as a reviewable facies instead of dropping the
+            # row: colour/lithology are still extracted into its card.
             if not (name or code or index):
-                issues.append(ImportIssue(f"{sheet.title}!{row}", "Нет названия, индекса или кода фации."))
-                continue
+                name = _infer_facies_name(description, attributes) or "Не задано"
+                issues.append(ImportIssue(
+                    f"{sheet.title}!{row}",
+                    "Нет кода/индекса фации: создана метка «Не задано», проверьте её перед обучением.",
+                ))
             layers.append(
                 DescriptionLayer(
                     well=well,
@@ -154,7 +184,7 @@ def read_description_workbook(path: Path) -> tuple[list[DescriptionLayer], list[
     if not layers:
         raise ValueError(
             "Не найдены строки с интервалом фации. Укажите скважину, верх/низ "
-            "(или один столбец с интервалом) и название, код либо индекс фации."
+            "(или один столбец с интервалом). Название, код и параметры можно оставить в свободном описании."
         )
     return sorted(layers, key=lambda item: (_well_key(item.well), item.top, item.base)), issues
 
@@ -256,6 +286,76 @@ def create_depth_bound_detections(
     return detections, issues, depth_segments
 
 
+def create_automatic_interval_detections(
+    image_path: Path,
+    pixmap: QPixmap,
+    photo_top: float | None = None,
+    photo_base: float | None = None,
+) -> tuple[list[FaciesDetection], list[dict[str, float]]]:
+    """Find persistent visual packages and create editable interval masks.
+
+    This is intentionally classless: visual texture alone cannot truthfully
+    name a geological facies.  It supplies the interval rows and masks, while
+    the interpreter selects a facies in the card before using it for training.
+    """
+    try:
+        image = cv2.imdecode(np.frombuffer(image_path.read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
+    except OSError as exc:
+        raise ValueError(f"Не удалось прочитать изображение: {image_path.name}") from exc
+    if image is None:
+        raise ValueError(f"Не удалось открыть изображение: {image_path.name}")
+
+    detector = RuleBasedFaciesDetector()
+    _, intervals = detector.analyse(image)
+    columns = detector._find_core_columns(image)
+    height, width = image.shape[:2]
+    if not columns:
+        columns = [(0, 0, width, max(1, int(height * 0.87)))]
+    columns = sorted(columns, key=lambda item: (item[0], item[1]))
+    if not intervals:
+        intervals = [
+            SimpleNamespace(
+                polygon=((left, top), (right - 1, top), (right - 1, bottom - 1), (left, bottom - 1)),
+                evidence="fallback core column",
+            )
+            for left, top, right, bottom in columns
+        ]
+
+    x_scale = pixmap.width() / max(1, width)
+    y_scale = pixmap.height() / max(1, height)
+    total_length = sum(max(1, bottom - top) for _, top, _, bottom in columns)
+    cursor = photo_top if photo_top is not None and photo_base is not None and photo_base > photo_top else None
+    segments: list[dict[str, float]] = []
+    for left, top, right, bottom in columns:
+        segment = {"left": float(left * x_scale), "top": float(top * y_scale), "right": float(right * x_scale), "bottom": float(bottom * y_scale)}
+        if cursor is not None:
+            span = (photo_base - photo_top) * (bottom - top) / total_length
+            segment.update({"depth_from": float(cursor), "depth_to": float(cursor + span)})
+            cursor += span
+        segments.append(segment)
+
+    detections: list[FaciesDetection] = []
+    for interval in intervals:
+        polygon = [QPointF(x * x_scale, y * y_scale) for x, y in interval.polygon]
+        depth_from = depth_to = None
+        for segment in segments:
+            if segment["left"] <= polygon[0].x() <= segment["right"] and "depth_from" in segment:
+                pixel_span = segment["bottom"] - segment["top"]
+                depth_span = segment["depth_to"] - segment["depth_from"]
+                depth_from = segment["depth_from"] + (min(point.y() for point in polygon) - segment["top"]) / pixel_span * depth_span
+                depth_to = segment["depth_from"] + (max(point.y() for point in polygon) - segment["top"]) / pixel_span * depth_span
+                break
+        detections.append(FaciesDetection(
+            label="Новый контур",
+            confidence=0.65,
+            polygon=polygon,
+            attributes={"Источник интервала": "Автоматически по текстуре фото", "Основание": str(interval.evidence)},
+            depth_from=round(depth_from, 3) if depth_from is not None else None,
+            depth_to=round(depth_to, 3) if depth_to is not None else None,
+        ))
+    return detections, segments
+
+
 def _find_columns(sheet) -> dict[str, int]:
     """Find description fields by meaning instead of a fixed Excel template.
 
@@ -286,9 +386,9 @@ def _find_columns(sheet) -> dict[str, int]:
         if column := _best_column(descriptions, "facies_interval"):
             columns["facies_interval"] = column
     for field in EXCEL_FACIES_ATTRIBUTE_FIELDS:
-        needle = _normalized(field)
+        needles = (_normalized(field), *(_normalized(value) for value in ATTRIBUTE_HEADER_ALIASES.get(field, ())))
         for column, text in descriptions:
-            if needle in text:
+            if any(needle in text for needle in needles):
                 columns[f"attribute:{field}"] = column
                 break
     return columns
@@ -324,7 +424,7 @@ def _column_score(text: str, role: str) -> int:
     if role == "well":
         return 100 if has("скваж", "№ скв", "no скв", "well") else 0
     if role == "facies_name":
-        return 100 if has("название фаци", "наименование фаци", "facies name") else (55 if has("литофаци", "фация") and not has("индекс", "код", "ассоциац") else 0)
+        return 100 if has("название фаци", "наименование фаци", "facies name") else (55 if has("литофаци", "фация") and not has("индекс", "код", "ассоциац") else (35 if has("название") else 0))
     if role == "facies_code":
         return 100 if has("код фаци", "facies code") or ("фациальн" in text and "код" in text) else 0
     if role == "facies_index":
@@ -332,9 +432,9 @@ def _column_score(text: str, role: str) -> int:
     if role == "description":
         return 100 if has("краткое описание") else (70 if has("описан", "характерист", "description") else 0)
     if role == "facies_top":
-        return facies_group + direction_top if facies_group and direction_top else (generic_interval + direction_top if direction_top else 0)
+        return facies_group + direction_top if facies_group and direction_top else (generic_interval + direction_top if direction_top else (18 if direction_top else 0))
     if role == "facies_base":
-        return facies_group + direction_base if facies_group and direction_base else (generic_interval + direction_base if direction_base else 0)
+        return facies_group + direction_base if facies_group and direction_base else (generic_interval + direction_base if direction_base else (18 if direction_base else 0))
     if role == "core_top":
         return core_group + direction_top if core_group and direction_top else 0
     if role == "core_base":
@@ -403,6 +503,10 @@ def _attributes_from_description(layer: DescriptionLayer) -> dict[str, str]:
         "Источник описания": f"Excel: {layer.sheet}, строка {layer.row}",
     }
     attributes.update({key: value for key, value in imported.items() if value})
+    # A prose cell like "Цвет: серый; порода: песчаник" is accepted in
+    # addition to the controlled vocabulary below.  Explicit table columns
+    # still win, so prepared datasets remain deterministic.
+    attributes.update(_inline_description_attributes(layer.description))
     for field, options in LITHOLOGY_ATTRIBUTE_OPTIONS.items():
         matches = [option for option in options if _option_is_mentioned(text, option)]
         if len(matches) == 1:
@@ -413,6 +517,31 @@ def _attributes_from_description(layer: DescriptionLayer) -> dict[str, str]:
     # defaults. This makes the import deterministic for prepared datasets.
     attributes.update(layer.attributes)
     return {key: value for key, value in attributes.items() if value}
+
+
+def _inline_description_attributes(description: str) -> dict[str, str]:
+    """Read short ``field: value`` fragments from a free-text description."""
+    result: dict[str, str] = {}
+    for field, aliases in ATTRIBUTE_HEADER_ALIASES.items():
+        for alias in aliases:
+            match = re.search(
+                rf"(?:^|[;,.\n])\s*{re.escape(alias)}\s*[:=\-]\s*([^;,.\n]+)",
+                description,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                result[field] = _display_text(match.group(1))
+                break
+    return result
+
+
+def _infer_facies_name(description: str, attributes: dict[str, str]) -> str:
+    """Give an otherwise unlabelled row a stable, visible review label."""
+    for pattern in (r"(?:фация|литофация)\s*[:=\-]\s*([^;,.\n]+)", r"(?:название)\s*[:=\-]\s*([^;,.\n]+)"):
+        match = re.search(pattern, description, flags=re.IGNORECASE)
+        if match:
+            return _display_text(match.group(1))
+    return _display_text(attributes.get("Название породы"))
 
 
 def _option_is_mentioned(text: str, option: str) -> bool:

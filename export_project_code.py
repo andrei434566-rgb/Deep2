@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-OUTPUT = ROOT / "deepcore_full_code.txt"
+OUTPUT = ROOT / "kern_analyzer_full_code.txt"
 EXTENSIONS = {".py", ".bat"}
 EXTRA_FILES = {"requirements.txt"}
 EXCLUDED_PARTS = {".venv", "__pycache__", ".git"}
@@ -21,7 +21,7 @@ def is_source_file(path: Path) -> bool:
 
 def main() -> None:
     files = sorted((path for path in ROOT.rglob("*") if path.is_file() and is_source_file(path)), key=lambda path: path.relative_to(ROOT).as_posix().lower())
-    blocks: list[str] = ["DEEPCORE 2 — ПОЛНЫЙ ИСХОДНЫЙ КОД", "Кодировка: UTF-8", ""]
+    blocks: list[str] = ["KERN ANALYZER — ПОЛНЫЙ ИСХОДНЫЙ КОД", "Кодировка: UTF-8", ""]
     for path in files:
         relative = path.relative_to(ROOT).as_posix()
         content = path.read_text(encoding="utf-8", errors="replace")

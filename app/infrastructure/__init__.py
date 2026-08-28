@@ -1,1 +1,1 @@
-"""External adapters used by DeepCore 2."""
+"""External adapters used by Kern Analyzer."""

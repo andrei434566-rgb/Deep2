@@ -1,4 +1,4 @@
-"""Entry point for DeepCore 2."""
+"""Entry point for Kern Analyzer."""
 
 import sys
 
@@ -9,7 +9,7 @@ from app.ui.windows.main_window import MainWindow
 
 def main() -> int:
     app = QApplication(sys.argv)
-    app.setApplicationName("DeepCore 2")
+    app.setApplicationName("Kern Analyzer")
     window = MainWindow()
     window.showMaximized()
     return app.exec()

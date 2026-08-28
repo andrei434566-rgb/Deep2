@@ -1,4 +1,4 @@
-"""Layer attributes copied from DeepCore MainController._build_default_attribute_options."""
+"""Layer attributes copied from Kern Analyzer MainController._build_default_attribute_options."""
 
 LITHOLOGY_ATTRIBUTE_OPTIONS = {
     "Название породы": ["Гравелит", "Песчаник", "Переслаивание с преобладанием песчаной фракции", "Переслаивание с преобладанием алеврито-глинистой фракции", "Алевролит", "Аргиллит", "Битуминозный и окремненный аргилит", "Углистый аргилит", "Уголь", "Породы фундамента"],

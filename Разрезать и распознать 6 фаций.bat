@@ -1,7 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-title DeepCore - Boundaries and six facies probabilities
+title Kern Analyzer - Boundaries and six facies probabilities
 
 if not exist ".venv\Scripts\python.exe" (
     echo Python environment was not found.

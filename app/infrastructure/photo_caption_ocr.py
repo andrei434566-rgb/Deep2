@@ -23,10 +23,17 @@ def read_caption_metadata(path: Path) -> CaptionMetadata:
     try:
         import pytesseract
     except ImportError as exc:
-        raise RuntimeError("Не установлен pytesseract. Установите зависимости DeepCore.") from exc
+        raise RuntimeError("Не установлен pytesseract. Установите зависимости Kern Analyzer.") from exc
 
     _configure_tesseract(pytesseract)
-    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    # OpenCV's imread cannot reliably open Cyrillic Windows paths.  Decode
+    # bytes explicitly, as the Excel-photo importer does elsewhere.
+    try:
+        import numpy as np
+
+        image = cv2.imdecode(np.frombuffer(path.read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
+    except OSError as exc:
+        raise ValueError(f"Не удалось открыть файл: {path.name}") from exc
     if image is None:
         raise ValueError(f"Не удалось открыть файл: {path.name}")
     height, width = image.shape[:2]
@@ -39,14 +46,12 @@ def read_caption_metadata(path: Path) -> CaptionMetadata:
     except pytesseract.TesseractNotFoundError as exc:
         raise RuntimeError(
             "Для чтения подписи на фото установите Tesseract OCR с русским языком. "
-            "После установки перезапустите DeepCore."
+            "После установки перезапустите Kern Analyzer."
         ) from exc
     except pytesseract.TesseractError as exc:
         raise RuntimeError(f"Не удалось распознать подпись Tesseract: {exc}") from exc
     top, base = _find_depth_range(text)
     well = _find_well(text)
-    if not well:
-        raise ValueError(f"{path.name}: OCR не нашёл номер скважины в подписи.")
     if top is None or base is None:
         raise ValueError(f"{path.name}: OCR не нашёл интервал глубин в подписи.")
     return CaptionMetadata(well=well, top=top, base=base, text=text)

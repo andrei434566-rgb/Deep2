@@ -1,4 +1,4 @@
-"""Reproduce a DeepCore fine-tuning launch with a visible traceback."""
+"""Reproduce a Kern Analyzer fine-tuning launch with a visible traceback."""
 
 from pathlib import Path
 import sys

@@ -33,6 +33,6 @@ def user_data_root() -> Path:
     application update would overwrite it.  Keep it next to the executable
     instead, where it is easy to copy or back up.
     """
-    root = application_root() / "DeepCore 2 Data" if getattr(sys, "frozen", False) else source_root()
+    root = application_root() / "Kern Analyzer Data" if getattr(sys, "frozen", False) else source_root()
     root.mkdir(parents=True, exist_ok=True)
     return root

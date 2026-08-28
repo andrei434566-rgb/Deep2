@@ -1,4 +1,4 @@
-"""Lithology legend transferred from the DeepCore reference controller."""
+"""Lithology legend transferred from the Kern Analyzer reference controller."""
 
 LITHOLOGY_LEGEND = [
     {"name": "Гравелит", "symbol": "GR", "color": "#b7791f", "pattern": "pebbles"},

@@ -17,7 +17,7 @@ class LogEditorDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(590, 620)
-        self.settings = QSettings("DeepCore", "DeepCore2")
+        self.settings = QSettings("Kern Analyzer", "KernAnalyzer")
         self.settings_key = settings_key
         self._data = {
             **log_data,

@@ -1,1 +1,1 @@
-"""DeepCore 2 desktop application."""
+"""Kern Analyzer desktop application."""

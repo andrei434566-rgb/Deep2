@@ -1,7 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-title DeepCore - Training six facies classifier
+title Kern Analyzer - Training six facies classifier
 
 if not exist ".venv\Scripts\python.exe" (
     echo Python environment was not found.
