@@ -57,6 +57,16 @@ class RuleBasedFaciesDetector:
         # than the brown tray. Projection is more reliable than connected components:
         # black tray edges otherwise connect all columns into one large component.
         candidate = (saturation < 70) & (value < 235)
+
+        # Prefer compact connected components before the full-height projection.
+        # This is important for short core samples: their column occupies only a
+        # small part of a page and therefore cannot reach the global 48% x-axis
+        # projection threshold.  The deliberately short closing kernel bridges
+        # fractures within a core, but does not bridge the "Верх" title above it.
+        component_boxes = RuleBasedFaciesDetector._core_component_boxes(candidate)
+        if component_boxes:
+            return component_boxes
+
         column_score = RuleBasedFaciesDetector._smooth(candidate.mean(axis=0).astype(np.float32), 7)
         active_columns = column_score >= 0.48
         min_width = max(10, int(width * 0.018))
@@ -77,6 +87,42 @@ class RuleBasedFaciesDetector:
         if boxes:
             return boxes
         return RuleBasedFaciesDetector._fallback_component_boxes(candidate.astype(np.uint8) * 255)
+
+    @staticmethod
+    def _core_component_boxes(candidate: np.ndarray) -> list[tuple[int, int, int, int]]:
+        """Find complete core columns, including short samples, without captions.
+
+        The footer and title area of this photo format contain dark text and
+        arrows.  A valid core column is a sufficiently filled, vertically
+        oriented component located in the central working area of the frame.
+        """
+        height, width = candidate.shape
+        kernel_height = max(9, min(25, round(height * 0.006)))
+        connected = cv2.morphologyEx(
+            candidate.astype(np.uint8) * 255,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (5, kernel_height)),
+        )
+        count, _, stats, _ = cv2.connectedComponentsWithStats(connected, connectivity=8)
+        boxes: list[tuple[int, int, int, int]] = []
+        for component in range(1, count):
+            left, top, box_width, box_height, area = stats[component]
+            aspect = box_height / max(box_width, 1)
+            center_x = left + box_width / 2
+            filled_fraction = area / max(1, box_width * box_height)
+            if (
+                box_width >= max(10, int(width * 0.018))
+                and box_width <= width * 0.30
+                and box_height >= max(50, int(height * 0.012))
+                and 0.70 <= aspect <= 35.0
+                and filled_fraction >= 0.15
+                # Core trays are in the central field; arrows and the ruler
+                # lie outside it.  This also rejects footer lettering.
+                and width * 0.18 < center_x < width * 0.82
+                and top < height * 0.75
+            ):
+                boxes.append((int(left), int(top), int(left + box_width), int(top + box_height)))
+        return sorted(boxes, key=lambda item: item[0])
 
     @staticmethod
     def _fallback_component_boxes(candidate: np.ndarray) -> list[tuple[int, int, int, int]]:

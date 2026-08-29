@@ -12,3 +12,7 @@ runs/
 spreadsheet_work/
 release/
 models/trained/
+models/sam/
+_release_test_v14/
+portable_build*/
+portable_release*/

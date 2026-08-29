@@ -1,0 +1,6 @@
+Core Tape Builder + Facies Audit
+Release: 2026-08-30
+
+Portable Windows package. Includes:
+- core-column detection, masks, crops and vertical core-tape build;
+- Excel/tape audit with facies meter statistics and data-quality checks.
