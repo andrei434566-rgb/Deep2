@@ -11,6 +11,7 @@ projects/
 runs/
 spreadsheet_work/
 release/
+release_demo*/
 models/trained/
 models/sam/
 _release_test_v14/

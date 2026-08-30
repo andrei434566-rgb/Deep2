@@ -6,8 +6,8 @@ if "%~1"=="" (
   pause
   exit /b 2
 )
-if exist "%~dp0Core_Tape_Builder.exe" (
-  "%~dp0Core_Tape_Builder.exe" "%~1" --demo-random-facies --demo-facies 7
+if exist "%~dp0Kern_Analyzer.exe" (
+  "%~dp0Kern_Analyzer.exe" "%~1" --demo-random-facies --demo-facies 7
 ) else (
   "%~dp0.venv\Scripts\python.exe" "%~dp0build_core_tape.py" "%~1" --demo-random-facies --demo-facies 7
 )
