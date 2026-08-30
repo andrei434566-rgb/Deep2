@@ -35,6 +35,7 @@ import cv2
 import numpy as np
 
 from app.infrastructure.ml.rule_based_facies import RuleBasedFaciesDetector
+from app.infrastructure.kern_analyzer_pipeline import KernAnalyzerAutomaticPipeline
 from app.infrastructure.excel_core_description import (
     DescriptionLayer,
     photo_interval_from_filename,
@@ -432,6 +433,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--right-to-left", action="store_true", help="Склеивать колонки каждой фотографии справа налево")
     parser.add_argument("--audit", action="store_true", help="Проверить Excel и уже собранные ленты керна")
     parser.add_argument("--excel", type=Path, action="append", default=[], help="Excel для аудита; можно указать по одному файлу на каждую ленту")
+    parser.add_argument("--excel-masks", type=Path, help="Автоматически наложить фации Excel на фото и создать YOLO-маски")
     return parser.parse_args()
 
 
@@ -458,6 +460,16 @@ def main() -> int:
     if args.audit:
         output_dir = args.output.expanduser().resolve() if args.output else source_dir / AUDIT_FOLDER_NAME
         return run_audit(source_dir, output_dir, [path.expanduser().resolve() for path in args.excel])
+    if args.excel_masks:
+        output_dir = args.output.expanduser().resolve() if args.output else source_dir / "_kern_analyzer_excel_masks"
+        try:
+            result = KernAnalyzerAutomaticPipeline().run(source_dir, args.excel_masks, output_dir)
+        except Exception as error:
+            print(f"Авторазметка Excel не выполнена: {error}", file=sys.stderr)
+            return 2
+        print(f"\\nГотово. Размечено фото: {result.photos_labeled}/{result.photos_seen}; масок: {result.masks_created}; фаций: {len(result.classes)}")
+        print(f"Проверка: {result.output_dir / 'review.html'}")
+        return 0
     if not source_dir.is_dir():
         print(f"Папка не найдена: {source_dir}", file=sys.stderr)
         return 2

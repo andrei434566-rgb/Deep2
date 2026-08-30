@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 import shutil
+import sys
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -58,15 +60,26 @@ def read_caption_metadata(path: Path) -> CaptionMetadata:
 
 
 def _configure_tesseract(pytesseract) -> None:
-    if shutil.which("tesseract"):
-        return
     candidates = (
+        # Portable Kern Analyzer package: the OCR runtime lives beside the
+        # executable, so another computer needs neither Python nor an install.
+        Path(sys.executable).resolve().parent / "tools" / "tesseract" / "tesseract.exe",
+        Path(sys.executable).resolve().parent / "tools" / "tesseract.exe",
+        Path(__file__).resolve().parents[2] / "tools" / "tesseract" / "tesseract.exe",
         Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
         Path(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"),
     )
     executable = next((candidate for candidate in candidates if candidate.is_file()), None)
     if executable is not None:
         pytesseract.pytesseract.tesseract_cmd = str(executable)
+        # A bundled Windows build needs its DLL folder and tessdata directory
+        # explicitly available to the subprocess started by pytesseract.
+        os.environ["PATH"] = str(executable.parent) + os.pathsep + os.environ.get("PATH", "")
+        tessdata = executable.parent / "tessdata"
+        if tessdata.is_dir():
+            os.environ["TESSDATA_PREFIX"] = str(tessdata)
+    elif shutil.which("tesseract"):
+        return
 
 
 def _find_well(text: str) -> str:

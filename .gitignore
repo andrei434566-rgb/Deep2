@@ -16,3 +16,6 @@ models/sam/
 _release_test_v14/
 portable_build*/
 portable_release*/
+Core_Tape_Builder_*.zip
+Kern_Analyzer_*.zip
+tools/tesseract/
