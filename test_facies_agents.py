@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from app.infrastructure.excel_core_description import CoreInterval, DescriptionLayer
-from app.infrastructure.facies_agents import CoreColumn, ExcelFaciesMaskAgent, PhotoOrientationAgent, TextMark
+from app.infrastructure.facies_agents import CoreColumn, ExcelFaciesMaskAgent, PhotoIntervalAgent, PhotoOrientationAgent, TextMark
 
 
 def layer(top: float, base: float, name: str) -> DescriptionLayer:
@@ -16,6 +18,15 @@ def layer(top: float, base: float, name: str) -> DescriptionLayer:
 
 
 class ExcelFaciesMaskAgentTests(unittest.TestCase):
+    def test_uses_specific_filename_interval_before_wider_caption_interval(self):
+        path = Path("Р-31_3002,00-3004,96.jpg")
+        with patch("app.infrastructure.facies_agents.read_caption_metadata") as caption:
+            interval, messages = PhotoIntervalAgent().from_photo(path, default_well="Р-31")
+
+        self.assertEqual(("Р-31", 3002.0, 3004.96), (interval.well, interval.top, interval.base))
+        caption.assert_not_called()
+        self.assertTrue(any("из имени" in item.message for item in messages))
+
     def test_projects_excel_boundaries_across_sequential_columns(self):
         bands, columns, messages = ExcelFaciesMaskAgent().apply(
             CoreInterval("P-31", 100.0, 102.0),

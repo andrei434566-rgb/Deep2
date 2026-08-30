@@ -122,23 +122,31 @@ class CoreColumnAgent:
 class PhotoIntervalAgent:
     """Stage 2: resolve the measured-depth interval printed on a photograph.
 
-    The printed drilling interval is the primary source.  A filename is only a
-    fallback so file renaming cannot silently alter the geological binding.
+    A valid filename interval is primary because it identifies the particular
+    JPG.  The caption can also contain the wider core-sampling interval, which
+    is unsuitable for a single image.  OCR remains the automatic route for
+    files whose names do not contain depths.
     """
 
     name = "photo-interval-agent"
 
     def from_photo(self, image_path: Path, default_well: str = "") -> tuple[CoreInterval | None, list[AgentMessage]]:
+        filename_interval, filename_messages = self.from_filename(image_path)
+        if filename_interval is not None:
+            return filename_interval, [AgentMessage(
+                "info",
+                f"Интервал конкретного JPG взят из имени: {filename_interval.well} {filename_interval.top:g}–{filename_interval.base:g} м.",
+            )]
         try:
             caption = read_caption_metadata(image_path)
-            interval = CoreInterval(caption.well or default_well, caption.top, caption.base)
+            # A folder with one Excel well is an explicit binding supplied by
+            # the user. It is more reliable than OCR confusing Cyrillic «Р»
+            # and Latin "p" in a well number.
+            interval = CoreInterval(default_well or caption.well, caption.top, caption.base)
             if not interval.well:
                 return None, [AgentMessage("warning", f"{image_path.name}: OCR прочитал интервал {interval.top:g}–{interval.base:g} м, но не номер скважины.")]
             return interval, [AgentMessage("info", f"Интервал по бурению прочитан с фото: {interval.well} {interval.top:g}–{interval.base:g} м.")]
         except Exception as ocr_error:
-            interval, filename_messages = self.from_filename(image_path)
-            if interval is not None:
-                return interval, [AgentMessage("warning", f"OCR интервала не сработал ({ocr_error}); использован резервный интервал из имени файла.")]
             return None, [AgentMessage("warning", f"{image_path.name}: OCR не прочитал интервал ({ocr_error}); имя также не содержит корректного интервала.")]
 
     def from_filename(self, image_path: Path) -> tuple[CoreInterval | None, list[AgentMessage]]:

@@ -35,6 +35,7 @@ from app.infrastructure.facies_agents import (
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 REVIEW_PREFIX = "_core_tape_review"
+GENERATED_FOLDER_PREFIXES = ("_core_tape_", "_kern_analyzer_", "_facies_audit")
 
 
 @dataclass(frozen=True)
@@ -83,7 +84,7 @@ class KernAnalyzerAutomaticPipeline:
             (
                 path for path in source.rglob("*")
                 if path.is_file() and path.suffix.casefold() in IMAGE_SUFFIXES
-                and not any(parent.name.casefold().startswith(REVIEW_PREFIX) for parent in path.parents)
+                and not any(parent.name.casefold().startswith(GENERATED_FOLDER_PREFIXES) for parent in path.parents)
             ),
             key=lambda path: [int(part) if part.isdigit() else part.casefold() for part in _parts(path.name)],
         )
@@ -336,8 +337,6 @@ def _load_column_manifest(source: Path) -> dict[str, list[tuple[int, int, int, i
     for manifest_path in manifests:
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if Path(str(manifest.get("source_folder", ""))).resolve() != source:
-                continue
             grouped: dict[str, list[tuple[int, int, int, int]]] = {}
             for item in manifest.get("columns", []):
                 rectangle = item.get("source_rectangle_px", {})
@@ -345,7 +344,12 @@ def _load_column_manifest(source: Path) -> dict[str, list[tuple[int, int, int, i
                 box = (rectangle.get("left"), rectangle.get("top"), rectangle.get("right"), rectangle.get("bottom"))
                 if relative and all(isinstance(value, int) for value in box):
                     grouped.setdefault(relative, []).append(box)
-            if grouped:
+            # The stage-1 manifest is stored underneath the same source folder
+            # and references JPGs relatively.  Its absolute ``source_folder``
+            # may legitimately change when the project is moved from D: to E:
+            # or copied to another computer, so do not discard verified manual
+            # rectangles only because the drive letter changed.
+            if grouped and any((source / Path(relative)).is_file() for relative in grouped):
                 return grouped
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             continue
