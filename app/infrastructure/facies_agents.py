@@ -315,6 +315,84 @@ class ExcelFaciesMaskAgent:
         return bands, messages
 
 
+class DemoRandomFaciesAgent:
+    """Create a visibly complete, synthetic seven-facies demonstration mask.
+
+    This agent exists solely to demonstrate the complete Kern Analyzer route
+    (columns -> masks -> review -> Excel).  It must never be used as training
+    truth or presented as an inferred geological facies result.  The seven
+    rectangles partition the detected physical core, without gaps, following
+    the already resolved column order and direction.
+    """
+
+    name = "demo-random-facies-agent"
+
+    def apply(
+        self,
+        columns: list[CoreColumn],
+        class_count: int = 7,
+        seed: int | None = None,
+    ) -> tuple[list[FaciesBand], list[AgentMessage]]:
+        if class_count < 1:
+            return [], [AgentMessage("error", "Количество демонстрационных фаций должно быть не меньше 1.")]
+        total_pixels = sum(column.height for column in columns)
+        if not columns or total_pixels < class_count:
+            return [], [AgentMessage("error", "Недостаточно пикселей керна для разбиения на демонстрационные фации.")]
+
+        generator = np.random.default_rng(seed)
+        # Every class receives a non-zero segment.  The remaining pixels are
+        # assigned randomly, so a fixed seed makes a review reproducible.
+        minimum = max(1, min(20, total_pixels // (class_count * 3)))
+        minimum = min(minimum, total_pixels // class_count)
+        lengths = generator.multinomial(total_pixels - minimum * class_count, np.full(class_count, 1 / class_count)) + minimum
+        labels = [f"DEMO-Фация {number}" for number in generator.permutation(np.arange(1, class_count + 1))]
+
+        bands: list[FaciesBand] = []
+        cursor = 0
+        for class_number, (label, length) in enumerate(zip(labels, lengths), start=1):
+            segment_start = cursor
+            segment_end = cursor + int(length)
+            column_cursor = 0
+            for column_number, column in enumerate(columns, start=1):
+                column_start = column_cursor
+                column_end = column_cursor + column.height
+                overlap_start = max(segment_start, column_start)
+                overlap_end = min(segment_end, column_end)
+                if overlap_end > overlap_start:
+                    local_start = overlap_start - column_start
+                    local_end = overlap_end - column_start
+                    if column.direction == "up":
+                        top = column.bottom - local_end
+                        bottom = column.bottom - local_start
+                    else:
+                        top = column.top + local_start
+                        bottom = column.top + local_end
+                    bands.append(FaciesBand(
+                        label=label,
+                        facies_name=label,
+                        facies_code=f"DEMO-{class_number:02d}",
+                        facies_index=str(class_number),
+                        well="DEMO",
+                        depth_from=float(overlap_start),
+                        depth_to=float(overlap_end),
+                        column_number=column_number,
+                        left=column.left,
+                        top=int(top),
+                        right=column.right,
+                        bottom=int(bottom),
+                        source_sheet="DEMO",
+                        source_row=class_number,
+                    ))
+                column_cursor = column_end
+            cursor = segment_end
+
+        messages = [
+            AgentMessage("warning", "DEMO: создана случайная синтетическая разметка; это не геологический результат и не обучающая истина."),
+            AgentMessage("info", f"DEMO полностью закрыл {total_pixels} px керна {class_count} фациями; seed={seed if seed is not None else 'random'}."),
+        ]
+        return bands, messages
+
+
 def read_core_image(path: Path) -> np.ndarray:
     """Open a Windows path with Cyrillic characters without ``cv2.imread``."""
     try:

@@ -35,7 +35,7 @@ import cv2
 import numpy as np
 
 from app.infrastructure.ml.rule_based_facies import RuleBasedFaciesDetector
-from app.infrastructure.kern_analyzer_pipeline import KernAnalyzerAutomaticPipeline
+from app.infrastructure.kern_analyzer_pipeline import KernAnalyzerAutomaticPipeline, KernAnalyzerDemoPipeline
 from app.infrastructure.excel_core_description import (
     DescriptionLayer,
     photo_interval_from_filename,
@@ -434,6 +434,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audit", action="store_true", help="Проверить Excel и уже собранные ленты керна")
     parser.add_argument("--excel", type=Path, action="append", default=[], help="Excel для аудита; можно указать по одному файлу на каждую ленту")
     parser.add_argument("--excel-masks", type=Path, help="Автоматически наложить фации Excel на фото и создать YOLO-маски")
+    parser.add_argument("--demo-random-facies", action="store_true", help="DEMO: закрыть керн случайными синтетическими фациями; не для обучения")
+    parser.add_argument("--demo-facies", type=int, default=7, help="Количество синтетических DEMO-фаций (по умолчанию 7)")
+    parser.add_argument("--demo-seed", type=int, help="Seed DEMO для повторяемого случайного разбиения")
     return parser.parse_args()
 
 
@@ -457,6 +460,17 @@ def main() -> int:
             return 0
         args.photo_folder = Path(selected)
     source_dir = args.photo_folder.expanduser().resolve()
+    if args.demo_random_facies:
+        output_dir = args.output.expanduser().resolve() if args.output else source_dir.parent / "_kern_analyzer_demo_7_facies"
+        try:
+            result = KernAnalyzerDemoPipeline().run(source_dir, output_dir, class_count=max(1, args.demo_facies), seed=args.demo_seed)
+        except Exception as error:
+            print(f"DEMO-разметка не выполнена: {error}", file=sys.stderr)
+            return 2
+        print(f"\nDEMO готово. Колонок: {result.columns_detected}; фаций: {len(result.classes)}; прямоугольников: {result.rectangles_created}.")
+        print("Это синтетическая разметка — не использовать для обучения или геологической интерпретации.")
+        print(f"Проверка: {result.output_dir / 'review.html'}")
+        return 0
     if args.audit:
         output_dir = args.output.expanduser().resolve() if args.output else source_dir / AUDIT_FOLDER_NAME
         return run_audit(source_dir, output_dir, [path.expanduser().resolve() for path in args.excel])

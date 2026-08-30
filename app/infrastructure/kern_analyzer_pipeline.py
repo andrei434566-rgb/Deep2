@@ -24,6 +24,7 @@ from app.infrastructure.excel_core_description import CoreInterval, read_descrip
 from app.infrastructure.facies_agents import (
     AgentMessage,
     CoreColumnAgent,
+    DemoRandomFaciesAgent,
     ExcelFaciesMaskAgent,
     FaciesBand,
     PhotoIntervalAgent,
@@ -196,6 +197,107 @@ class KernAnalyzerAutomaticPipeline:
         return PipelineResult(destination, len(image_paths), photos_labeled, mask_count, classes, issues)
 
 
+@dataclass(frozen=True)
+class DemoPipelineResult:
+    """Output of the explicitly synthetic, non-training demonstration."""
+
+    output_dir: Path
+    image_path: Path
+    columns_detected: int
+    classes: list[str]
+    rectangles_created: int
+    seed: int
+
+
+class KernAnalyzerDemoPipeline:
+    """Make a complete random seven-facies preview for one arbitrary photo.
+
+    The resulting files are intentionally separated from the real Excel
+    training masks.  Their purpose is a quick end-to-end demonstration of the
+    user interface and exports, not a prediction or an annotation dataset.
+    """
+
+    def __init__(self) -> None:
+        self.columns = CoreColumnAgent()
+        self.orientation = PhotoOrientationAgent()
+        self.demo = DemoRandomFaciesAgent()
+
+    def run(self, image_path: Path, output_dir: Path, class_count: int = 7, seed: int | None = None) -> DemoPipelineResult:
+        source = image_path.expanduser().resolve()
+        destination = output_dir.expanduser().resolve()
+        if not source.is_file() or source.suffix.casefold() not in IMAGE_SUFFIXES:
+            raise FileNotFoundError(f"Не найдено изображение керна: {source}")
+        if destination.exists():
+            raise FileExistsError(f"Папка результата уже существует: {destination}")
+
+        image = read_core_image(source)
+        manifest_columns = _load_column_manifest(source.parent).get(source.name)
+        columns, column_messages = self.columns.detect(image, manifest_columns)
+        if not columns:
+            raise ValueError("DEMO не может начаться: колонки керна не найдены.")
+        marks, ocr_messages = self.orientation.recognise_marks(image)
+        ordered_columns, orientation_messages = self.orientation.order(columns, marks)
+        if seed is None:
+            seed = int.from_bytes(hashlib.sha256(source.read_bytes()).digest()[:8], "little")
+        bands, demo_messages = self.demo.apply(ordered_columns, class_count=class_count, seed=seed)
+        if not bands:
+            detail = "; ".join(message.message for message in demo_messages)
+            raise ValueError(f"DEMO не создал маски: {detail}")
+
+        destination.mkdir(parents=True)
+        for name in ("overlays", "class_masks", "yolo_labels"):
+            (destination / name).mkdir()
+        classes = sorted({band.label for band in bands}, key=str.casefold)
+        class_index = {name: index for index, name in enumerate(classes)}
+        class_mask = np.zeros(image.shape[:2], dtype=np.uint16)
+        yolo_lines: list[str] = []
+        rows: list[dict[str, object]] = []
+        for band in bands:
+            class_mask[band.top:band.bottom, band.left:band.right] = class_index[band.label] + 1
+            yolo_lines.append(_yolo_segment_line(class_index[band.label], band, image.shape[1], image.shape[0]))
+            rows.append({
+                "photo": source.name,
+                "facies": band.label,
+                "facies_code": band.facies_code,
+                "column": band.column_number,
+                "core_start_px": int(band.depth_from),
+                "core_end_px": int(band.depth_to),
+                "length_px": int(band.depth_to - band.depth_from),
+                "left": band.left,
+                "top": band.top,
+                "right": band.right,
+                "bottom": band.bottom,
+                "status": "DEMO — случайная синтетическая разметка",
+            })
+        stem = source.stem
+        _write_overlay(destination / "overlays" / f"{stem}_demo_overlay.png", image, bands)
+        _write_image(destination / "class_masks" / f"{stem}_demo_mask.png", class_mask)
+        (destination / "yolo_labels" / f"{stem}_demo.txt").write_text("\n".join(yolo_lines) + "\n", encoding="utf-8")
+        _write_demo_annotations_csv(destination / "demo_facies_annotations.csv", rows)
+        _write_demo_excel(destination / "DEMO_7_фаций.xlsx", source.name, rows, classes, seed)
+
+        messages = column_messages + ocr_messages + orientation_messages + demo_messages
+        payload = {
+            "pipeline": "Kern Analyzer DEMO random facies — NOT TRAINING DATA",
+            "warning": "Синтетическая разметка. Не использовать как геологический прогноз, ручную разметку или данные обучения.",
+            "source_photo": str(source),
+            "seed": seed,
+            "classes": classes,
+            "columns_detected": len(ordered_columns),
+            "rectangles_created": len(bands),
+            "coverage": "Все пиксели внутри прямоугольников найденного керна закрыты ровно одним классом.",
+            "messages": [asdict(message) for message in messages],
+            "files": {
+                "overlay": f"overlays/{stem}_demo_overlay.png",
+                "mask": f"class_masks/{stem}_demo_mask.png",
+                "excel": "DEMO_7_фаций.xlsx",
+            },
+        }
+        (destination / "demo_manifest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_demo_review(destination, payload)
+        return DemoPipelineResult(destination, source, len(ordered_columns), classes, len(bands), seed)
+
+
 def _parts(value: str) -> list[str]:
     import re
     return re.split(r"(\d+)", value)
@@ -290,6 +392,104 @@ def _write_annotations_csv(path: Path, rows: list[dict[str, object]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=columns, delimiter=";")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _write_demo_annotations_csv(path: Path, rows: list[dict[str, object]]) -> None:
+    columns = ["photo", "facies", "facies_code", "column", "core_start_px", "core_end_px", "length_px", "left", "top", "right", "bottom", "status"]
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns, delimiter=";")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_demo_excel(path: Path, photo_name: str, rows: list[dict[str, object]], classes: list[str], seed: int) -> None:
+    """Export the synthetic demo independently from real training labels."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+
+    workbook = Workbook()
+    summary = workbook.active
+    summary.title = "Сводка DEMO"
+    summary.sheet_view.showGridLines = False
+    summary.merge_cells("A1:H1")
+    summary["A1"] = "Kern Analyzer — DEMO: случайные 7 фаций"
+    summary["A1"].font = Font(bold=True, size=16, color="FFFFFF")
+    summary["A1"].fill = PatternFill("solid", fgColor="B91C1C")
+    summary["A1"].alignment = Alignment(horizontal="center")
+    summary.merge_cells("A2:H2")
+    summary["A2"] = "ВНИМАНИЕ: это синтетическая демонстрация. Результат не является геологическим прогнозом и не предназначен для обучения."
+    summary["A2"].font = Font(bold=True, color="9A3412")
+    summary["A2"].fill = PatternFill("solid", fgColor="FEF3C7")
+    summary["A2"].alignment = Alignment(wrap_text=True)
+    summary.row_dimensions[2].height = 34
+    summary.append(["Фото", photo_name, "Seed", seed, "Колонок", len({int(row['column']) for row in rows}), "Классов", len(classes)])
+    summary.append([])
+    summary.append(["Название фации", "Код", "Длина, px", "Доля", "Режим", "", "", ""])
+    totals: dict[str, int] = {}
+    codes: dict[str, str] = {}
+    for row in rows:
+        name = str(row["facies"])
+        totals[name] = totals.get(name, 0) + int(row["length_px"])
+        codes[name] = str(row["facies_code"])
+    total_pixels = sum(totals.values())
+    for name in classes:
+        length = totals.get(name, 0)
+        summary.append([name, codes.get(name, ""), length, length / total_pixels if total_pixels else 0, "Случайный DEMO", "", "", ""])
+    summary.append(["ИТОГО", "", total_pixels, "=SUM(D6:D12)", "Все пиксели керна закрыты", "", "", ""])
+
+    detail = workbook.create_sheet("Маски DEMO")
+    detail.sheet_view.showGridLines = False
+    headers = ["Фото", "Название фации", "Код", "№ колонки", "От начала керна, px", "До конца, px", "Толщина, px", "Left", "Top", "Right", "Bottom", "Статус"]
+    detail.append(headers)
+    for row in rows:
+        detail.append([
+            row["photo"], row["facies"], row["facies_code"], row["column"], row["core_start_px"],
+            row["core_end_px"], row["length_px"], row["left"], row["top"], row["right"], row["bottom"], row["status"],
+        ])
+
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(bold=True, color="FFFFFF")
+    warning_fill = PatternFill("solid", fgColor="FDE68A")
+    thin = Side(style="thin", color="D1D5DB")
+    for sheet, header_row in ((summary, 5), (detail, 1)):
+        for cell in sheet[header_row]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        sheet.freeze_panes = f"A{header_row + 1}"
+        sheet.auto_filter.ref = sheet.dimensions
+        for row_cells in sheet.iter_rows(min_row=header_row + 1, max_row=sheet.max_row, min_col=1, max_col=sheet.max_column):
+            for cell in row_cells:
+                cell.border = Border(bottom=thin)
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+    for cell in summary[summary.max_row]:
+        cell.fill = warning_fill
+        cell.font = Font(bold=True)
+    summary.column_dimensions["A"].width = 25
+    summary.column_dimensions["B"].width = 20
+    summary.column_dimensions["C"].width = 16
+    summary.column_dimensions["D"].width = 13
+    summary.column_dimensions["E"].width = 28
+    for column, width in zip("ABCDEFGHIJKL", (28, 25, 14, 13, 19, 16, 15, 11, 11, 11, 11, 46)):
+        detail.column_dimensions[column].width = width
+    for cell in summary["D6:D12"]:
+        cell[0].number_format = "0.0%"
+    workbook.save(path)
+
+
+def _write_demo_review(output_dir: Path, payload: dict[str, object]) -> None:
+    files = payload["files"]
+    messages = payload["messages"]
+    rows = "\n".join(
+        f"<tr><td>{html.escape(str(item['level']))}</td><td>{html.escape(str(item['message']))}</td></tr>"
+        for item in messages
+    )
+    document = f"""<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><title>Kern Analyzer — DEMO</title>
+<style>body{{font-family:Segoe UI,Arial,sans-serif;margin:24px;background:#f4f6f8;color:#172033}}.warning{{background:#7f1d1d;color:#fff;padding:16px;border-radius:8px;font-weight:700}}section{{background:#fff;margin:18px 0;padding:14px;border:1px solid #d7dde4;border-radius:8px}}img{{max-width:100%;border:1px solid #c7ced6}}table{{border-collapse:collapse;width:100%}}td,th{{padding:7px;border-bottom:1px solid #d7dde4;text-align:left}}</style></head><body>
+<h1>Kern Analyzer: DEMO 7 фаций</h1><p class=\"warning\">СИНТЕТИЧЕСКАЯ ДЕМОНСТРАЦИЯ. Это не прогноз фаций, не ручная разметка и не материал для обучения модели.</p>
+<section><p>Фото: {html.escape(str(payload['source_photo']))}</p><p>Найдено колонок: {payload['columns_detected']}; классов: {len(payload['classes'])}; прямоугольников: {payload['rectangles_created']}; seed: {payload['seed']}.</p><p>{html.escape(str(payload['coverage']))}</p><p><a href=\"{quote(str(files['excel']), safe='/._-') }\">Открыть Excel-выгрузку</a></p></section>
+<section><h2>Наложение</h2><img src=\"{quote(str(files['overlay']), safe='/._-')}\"></section><section><h2>Сообщения агентов</h2><table><tr><th>Уровень</th><th>Сообщение</th></tr>{rows}</table></section></body></html>"""
+    (output_dir / "review.html").write_text(document, encoding="utf-8")
 
 
 def _write_review(output_dir: Path, payload: dict[str, object]) -> None:
