@@ -1,7 +1,7 @@
 @echo off
 setlocal
 if "%~1"=="" (
-  echo Usage: drag one core photo onto this BAT.
+  echo Usage: drag a folder with core photos onto this BAT.
   echo It creates a synthetic DEMO mask and an Excel file next to the photo.
   pause
   exit /b 2

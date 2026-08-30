@@ -1,6 +1,6 @@
-Core Tape Builder + Facies Audit
-Release: 2026-08-30
+Kern Analyzer v1.5
 
-Portable Windows package. Includes:
-- core-column detection, masks, crops and vertical core-tape build;
-- Excel/tape audit with facies meter statistics and data-quality checks.
+Полный переносимый выпуск Windows.
+Включает интерфейс Kern Analyzer, CUDA-PyTorch, модель best.pt, офлайн OCR
+Tesseract (русский и английский), аудит фаций, DEMO на 7 фаций и модуль
+автоматического наложения Excel-интервалов на фото керна.

@@ -21,11 +21,13 @@ py -3.11 -m PyInstaller --noconfirm --clean --onedir --windowed --name Kern_Anal
   --paths . ^
   --add-data "models\best.pt;models" ^
   --add-data "app;app" ^
+  --add-data "tools\tesseract;tools\tesseract" ^
   --runtime-hook "app\qt_runtime_hook.py" ^
   --hidden-import app.ui.widgets.workspace_canvas ^
   --hidden-import PySide6.QtCore ^
   --hidden-import PySide6.QtGui ^
   --hidden-import PySide6.QtWidgets ^
+  --hidden-import build_core_tape ^
   --collect-submodules app ^
   --collect-all PySide6 ^
   --collect-binaries shiboken6 ^

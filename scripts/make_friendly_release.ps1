@@ -10,14 +10,13 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 $sourceRoot = (Resolve-Path -LiteralPath $Source).Path
 $outputRoot = (Resolve-Path -LiteralPath $Output).Path
 $archiveNames = @(
-    'Kern-Analyzer-v1.4-Windows-part1.zip',
-    'Kern-Analyzer-v1.4-Windows-part2.zip'
+    'Kern-Analyzer-v1.5-Windows-part1.zip',
+    'Kern-Analyzer-v1.5-Windows-part2.zip'
 )
 
 $files = Get-ChildItem -LiteralPath $sourceRoot -Recurse -File | Where-Object {
     $relative = $_.FullName.Substring($sourceRoot.Length).TrimStart('\')
     -not $relative.StartsWith('_payload_chunks\', [System.StringComparison]::OrdinalIgnoreCase) -and
-    $relative -ne 'Start_Kern_Analyzer.bat' -and
     # These DLLs can be collected from the build machine PATH. They conflict
     # with the Qt bundle on Windows 10 LTSC and must not be shipped.
     $relative -notin @('_internal\icuuc.dll', '_internal\icudt78.dll')
@@ -69,13 +68,14 @@ for ($index = 0; $index -lt 2; $index++) {
 
         if ($index -eq 0) {
             Add-TextEntry $archive 'Kern_Analyzer/README.txt' @"
-Kern Analyzer v1.4 — installation
+Kern Analyzer v1.5 — full Windows installation
 
 1. Download both files: part1 and part2.
 2. Extract BOTH archives into the same place. They will form one folder named Kern_Analyzer.
-3. Open Kern_Analyzer and run Kern_Analyzer.exe.
+3. Open Kern_Analyzer and run Kern_Analyzer.exe. Without parameters it opens the graphical app.
+4. Optional BAT shortcuts run the core-tape builder, Excel facies masks, audit, and synthetic DEMO.
 
-Only Kern_Analyzer.exe is the application launcher. Everything else is kept in _internal and is required for GPU training.
+This is the full GPU-enabled release. Keep the complete folder: _internal and tools are required for model training and offline Russian OCR.
 "@
         }
     }
@@ -84,6 +84,6 @@ Only Kern_Analyzer.exe is the application launcher. Everything else is kept in _
     }
 }
 
-Get-ChildItem -LiteralPath $outputRoot -File -Filter 'Kern-Analyzer-v1.4-Windows-part*.zip' |
+Get-ChildItem -LiteralPath $outputRoot -File -Filter 'Kern-Analyzer-v1.5-Windows-part*.zip' |
     Sort-Object Name |
     Select-Object Name, Length, @{Name='SHA256'; Expression={(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash}}
