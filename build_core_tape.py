@@ -55,6 +55,17 @@ RIGHT_MARGIN = 18
 AUDIT_FOLDER_NAME = "_facies_audit"
 
 
+def _console_print(message: str, *, file=None) -> None:
+    """Print CLI status even when the host console cannot encode Cyrillic."""
+    stream = file or sys.stdout
+    try:
+        print(message, file=stream)
+    except UnicodeEncodeError:
+        encoding = getattr(stream, "encoding", None) or "ascii"
+        escaped = message.encode(encoding, errors="backslashreplace").decode(encoding)
+        print(escaped, file=stream)
+
+
 @dataclass
 class CropRecord:
     photo_number: int
@@ -418,8 +429,8 @@ def run_audit(work_folder: Path, output_dir: Path, supplied_excels: list[Path]) 
     payload = {"created_at": datetime.now().isoformat(timespec="seconds"), "root_folder": str(root), "facies": summaries, "wells": well_rows, "issues": [item.__dict__ for item in issues]}
     (output_dir / "facies_audit.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     _audit_html(output_dir, summaries, well_rows, issues)
-    print(f"\\nАудит готов. Скважин: {len(well_rows)}, фаций: {len(summaries)}, замечаний: {len(issues)}")
-    print(f"Отчёт: {output_dir / 'facies_audit.html'}")
+    _console_print(f"\\nАудит готов. Скважин: {len(well_rows)}, фаций: {len(summaries)}, замечаний: {len(issues)}")
+    _console_print(f"Отчёт: {output_dir / 'facies_audit.html'}")
     return 0
 
 

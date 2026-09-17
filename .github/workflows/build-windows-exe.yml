@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+env:
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: 'utf-8'
+
 concurrency:
   group: kern-analyzer-windows-release
   cancel-in-progress: true
@@ -54,7 +58,7 @@ jobs:
           Get-Content unit-tests.log | Add-Content $env:GITHUB_STEP_SUMMARY
           '```' | Add-Content $env:GITHUB_STEP_SUMMARY
           if ($testExit -ne 0) {
-            $tailLines = Get-Content unit-tests.log | Select-Object -Last 100 | ForEach-Object { $_.Replace('%', '%25') }
+            $tailLines = Get-Content unit-tests.log | Select-Object -Last 30 | ForEach-Object { $_.Replace('%', '%25') }
             $tail = $tailLines -join '%0A'
             Write-Output "::error title=Unit test output::$tail"
             throw "Unit tests failed with exit code $testExit"
