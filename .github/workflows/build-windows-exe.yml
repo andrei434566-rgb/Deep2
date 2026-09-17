@@ -3,7 +3,6 @@ name: Build Windows application
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
     tags: ['v*']
 
 permissions:
@@ -54,7 +53,12 @@ jobs:
           '```text' | Add-Content $env:GITHUB_STEP_SUMMARY
           Get-Content unit-tests.log | Add-Content $env:GITHUB_STEP_SUMMARY
           '```' | Add-Content $env:GITHUB_STEP_SUMMARY
-          if ($testExit -ne 0) { throw "Unit tests failed with exit code $testExit" }
+          if ($testExit -ne 0) {
+            $tailLines = Get-Content unit-tests.log | Select-Object -Last 100 | ForEach-Object { $_.Replace('%', '%25') }
+            $tail = $tailLines -join '%0A'
+            Write-Output "::error title=Unit test output::$tail"
+            throw "Unit tests failed with exit code $testExit"
+          }
 
       - name: Build portable Kern Analyzer
         run: python -m PyInstaller --noconfirm --clean Kern_Analyzer.spec
