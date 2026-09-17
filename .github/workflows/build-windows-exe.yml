@@ -44,9 +44,17 @@ jobs:
           Invoke-WebRequest -Uri 'https://github.com/tesseract-ocr/tessdata_fast/raw/main/rus.traineddata' -OutFile tools/tesseract/tessdata/rus.traineddata
 
       - name: Run unit tests
+        shell: pwsh
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -B -m unittest discover
+        run: |
+          python -B -m unittest discover -v 2>&1 | Tee-Object -FilePath unit-tests.log
+          $testExit = $LASTEXITCODE
+          "## Unit tests" | Add-Content $env:GITHUB_STEP_SUMMARY
+          '```text' | Add-Content $env:GITHUB_STEP_SUMMARY
+          Get-Content unit-tests.log | Add-Content $env:GITHUB_STEP_SUMMARY
+          '```' | Add-Content $env:GITHUB_STEP_SUMMARY
+          if ($testExit -ne 0) { throw "Unit tests failed with exit code $testExit" }
 
       - name: Build portable Kern Analyzer
         run: python -m PyInstaller --noconfirm --clean Kern_Analyzer.spec
