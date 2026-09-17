@@ -15,7 +15,12 @@ class PhotoIntervalMappingDialog(QDialog):
 
     HEADERS = ("Файл фото", "Скважина", "Начало, м", "Конец, м", "Источник")
 
-    def __init__(self, rows: list[tuple[Path, CoreInterval | None, str]], parent=None):
+    def __init__(
+        self,
+        rows: list[tuple[Path, CoreInterval | None, str]],
+        parent=None,
+        context_text: str = "",
+    ):
         super().__init__(parent)
         self.setWindowTitle("Проверка интервалов фотографий")
         self.resize(900, 520)
@@ -28,6 +33,11 @@ class PhotoIntervalMappingDialog(QDialog):
         )
         note.setWordWrap(True)
         layout.addWidget(note)
+        if context_text:
+            context = QLabel(context_text, self)
+            context.setWordWrap(True)
+            context.setStyleSheet("padding: 7px; background: #eef4f8; border: 1px solid #c7d6df;")
+            layout.addWidget(context)
         self.table = QTableWidget(len(rows), len(self.HEADERS), self)
         self.table.setHorizontalHeaderLabels(self.HEADERS)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)

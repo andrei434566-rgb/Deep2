@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import re
 import shutil
@@ -9,35 +10,55 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
-from PySide6.QtCore import QPointF, QSettings, QThread, Qt
+from PySide6.QtCore import QPointF, QSettings, QThread, QTimer, Qt
 from PySide6.QtGui import QAction, QColor, QCursor, QPolygonF
-from PySide6.QtWidgets import QApplication, QColorDialog, QFileDialog, QDockWidget, QFrame, QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu, QMessageBox, QProgressBar, QProgressDialog, QPushButton, QSpinBox, QStatusBar, QTabWidget, QToolBar, QToolButton, QTreeWidget, QTreeWidgetItem
+from PySide6.QtWidgets import QApplication, QCheckBox, QColorDialog, QFileDialog, QDockWidget, QFrame, QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu, QMessageBox, QProgressBar, QProgressDialog, QPushButton, QSpinBox, QStatusBar, QTabWidget, QToolBar, QToolButton, QTreeWidget, QTreeWidgetItem
 
+from app.domain.facies_catalog import facies_metadata, resolve_facies_class
+from app.domain.facies_palette import normalize_facies_palette
+from app.domain.lithology import default_lithology_palette, normalize_lithology_palette
 from app.domain.models import PhotoRecord
 from app.infrastructure.io.las_parser import parse_las_file
 from app.infrastructure.core_report_export import export_core_description_report
 from app.infrastructure.cvat_coco_import import CvatImagesMissingError, import_cvat_coco_zip, import_cvat_coco_zips
-from app.infrastructure.excel_core_description import CoreInterval, create_automatic_interval_detections, create_depth_bound_detections, layers_for_photo, photo_interval_from_filename, read_description_workbook
+from app.infrastructure.excel_core_description import (
+    CoreInterval,
+    create_automatic_interval_detections,
+    create_depth_bound_detections,
+    layers_for_photo,
+    photo_interval_from_filename,
+    read_description_workbook,
+    suggest_photo_intervals_from_excel,
+    workbook_import_summary,
+)
 from app.infrastructure.facies_postprocess import postprocess_detections
 from app.infrastructure.image_loading import load_working_pixmap
 from app.infrastructure.lithology_attribute_service import LithologyAttributeService
 from app.infrastructure.ml.fine_tune_worker import FineTuneWorker
-from app.infrastructure.ml.rule_based_facies import RuleBasedFaciesDetector
+from app.infrastructure.ml.core_column_service import (
+    CoreColumnRecognizer,
+    CoreColumnTrainingWorker,
+    MIN_COLUMN_TRAINING_PHOTOS,
+    export_core_column_dataset,
+)
 from app.infrastructure.ml.yolo_model_service import SegmentationWorker
 from app.infrastructure.pdf_photo_import import render_pdf_pages
 from app.infrastructure.photo_caption_ocr import read_caption_metadata
 from app.infrastructure.project_storage import MANIFEST_NAME, load_project, save_project
 from app.infrastructure.training_dataset import MIN_TRAINING_SAMPLES, automatic_samples_count, export_training_dataset, unlabeled_manual_samples_count, verified_samples_count
 from app.infrastructure.training_quality import review_queue, training_quality
+from app.infrastructure.training_recommendation import TrainingRecommendation, recommend_training
 from app.runtime_paths import bundled_root, user_data_root
 from app.ui.dialogs.depth_range_dialog import DepthRangeDialog
 from app.ui.dialogs.core_columns_dialog import CoreColumnsDialog
 from app.ui.dialogs.facies_dialog import FaciesDialog
+from app.ui.dialogs.model_preparation_dialog import ModelPreparationDialog
 from app.ui.dialogs.log_editor_dialog import LogEditorDialog
+from app.ui.dialogs.lithology_palette_dialog import FaciesPaletteDialog, LithologyPaletteDialog
 from app.ui.dialogs.photo_interval_dialog import PhotoIntervalDialog
 from app.ui.dialogs.photo_interval_mapping_dialog import PhotoIntervalMappingDialog
 from app.ui.dialogs.well_depth_dialog import WellDepthDialog
-from app.ui.widgets.workspace_canvas import StackColumnItem, WorkspaceCanvas
+from app.ui.widgets.workspace_canvas import StackColumnItem, WorkspaceCanvas, facies_color
 
 
 class MainWindow(QMainWindow):
@@ -56,6 +77,9 @@ class MainWindow(QMainWindow):
         self._segmentation_failed = False
         self._training_thread: QThread | None = None
         self._training_worker: FineTuneWorker | None = None
+        self._column_training_thread: QThread | None = None
+        self._column_training_worker: CoreColumnTrainingWorker | None = None
+        self._column_training_succeeded_model: Path | None = None
         self._training_epoch_current = 0
         self._training_epoch_total = 0
         self._fine_tune_success_model: Path | None = None
@@ -65,10 +89,18 @@ class MainWindow(QMainWindow):
         self._queued_records: list[PhotoRecord] = []
         self._pending_photo_imports: deque[tuple[Path, str, float | None, float | None]] = deque()
         self._facies_dialogs: list[FaciesDialog] = []
-        self._selected_model_path: Path | None = None
+        self._settings = QSettings("Kern Analyzer", "KernAnalyzer")
+        saved_facies_model = str(self._settings.value("facies/model_path", "") or "")
+        self._selected_model_path: Path | None = Path(saved_facies_model) if saved_facies_model else None
         self._gis_data: dict | None = None
         self._rigis_data: dict | None = None
-        self._settings = QSettings("Kern Analyzer", "KernAnalyzer")
+        self._lithology_palette = self._read_lithology_palette()
+        StackColumnItem.set_lithology_palette(self._lithology_palette)
+        self._saved_facies_palette = self._read_facies_palette()
+        self._facies_palette: list[dict[str, str]] = []
+        StackColumnItem.set_facies_palette([])
+        saved_column_model = str(self._settings.value("core_columns/model_path", "") or "")
+        self._selected_column_model_path: Path | None = Path(saved_column_model) if saved_column_model else None
         self._confidence_threshold = self._read_confidence_threshold()
         self._segmentation_profile = self._read_segmentation_profile()
         self._well_logs: dict[str, dict[str, dict]] = {}
@@ -137,7 +169,6 @@ class MainWindow(QMainWindow):
                     ("Сохранить проект", self.save_project, "Сохранить текущий проект", "Ctrl+S"),
                     ("Сохранить проект как…", self.save_project_as, "Сохранить проект в новой папке", "Ctrl+Shift+S"),
                     ("Загрузить фото/PDF…", self.open_images, "Выбрать изображения или PDF; каждая страница PDF станет отдельным фото", "Ctrl+O"),
-                    ("Настроить колонки керна на фото…", self.configure_core_columns, "Вручную задать границы керна; фон, линейки и шлак будут исключены"),
                     ("Автоматически определить интервалы на фото…", self.detect_photo_intervals, "Выделить на фото устойчивые визуальные интервалы и заполнить строки без назначения фаций"),
                     ("Импорт разметки CVAT (COCO ZIP)…", self.import_cvat_coco, "Создать проект из фото, контуров и классов из выгрузки CVAT"),
                     ("Импорт нескольких CVAT ZIP…", self.import_cvat_coco_batch, "Последовательно объединить несколько COCO ZIP с защитой памяти и дубликатов"),
@@ -149,15 +180,30 @@ class MainWindow(QMainWindow):
         )
         toolbar.addWidget(
             self._create_toolbar_menu(
+                "Столбики",
+                [
+                    ("Проверить границы на фото…", self.configure_core_columns, "Исправить и подтвердить обучающую разметку столбиков"),
+                    ("Выбрать модель столбиков…", self.select_core_column_model, "Выбрать отдельную YOLO-модель класса core_column"),
+                    ("Обучить модель столбиков…", self.start_core_column_training, "Обучить отдельный первый этап на подтверждённых границах"),
+                ],
+                "Отдельный этап 1: поиск и обучение столбиков керна",
+            )
+        )
+        toolbar.addWidget(
+            self._create_toolbar_menu(
                 "Модель",
                 [
+                    ("Подготовка модели и перенос…", self.show_model_preparation, "Справочник фаций, покрытие классов, проверка и экспорт без подключения модели"),
                     ("Выбрать модель сегментации…", self.select_detection_model, "Выбрать файл модели .pt"),
+                    ("Переразметить фации выбранной моделью…", self.resegment_facies_with_selected_model, "Заменить текущие фациальные маски новым прогнозом"),
                     ("История дообучений…", self.show_training_history, "Сравнить сохранённые модели по validation-метрикам"),
                     ("Проверить датасет перед обучением…", self.show_training_quality, "Проверить малые классы, дубликаты и размер масок"),
                     ("Порог уверенности масок…", self.select_confidence_threshold, "Ниже порог — больше масок для ручной проверки"),
                     ("Режим сегментации…", self.select_segmentation_profile, "Быстрый, стандартный или детальный режим обработки фото"),
                     ("Проверить сомнительные маски…", self.review_uncertain_masks, "Открыть очередь автоматических масок с низкой уверенностью"),
                     ("Подобрать атрибуты пород…", self.suggest_lithology_attributes, "Отдельно от фаций предложить цвет, зернистость и слоистость внутри масок"),
+                    ("Настроить литологическую палетку…", self.configure_lithology_palette, "Свои названия пород, цвета, условные знаки и узоры"),
+                    ("Настроить палетку фаций…", self.configure_facies_palette, "Классы и цвета из масок загруженных фотографий"),
                 ],
                 "Модель детекции и сегментации",
             )
@@ -184,8 +230,17 @@ class MainWindow(QMainWindow):
         back_to_photos.setShortcut("Home")
         back_to_photos.triggered.connect(self.return_to_photos)
         toolbar.addAction(back_to_photos)
-        toolbar.addSeparator()
-        toolbar.addWidget(self._create_training_bar())
+
+        # Keep training controls on their own toolbar row.  The former layout
+        # appended them to an already full row, so Qt moved them into the
+        # overflow popup on ordinary laptop-sized windows.
+        training_toolbar = QToolBar("Обучение фаций", self)
+        training_toolbar.setObjectName("trainingToolbar")
+        training_toolbar.setMovable(False)
+        training_toolbar.setFloatable(False)
+        self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, training_toolbar)
+        training_toolbar.addWidget(self._create_training_bar())
         self._register_shortcuts()
 
         self.setStyleSheet(
@@ -196,7 +251,8 @@ class MainWindow(QMainWindow):
             QTabBar::tab { background: #eef1f7; color: #596176; border: 1px solid #d9deea; border-bottom: none; padding: 8px 18px; margin-right: 2px; min-width: 130px; }
             QTabBar::tab:selected { background: #ffffff; color: #5149ca; font-weight: 700; border-top: 2px solid #655be8; }
             QTabBar::tab:hover { background: #f7f7ff; color: #5149ca; }
-            QToolBar#mainToolbar { background: #ffffff; border: none; border-bottom: 1px solid #e4e8f0; spacing: 8px; padding: 9px 14px; }
+            QToolBar#mainToolbar { background: #ffffff; border: none; spacing: 8px; padding: 9px 14px 5px 14px; }
+            QToolBar#trainingToolbar { background: #ffffff; border: none; border-bottom: 1px solid #e4e8f0; spacing: 6px; padding: 3px 14px 8px 14px; }
             QLabel#appTitle { color: #35306f; font-weight: 800; letter-spacing: 1px; padding: 0 10px; }
             QToolButton#toolbarMenuButton { color: #262b3d; font-weight: 600; background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 7px 11px; }
             QToolButton#toolbarMenuButton:hover { background: #f0f1ff; border-color: #e4e3ff; color: #554dcc; }
@@ -223,6 +279,106 @@ class MainWindow(QMainWindow):
             """
         )
 
+    def _read_lithology_palette(self) -> list[dict[str, str]]:
+        raw = self._settings.value("lithology/palette_json", "")
+        if raw:
+            try:
+                palette = normalize_lithology_palette(json.loads(str(raw)))
+                if palette:
+                    return palette
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        return default_lithology_palette()
+
+    def _save_lithology_palette(self) -> None:
+        self._settings.setValue(
+            "lithology/palette_json",
+            json.dumps(self._lithology_palette, ensure_ascii=False),
+        )
+        self._settings.sync()
+
+    def configure_lithology_palette(self) -> None:
+        dialog = LithologyPaletteDialog(self._lithology_palette, self)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        palette = dialog.palette()
+        if not palette:
+            return
+        self._lithology_palette = palette
+        self._save_lithology_palette()
+        StackColumnItem.set_lithology_palette(palette)
+        if self._records or self._empty_wells:
+            self._show_stack()
+        self.statusBar().showMessage(f"Литологическая палетка сохранена · пород: {len(palette)}")
+
+    def _read_facies_palette(self) -> list[dict[str, str]]:
+        raw = self._settings.value("facies/palette_json", "")
+        if raw:
+            try:
+                return normalize_facies_palette(json.loads(str(raw)))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        return []
+
+    def _facies_palette_defaults(self) -> list[dict[str, str]]:
+        rows = []
+        seen: set[str] = set()
+        for record in self._records:
+            for detection in record.detections:
+                label = str(detection.label or "").strip()
+                key = label
+                if not label or label == "Новый контур" or key in seen:
+                    continue
+                rows.append(
+                    {
+                        "key": label,
+                        "name": label,
+                        "symbol": label[:12],
+                        "color": facies_color(label).name(QColor.NameFormat.HexRgb),
+                        "pattern": "solid",
+                    }
+                )
+                seen.add(key)
+        return normalize_facies_palette(rows)
+
+    def _sync_facies_palette(self) -> None:
+        saved = {item["key"]: item for item in self._saved_facies_palette}
+        merged = []
+        current_keys: set[str] = set()
+        for default in self._facies_palette_defaults():
+            normalized_key = default["key"]
+            current_keys.add(normalized_key)
+            custom = saved.get(normalized_key)
+            merged.append({**default, **(custom or {}), "key": default["key"]})
+        # Keep explicitly added user classes available for manual reassignment,
+        # even when the current batch has no prediction of that class yet.
+        merged.extend(item for key, item in saved.items() if key not in current_keys)
+        self._facies_palette = normalize_facies_palette(merged)
+        StackColumnItem.set_facies_palette(self._facies_palette)
+
+    def configure_facies_palette(self) -> None:
+        defaults = self._facies_palette_defaults()
+        if not defaults:
+            QMessageBox.information(
+                self,
+                "Палетка фаций",
+                "Сначала загрузите и распознайте фотографии: список фаций собирается из масок в памяти.",
+            )
+            return
+        self._sync_facies_palette()
+        dialog = FaciesPaletteDialog(self._facies_palette, defaults, self)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        self._saved_facies_palette = dialog.palette()
+        self._settings.setValue(
+            "facies/palette_json",
+            json.dumps(self._saved_facies_palette, ensure_ascii=False),
+        )
+        self._settings.sync()
+        self._sync_facies_palette()
+        self._show_stack()
+        self.statusBar().showMessage(f"Палетка фаций сохранена · классов из фотографий: {len(self._facies_palette)}")
+
     def _create_training_bar(self) -> QFrame:
         bar = QFrame(self)
         bar.setObjectName("trainingBar")
@@ -231,17 +387,20 @@ class MainWindow(QMainWindow):
         layout.setSpacing(5)
         self._training_count_label = QLabel(bar)
         self._training_count_label.setObjectName("trainingCount")
-        self._training_epochs_label = QLabel("Эпохи:", bar)
+        self._training_epochs_label = QLabel("Макс. эпох:", bar)
         self._training_epochs_label.setObjectName("trainingCount")
         self._training_epochs = QSpinBox(bar)
         self._training_epochs.setObjectName("trainingEpochs")
         self._training_epochs.setRange(1, 500)
         self._training_epochs.setValue(int(self._settings.value("training/epochs", 20)))
-        self._training_epochs.setToolTip("Сколько эпох выполнить при следующем дообучении")
+        self._training_epochs.setToolTip("Верхний предел эпох; обучение может остановиться раньше по контрольной выборке")
         self._training_epochs.valueChanged.connect(lambda value: self._settings.setValue("training/epochs", value))
+        self._training_auto_epochs = QCheckBox("авто", bar)
+        self._training_auto_epochs.setChecked(str(self._settings.value("training/auto_epochs", "true")).casefold() != "false")
+        self._training_auto_epochs.setToolTip("Автоматически применять рассчитанный безопасный максимум эпох")
+        self._training_auto_epochs.toggled.connect(self._on_training_auto_epochs_toggled)
         self._training_recommendation_label = QLabel(bar)
         self._training_recommendation_label.setObjectName("trainingCount")
-        self._training_recommendation_label.setToolTip("Оценка по числу вручную проверенных слоёв; её можно изменить вручную.")
         self._training_progress_label = QLabel("⏳ Обучение…", bar)
         self._training_progress_label.setObjectName("trainingProgressLabel")
         self._training_progress = QProgressBar(bar)
@@ -254,6 +413,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._training_count_label)
         layout.addWidget(self._training_epochs_label)
         layout.addWidget(self._training_epochs)
+        layout.addWidget(self._training_auto_epochs)
         layout.addWidget(self._training_recommendation_label)
         layout.addWidget(self._training_progress_label)
         layout.addWidget(self._training_progress)
@@ -305,9 +465,14 @@ class MainWindow(QMainWindow):
         needed = max(0, MIN_TRAINING_SAMPLES - count)
         self._training_count_label.setText(f"Для обучения: {count} · новые: {unlabeled_count} · авто: {automatic_count}")
         self._training_count_label.setToolTip(quality.summary)
-        recommended_epochs = self._recommended_training_epochs(count)
-        self._training_recommendation_label.setText(f"рекомендовано: {recommended_epochs}")
-        is_busy = self._segmentation_thread is not None or self._training_thread is not None
+        recommendation = self._current_training_recommendation(quality)
+        self._training_recommendation_label.setText(
+            f"ориентир {recommendation.recommended_epochs} · стоп {recommendation.patience}"
+        )
+        self._training_recommendation_label.setToolTip(recommendation.details)
+        if self._training_auto_epochs.isChecked():
+            self._training_epochs.setValue(recommendation.max_epochs)
+        is_busy = self._segmentation_thread is not None or self._training_thread is not None or self._column_training_thread is not None
         is_training = self._training_thread is not None
         self._training_progress_label.setVisible(is_training)
         self._training_progress.setVisible(is_training)
@@ -319,7 +484,8 @@ class MainWindow(QMainWindow):
             )
             self._training_progress.setRange(0, total)
             self._training_progress.setValue(current)
-        self._training_epochs.setEnabled(not is_busy)
+        self._training_auto_epochs.setEnabled(not is_busy)
+        self._training_epochs.setEnabled(not is_busy and not self._training_auto_epochs.isChecked())
         self._training_button.setEnabled(count >= MIN_TRAINING_SAMPLES and not is_busy)
         if is_busy:
             self._training_button.setToolTip("Дождитесь завершения текущей операции")
@@ -330,7 +496,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _recommended_training_epochs(examples: int) -> int:
-        """Conservative starting point for a small, manually reviewed dataset."""
+        """Legacy total-only estimate retained for integrations using this API."""
         if examples < 20:
             return 80
         if examples < 50:
@@ -340,6 +506,29 @@ class MainWindow(QMainWindow):
         if examples < 250:
             return 35
         return 25
+
+    def _on_training_auto_epochs_toggled(self, enabled: bool) -> None:
+        self._settings.setValue("training/auto_epochs", bool(enabled))
+        self._refresh_training_bar()
+
+    def _current_training_recommendation(self, quality=None) -> TrainingRecommendation:
+        return recommend_training(
+            self._records,
+            known_model_classes=self._known_model_facies(),
+            quality=quality,
+        )
+
+    def _known_model_facies(self) -> set[str] | None:
+        """Read class names cheaply, without loading a YOLO checkpoint in the UI."""
+        model_path = self._resolve_model_path()
+        if model_path is None:
+            return None
+        catalog_path = model_path.parent / "facies_catalog.json"
+        try:
+            catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return None
+        return {str(name).strip() for name in catalog if str(name).strip()} if isinstance(catalog, dict) else None
 
     def _build_project_sidebar(self) -> None:
         sidebar = QDockWidget("ПРОЕКТЫ", self)
@@ -404,6 +593,9 @@ class MainWindow(QMainWindow):
     def _trained_models_root(self) -> Path:
         """Published models live here instead of inside a training-run tree."""
         return user_data_root() / "models" / "trained"
+
+    def _core_column_models_root(self) -> Path:
+        return user_data_root() / "models" / "core_columns"
 
     def _pdf_pages_root(self) -> Path:
         return self._projects_root() / "pdf_pages"
@@ -492,6 +684,13 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         edit = menu.addAction("Редактировать параметры фации")
         edit.triggered.connect(lambda: self._open_facies_editor(record, detection))
+        menu.addSeparator()
+        move_up = menu.addAction("↑ Переместить слой выше")
+        move_up.setEnabled(self._can_move_layer(record, detection, -1))
+        move_up.triggered.connect(lambda: self._move_layer(record, detection, -1))
+        move_down = menu.addAction("↓ Переместить слой ниже")
+        move_down.setEnabled(self._can_move_layer(record, detection, 1))
+        move_down.triggered.connect(lambda: self._move_layer(record, detection, 1))
         menu.exec(self.project_tree.viewport().mapToGlobal(position))
 
     def _tree_layer(self, identifier: str, index) -> tuple[PhotoRecord, object] | None:
@@ -544,7 +743,7 @@ class MainWindow(QMainWindow):
             self._open_project(Path(folder))
 
     def _open_project(self, folder: Path) -> None:
-        if self._segmentation_thread is not None or self._training_thread is not None:
+        if self._segmentation_thread is not None or self._training_thread is not None or self._column_training_thread is not None:
             QMessageBox.information(self, "Подождите", "Дождитесь окончания сегментации перед открытием проекта.")
             return
         try:
@@ -554,10 +753,19 @@ class MainWindow(QMainWindow):
             return
         self.workspace.clear_workspace()
         self._records = records
+        for record in records:
+            for detection in record.detections:
+                approved = facies_metadata(
+                    detection.label,
+                    (detection.attributes or {}).get("Индекс фации"),
+                )
+                if approved:
+                    detection.attributes.update(approved)
         self._deleted_records.clear()
         self._project_folder = folder
         self._project_title = title
-        self._selected_model_path = self._best_project_model(folder)
+        # Keep the explicitly selected global model. Opening a project never
+        # promotes an old training run implicitly.
         self._gis_data = None
         self._rigis_data = None
         self._well_logs.clear()
@@ -719,6 +927,22 @@ class MainWindow(QMainWindow):
         self._deleted_records.clear()
         self._refresh_project_tree()
         self._refresh_training_bar()
+        if self._resolve_model_path() is None:
+            for record in records:
+                record.core_columns = self._suggest_core_columns(record)
+                if record.core_columns:
+                    self._update_depth_segments_for_columns(record)
+                self.workspace.update_photo_detections(record)
+            if self._well_names():
+                self._show_stack()
+            self._refresh_project_tree()
+            self._refresh_training_bar()
+            self.statusBar().showMessage(
+                f"Загружено {len(records)} фото · модель фаций не подключена · можно размечать и готовить датасет"
+            )
+            if self._pending_photo_imports:
+                QTimer.singleShot(0, self._load_next_photo_batch)
+            return
         self.statusBar().showMessage(
             f"Загружено {len(records)} фото · в очереди: {len(self._pending_photo_imports)} · запускаю сегментацию…"
         )
@@ -726,7 +950,7 @@ class MainWindow(QMainWindow):
 
     def import_cvat_coco(self) -> None:
         """Create a clean Kern Analyzer project from a human-marked CVAT COCO ZIP."""
-        if self._segmentation_thread is not None or self._training_thread is not None:
+        if self._segmentation_thread is not None or self._training_thread is not None or self._column_training_thread is not None:
             QMessageBox.information(self, "Импорт CVAT", "Дождитесь окончания текущей операции.")
             return
         archive_path, _ = QFileDialog.getOpenFileName(
@@ -833,7 +1057,7 @@ class MainWindow(QMainWindow):
 
     def import_cvat_coco_batch(self) -> None:
         """Sequentially import several COCO ZIPs; never unpack the full batch in memory."""
-        if self._segmentation_thread is not None or self._training_thread is not None:
+        if self._segmentation_thread is not None or self._training_thread is not None or self._column_training_thread is not None:
             QMessageBox.information(self, "Импорт CVAT", "Дождитесь окончания текущей операции.")
             return
         archive_paths, _ = QFileDialog.getOpenFileNames(
@@ -928,7 +1152,7 @@ class MainWindow(QMainWindow):
 
     def import_excel_photo_batch(self) -> None:
         """Build reviewed training candidates from a depth-description Excel and JPG folder."""
-        if self._segmentation_thread is not None or self._training_thread is not None:
+        if self._segmentation_thread is not None or self._training_thread is not None or self._column_training_thread is not None:
             QMessageBox.information(self, "Импорт Excel + JPG", "Дождитесь окончания текущей операции.")
             return
         excel_path, _ = QFileDialog.getOpenFileName(
@@ -979,11 +1203,31 @@ class MainWindow(QMainWindow):
         records: list[PhotoRecord] = []
         wells_in_excel = sorted({layer.well for layer in layers}, key=str.casefold)
         default_well = wells_in_excel[0] if len(wells_in_excel) == 1 else ""
-        mapping_rows = [
+        mapping_rows = suggest_photo_intervals_from_excel([
             (path, *self._detect_photo_interval(path, default_well))
             for path in photo_paths
+        ], layers)
+        import_summary = workbook_import_summary(layers)
+        interval_titles = "; ".join(
+            item.title for item in import_summary["core_intervals"][:6]
+        )
+        if len(import_summary["core_intervals"]) > 6:
+            interval_titles += f"; ещё {len(import_summary['core_intervals']) - 6}"
+        context_lines = [
+            f"Месторождение: {', '.join(import_summary['fields']) or 'не найдено'}",
+            f"Скважины: {', '.join(import_summary['wells'])}",
+            f"Интервалы керна из Excel: {interval_titles or 'отдельно не заданы'}",
+            (
+                f"Слои фаций: {import_summary['facies_layers']}; "
+                f"с литологическим описанием/параметрами: {import_summary['described_layers']}. "
+                "Границы на фото будут вычислены пропорционально реальной мощности каждого слоя."
+            ),
         ]
-        mapping_dialog = PhotoIntervalMappingDialog(mapping_rows, self)
+        mapping_dialog = PhotoIntervalMappingDialog(
+            mapping_rows,
+            self,
+            context_text="\n".join(context_lines),
+        )
         while mapping_dialog.exec() == mapping_dialog.DialogCode.Accepted:
             try:
                 photo_mappings = mapping_dialog.mappings()
@@ -1033,6 +1277,13 @@ class MainWindow(QMainWindow):
                 report.extend(f"[Проверка] {issue.source}: {issue.message}" for issue in image_issues)
                 if not detections:
                     continue
+                report.extend(
+                    f"[Слой] {photo_path.name}: {item.label} · "
+                    f"{item.depth_from:g}–{item.depth_to:g} м · "
+                    f"мощность {item.depth_to - item.depth_from:g} м · требуется проверка"
+                    for item in detections
+                    if item.depth_from is not None and item.depth_to is not None
+                )
                 records.append(
                     PhotoRecord(
                         identifier=str(uuid4()),
@@ -1076,6 +1327,34 @@ class MainWindow(QMainWindow):
         self._well_depth_settings.clear()
         self._well_intervals.clear()
         self._well_interpretations.clear()
+        for well_name in self._well_order:
+            well_layers = layers_for_photo(layers, well_name, -1.0e12, 1.0e12)
+            if not well_layers:
+                continue
+            core_tops = [
+                item.core_top if item.core_top is not None else item.top
+                for item in well_layers
+            ]
+            core_bases = [
+                item.core_base if item.core_base is not None else item.base
+                for item in well_layers
+            ]
+            field_names = list(dict.fromkeys(item.field_name for item in well_layers if item.field_name))
+            self._well_intervals[well_name] = (min(core_tops), max(core_bases))
+            self._well_depth_ranges[well_name] = (
+                min([item.top for item in well_layers] + core_tops),
+                max([item.base for item in well_layers] + core_bases),
+            )
+            self._well_depth_references[well_name] = "MD"
+            self._well_depth_settings[well_name] = {
+                "coordinate_system": "MD",
+                "unit": "m",
+                "datum": "RKB / KB",
+                "datum_elevation": None,
+                "source_curve": "",
+                "source": "Excel",
+                "field": "; ".join(field_names),
+            }
         self._active_well_name = records[0].well_name
         self.workspace.add_photos(records)
         self._save_current_project(project_folder)
@@ -1087,7 +1366,8 @@ class MainWindow(QMainWindow):
             "Импорт Excel + JPG завершён",
             (
                 f"Сопоставлено фото: {len(records)} из {len(photo_paths)}\n"
-                f"Создано слоёв для обучения: {sum(len(record.detections) for record in records)}\n\n"
+                f"Наложено слоёв фаций: {sum(len(record.detections) for record in records)}\n"
+                "Все автоматически спроецированные границы требуют проверки и подтверждения перед обучением.\n\n"
                 f"Диагностика сохранена в:\n{report_path}"
             ),
         )
@@ -1161,6 +1441,9 @@ class MainWindow(QMainWindow):
         if not records:
             QMessageBox.information(self, "Kern Analyzer", "Сначала загрузите фотографии через File → Загрузить фотографии.")
             return
+        if self._column_training_thread is not None:
+            QMessageBox.information(self, "Распознавание", "Дождитесь окончания обучения модели столбиков.")
+            return
         if self._segmentation_thread is not None:
             self._queued_records.extend(records)
             self.statusBar().showMessage("Фото добавлены в очередь сегментации…")
@@ -1171,7 +1454,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(
                 self,
                 "Модель не найдена",
-                "Не найден models/best.pt. Скопируйте модель из исходного Kern Analyzer в папку models этого проекта.",
+                "Выберите свою модель фаций .pt через меню «Модель». Без неё доступны загрузка фото, "
+                "ручная разметка, проверка выборки и экспорт для другого компьютера.",
             )
             return
 
@@ -1182,10 +1466,20 @@ class MainWindow(QMainWindow):
         self._segmentation_thread = QThread(self)
         self._segmentation_worker = SegmentationWorker(
             model_path,
-            [(record.path, record.pixmap.width(), record.pixmap.height(), record.core_columns or None) for record in records],
+            [
+                (
+                    record.path,
+                    record.pixmap.width(),
+                    record.pixmap.height(),
+                    record.core_columns or None,
+                    record.core_columns_verified,
+                )
+                for record in records
+            ],
             self._confidence_threshold,
             self._segmentation_options()["image_size"],
             self._segmentation_options()["max_detections"],
+            self._resolve_core_column_model_path(),
         )
         self._segmentation_worker.moveToThread(self._segmentation_thread)
         self._segmentation_thread.started.connect(self._segmentation_worker.run)
@@ -1200,7 +1494,7 @@ class MainWindow(QMainWindow):
 
     def detect_photo_intervals(self) -> None:
         """Create editable visual interval rows when no description is available."""
-        if self._segmentation_thread is not None or self._training_thread is not None:
+        if self._segmentation_thread is not None or self._training_thread is not None or self._column_training_thread is not None:
             QMessageBox.information(self, "Автоинтервалы", "Дождитесь окончания текущей операции.")
             return
         if not self._records:
@@ -1248,41 +1542,142 @@ class MainWindow(QMainWindow):
         )
 
     def _resolve_model_path(self) -> Path | None:
+        # Preparation and annotation work without weights. A bundled/older
+        # model is not necessarily the user's model or even a facies model.
+        path = self._selected_model_path
+        return path if path is not None and path.is_file() else None
+
+    def _resolve_core_column_model_path(self) -> Path | None:
+        """Return only a dedicated stage-1 model; never confuse it with facies."""
         root = bundled_root()
-        candidates = [
-            self._selected_model_path,
-            self._best_project_model(self._project_folder),
-            root / "models" / "best.pt",
-            root.parent / "deep core" / "core-analyzer" / "models" / "best.pt",
+        candidates: list[Path | None] = [
+            self._selected_column_model_path,
+            root / "models" / "core_columns" / "best.pt",
         ]
+        trained = sorted(
+            self._core_column_models_root().glob("*/best.pt"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        candidates.extend(trained)
         return next((path for path in candidates if path is not None and path.is_file()), None)
 
-    def _best_project_model(self, project_folder: Path | None) -> Path | None:
-        """Prefer the published model with best held-out mAP, never a partial run."""
-        if project_folder is None:
-            return None
-        root = self._trained_models_root() / self._safe_folder_name(self._project_title)
-        ranked: list[tuple[float, float, Path]] = []
-        for info_path in root.glob("*/training_info.json"):
-            try:
-                import json
+    def select_core_column_model(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выбрать модель столбиков",
+            str(self._selected_column_model_path.parent) if self._selected_column_model_path else "",
+            "Модели YOLO (*.pt);;Все файлы (*)",
+        )
+        if not file_path:
+            return
+        try:
+            recognizer = CoreColumnRecognizer(Path(file_path))
+        except Exception as exc:
+            QMessageBox.critical(self, "Модель столбиков", str(exc))
+            return
+        if recognizer.model is None:
+            QMessageBox.warning(
+                self,
+                "Неверная модель",
+                "В модели нет отдельного класса core_column. Выберите модель, обученную в модуле «Столбики».",
+            )
+            return
+        self._selected_column_model_path = Path(file_path)
+        self._settings.setValue("core_columns/model_path", str(self._selected_column_model_path))
+        self.statusBar().showMessage(f"Модель столбиков выбрана: {self._selected_column_model_path.name}")
 
-                info = json.loads(info_path.read_text(encoding="utf-8"))
-                score = float(dict(info.get("metrics") or {}).get("mAP50-95", -1))
-                model = info_path.parent / "best.pt"
-                if model.is_file() and (info_path.parent / "facies_catalog.json").is_file():
-                    ranked.append((score, model.stat().st_mtime, model))
-            except (OSError, ValueError, TypeError):
-                continue
-        if ranked:
-            return max(ranked, key=lambda item: (item[0], item[1]))[2]
-        candidates = [
-            path for path in project_folder.glob("training/runs/*/fine_tune/weights/best.pt")
-            if (path.parent / "facies_catalog.json").is_file()
-        ]
-        return max(candidates, key=lambda path: path.stat().st_mtime, default=None)
+    def start_core_column_training(self) -> None:
+        """Train stage 1 only from explicitly confirmed column rectangles."""
+        if self._segmentation_thread is not None or self._training_thread is not None or self._column_training_thread is not None:
+            QMessageBox.information(self, "Обучение столбиков", "Дождитесь окончания текущей операции.")
+            return
+        confirmed = sum(1 for record in self._records if record.core_columns_verified and record.core_columns)
+        if confirmed < MIN_COLUMN_TRAINING_PHOTOS:
+            QMessageBox.information(
+                self,
+                "Мало разметки",
+                f"Проверьте границы столбиков минимум на {MIN_COLUMN_TRAINING_PHOTOS} фото. Сейчас подтверждено: {confirmed}.",
+            )
+            return
+        base_model = self._resolve_core_column_model_path() or self._resolve_model_path()
+        if base_model is None:
+            QMessageBox.critical(self, "Нет базовой модели", "Не найден файл .pt, с которого можно начать обучение.")
+            return
+        epochs, accepted = QInputDialog.getInt(
+            self,
+            "Обучение столбиков",
+            f"Подтверждённых фото: {confirmed}. Число эпох:",
+            30, 1, 500, 1,
+        )
+        if not accepted:
+            return
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_folder = self._project_folder or (self._projects_root() / self._safe_folder_name(self._project_title))
+        training_root = base_folder / "training" / "core_columns"
+        try:
+            dataset = export_core_column_dataset(self._records, training_root / "datasets" / stamp)
+        except Exception as exc:
+            QMessageBox.critical(self, "Датасет столбиков", str(exc))
+            return
+        self._column_training_thread = QThread(self)
+        self._column_training_succeeded_model = None
+        self._column_training_worker = CoreColumnTrainingWorker(
+            base_model,
+            Path(dataset["data_yaml"]),
+            training_root / "runs" / stamp,
+            self._core_column_models_root() / stamp,
+            epochs,
+        )
+        self._column_training_worker.moveToThread(self._column_training_thread)
+        self._column_training_thread.started.connect(self._column_training_worker.run)
+        self._column_training_worker.progress.connect(self.statusBar().showMessage)
+        self._column_training_worker.epoch_progress.connect(self._on_column_training_epoch)
+        self._column_training_worker.succeeded.connect(self._on_column_training_succeeded)
+        self._column_training_worker.failed.connect(self._on_column_training_failed)
+        self._column_training_worker.finished.connect(self._column_training_thread.quit)
+        self._column_training_thread.finished.connect(self._on_column_training_finished)
+        self._column_training_thread.finished.connect(self._column_training_worker.deleteLater)
+        self._column_training_thread.finished.connect(self._column_training_thread.deleteLater)
+        self._show_activity("Обучение столбиков", f"Подготовлено фото: {confirmed}", epochs)
+        self._refresh_training_bar()
+        self._column_training_thread.start()
+
+    def _on_column_training_epoch(self, current: int, total: int) -> None:
+        label = f"Обучение столбиков: эпоха {current} из {total}"
+        self.statusBar().showMessage(label)
+        self._update_activity(label, current, total)
+
+    def _on_column_training_succeeded(self, model_path: str) -> None:
+        self._selected_column_model_path = Path(model_path)
+        self._column_training_succeeded_model = Path(model_path)
+        self._settings.setValue("core_columns/model_path", model_path)
+        self.statusBar().showMessage(f"Модель столбиков готова: {model_path}")
+
+    def _on_column_training_failed(self, message: str) -> None:
+        QMessageBox.critical(self, "Ошибка обучения столбиков", message)
+
+    def _on_column_training_finished(self) -> None:
+        trained = self._column_training_succeeded_model is not None and self._column_training_succeeded_model.is_file()
+        self._column_training_thread = None
+        self._column_training_worker = None
+        self._column_training_succeeded_model = None
+        self._close_activity()
+        self._refresh_training_bar()
+        if trained:
+            unverified = [record for record in self._records if not record.core_columns_verified]
+            if unverified:
+                self.statusBar().showMessage("Модель столбиков готова · повторяю этап 1 для непроверенных фото…")
+                self.run_segmentation(unverified)
+
+    def _best_project_model(self, project_folder: Path | None) -> Path | None:
+        """Different control splits are not a valid automatic model ranking."""
+        return None
 
     def select_detection_model(self) -> None:
+        if self._segmentation_thread is not None or self._training_thread is not None or self._column_training_thread is not None:
+            QMessageBox.information(self, "Модель фаций", "Дождитесь окончания текущей операции.")
+            return
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Выбрать модель сегментации",
@@ -1292,7 +1687,39 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
         self._selected_model_path = Path(file_path)
+        self._settings.setValue("facies/model_path", str(self._selected_model_path))
+        self._refresh_training_bar()
         self.statusBar().showMessage(f"Выбрана модель: {self._selected_model_path.name}")
+        if self._records:
+            self.resegment_facies_with_selected_model()
+
+    def resegment_facies_with_selected_model(self) -> None:
+        """Replace all facies masks after an explicit model change/re-run."""
+        if self._segmentation_thread is not None or self._training_thread is not None or self._column_training_thread is not None:
+            QMessageBox.information(self, "Переразметка фаций", "Дождитесь окончания текущей операции.")
+            return
+        if not self._records:
+            QMessageBox.information(self, "Переразметка фаций", "В проекте нет фотографий.")
+            return
+        model_path = self._resolve_model_path()
+        if model_path is None:
+            QMessageBox.critical(self, "Модель не найдена", "Сначала выберите фациальную модель .pt.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Переразметить фации?",
+            (
+                f"Все текущие фациальные маски будут заменены прогнозом модели «{model_path.name}».\n"
+                "Подтверждённые границы столбиков керна сохранятся.\n\n"
+                "Ручные исправления фаций также будут заменены. Продолжить?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self.statusBar().showMessage(f"Модель {model_path.name} выбрана · переразметка не запущена")
+            return
+        self.run_segmentation(self._records)
 
     def show_training_history(self) -> None:
         """Show locally saved validation metrics without depending on a server."""
@@ -1318,9 +1745,16 @@ class MainWindow(QMainWindow):
             sample_counts = dict(info.get("dataset_summary") or {}).get("class_counts", {})
             counts_text = " · ".join(f"{name}: {count}" for name, count in sample_counts.items())
             recommendation = info.get("recommended_epochs")
+            completed_epochs = info.get("completed_epochs")
+            max_epochs = info.get("max_epochs", info.get("epochs"))
+            patience = info.get("early_stopping_patience")
             suffix = f"\n  фации: {counts_text}" if counts_text else ""
             if recommendation:
                 suffix += f" · рекомендовано эпох: {recommendation}"
+            if completed_epochs:
+                suffix += f" · выполнено: {completed_epochs} из {max_epochs}"
+            if patience:
+                suffix += f" · автостоп: {patience}"
             items.append((float(m_ap) if m_ap is not None else -1.0, f"{info_path.parent.name}: {metric_text}{suffix}"))
         if not items:
             QMessageBox.information(self, "История дообучений", "В этом проекте ещё нет завершённых дообучений с метриками.")
@@ -1329,13 +1763,69 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "История дообучений", "\n".join(lines))
 
     def show_training_quality(self) -> None:
-        """An explicit pre-flight review, also run automatically before training."""
-        quality = training_quality(self._records)
-        if quality.blocking_reasons:
-            detail = "\n\nОбучение сейчас заблокировано: " + "; ".join(quality.blocking_reasons) + "."
-        else:
-            detail = "\n\nКритических блокировок нет. Проверьте предупреждения перед запуском."
-        QMessageBox.information(self, "Проверка датасета", quality.summary + detail)
+        self.show_model_preparation()
+
+    def show_model_preparation(self) -> None:
+        dialog = ModelPreparationDialog(self._records, self._resolve_model_path(), self)
+        dialog.check_requested.connect(lambda: self._check_model_dataset(dialog))
+        dialog.blueprint_requested.connect(self.export_model_blueprint)
+        dialog.dataset_requested.connect(self.export_model_dataset)
+        dialog.review_requested.connect(lambda: self._review_preparation_issue(dialog))
+        dialog.exec()
+
+    def _check_model_dataset(self, dialog) -> None:
+        from app.infrastructure.training_dataset import inspect_training_dataset
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            report = inspect_training_dataset(self._records)
+            dialog.show_check(report)
+        except Exception as exc:
+            QMessageBox.warning(self, "Проверка выборки", str(exc))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _review_preparation_issue(self, dialog) -> None:
+        candidate = next(((record, detection) for record in self._records for detection in record.detections
+                          if not resolve_facies_class(detection.label, detection.attributes.get("Индекс фации"))), None)
+        if candidate is None:
+            candidate = next(iter(review_queue(self._records)), None)
+        if candidate is None:
+            QMessageBox.information(self, "Проверка слоёв", "Не найдено непроверенных или несопоставленных фаций. Проверьте выборку перед экспортом.")
+            return
+        dialog.accept()
+        self.workspace.focus_facies(*candidate)
+        self._open_facies_editor(*candidate)
+
+    def export_model_blueprint(self) -> None:
+        from app.infrastructure.model_blueprint import export_model_blueprint
+        parent = QFileDialog.getExistingDirectory(self, "Куда сохранить заготовку для другого компьютера?")
+        if not parent:
+            return
+        output = Path(parent) / f"facies_blueprint_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:6]}"
+        try:
+            export_model_blueprint(output)
+        except Exception as exc:
+            QMessageBox.warning(self, "Экспорт заготовки", str(exc))
+            return
+        QMessageBox.information(self, "Заготовка сохранена", f"Справочник и схема обучения:\n{output}\n\nВеса модели не входят в заготовку. Подключите свою .pt на рабочем компьютере.")
+
+    def export_model_dataset(self) -> None:
+        if self._segmentation_thread or self._training_thread or self._column_training_thread:
+            QMessageBox.information(self, "Экспорт", "Дождитесь завершения текущей операции.")
+            return
+        parent = QFileDialog.getExistingDirectory(self, "Куда сохранить обучающую выборку?")
+        if not parent:
+            return
+        output = Path(parent) / f"facies_dataset_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:6]}"
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            dataset = export_training_dataset(self._records, output)
+        except Exception as exc:
+            QMessageBox.warning(self, "Датасет не подготовлен", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        QMessageBox.information(self, "Датасет сохранён", f"Примеров: {dataset['sample_count']}\n{output}\n\nПеренесите папку целиком. Для экспорта модель и GPU не требуются.")
 
     def select_confidence_threshold(self) -> None:
         """Let an interpreter trade precision for recall without code changes."""
@@ -1402,7 +1892,7 @@ class MainWindow(QMainWindow):
 
     def configure_core_columns(self) -> None:
         """Persist interpreter-corrected core bounds and re-run only that photo."""
-        if self._segmentation_thread is not None or self._training_thread is not None:
+        if self._segmentation_thread is not None or self._training_thread is not None or self._column_training_thread is not None:
             QMessageBox.information(self, "Колонки керна", "Дождитесь завершения текущей обработки.")
             return
         if not self._records:
@@ -1422,6 +1912,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Колонки керна", "Укажите хотя бы одну корректную колонку (право > лево, низ > верх).")
             return
         record.core_columns = corrected
+        record.core_columns_verified = True
+        self._update_depth_segments_for_columns(record)
         if self._project_folder is not None:
             self._save_current_project(self._project_folder)
         self.statusBar().showMessage("Границы колонок сохранены · повторно сегментирую это фото…")
@@ -1431,20 +1923,11 @@ class MainWindow(QMainWindow):
     def _suggest_core_columns(record: PhotoRecord) -> list[dict[str, float]]:
         """Populate the editor from the automatic detector; user remains final authority."""
         try:
-            import cv2
-            import numpy as np
-
-            image = cv2.imdecode(np.frombuffer(Path(record.path).read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
-            if image is None:
-                return []
-            height, width = image.shape[:2]
-            x_scale = record.pixmap.width() / max(1, width)
-            y_scale = record.pixmap.height() / max(1, height)
-            return [
-                {"left": left * x_scale, "top": top * y_scale, "right": right * x_scale, "bottom": bottom * y_scale}
-                for left, top, right, bottom in RuleBasedFaciesDetector._find_core_columns(image)
-            ]
-        except (ImportError, OSError):
+            return CoreColumnRecognizer().recognize_path(
+                record.path,
+                (record.pixmap.width(), record.pixmap.height()),
+            )
+        except (ImportError, OSError, ValueError):
             return []
 
     def review_uncertain_masks(self) -> None:
@@ -1475,8 +1958,8 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "Подобрать атрибуты пород",
-            "Будут заполнены только пустые поля «Цвет», «Зернистость» и «Слоистость» внутри существующих масок. "
-            "Это визуальные рекомендации — проверьте их в карточке фации перед дообучением.",
+            "Будут рассчитаны визуальные подсказки «Цвет», «Зернистость» и «Слоистость». "
+            "Они сохраняются отдельно от наблюдений. В карточке слоя можно принять нужные значения.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Yes,
         )
@@ -1487,10 +1970,9 @@ class MainWindow(QMainWindow):
         for record in self._records:
             for detection in record.detections:
                 suggestions = service.suggest(record, detection)
-                for field, value in suggestions.items():
-                    if value and not str(detection.attributes.get(field) or "").strip():
-                        detection.attributes[field] = value
-                        changed += 1
+                if suggestions:
+                    detection.attributes["__attribute_suggestions"] = json.dumps(suggestions, ensure_ascii=False)
+                    changed += len(suggestions)
             self.workspace.update_photo_detections(record)
         if self._project_folder is not None:
             self._save_current_project(self._project_folder)
@@ -1523,17 +2005,9 @@ class MainWindow(QMainWindow):
             )
             return
         quality = training_quality(self._records)
-        if quality.blocking_reasons:
-            QMessageBox.critical(
-                self,
-                "Дообучение заблокировано",
-                "Обучение не начато, потому что модель начнёт игнорировать редкую фацию:\n\n"
-                f"{quality.summary}\n\n"
-                "Добавьте и проверьте маски редких фаций, затем повторите проверку.",
-            )
-            return
         if (
             quality.underrepresented
+            or quality.severe_imbalance
             or quality.unnamed_manual
             or quality.missing_depth
             or quality.duplicate_masks
@@ -1545,6 +2019,7 @@ class MainWindow(QMainWindow):
                 "Проверка качества разметки",
                 "Перед дообучением обнаружены пункты, которые могут ухудшить качество модели:\n\n"
                 f"{quality.summary}\n\n"
+                "Естественный дисбаланс фаций внутри скважины не блокирует обучение.\n\n"
                 "Продолжить всё равно?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel,
@@ -1568,14 +2043,17 @@ class MainWindow(QMainWindow):
                 "чтобы не перегружать компьютер. Установите/соберите версию с CUDA PyTorch и обновите драйвер NVIDIA.",
             )
             return
+        recommendation = self._current_training_recommendation(quality)
         epochs = self._training_epochs.value()
-        recommended_epochs = self._recommended_training_epochs(examples)
+        recommended_epochs = recommendation.recommended_epochs
         answer = QMessageBox.question(
             self,
             "Запустить дообучение?",
             (
                 f"Будет создан датасет из {examples} вручную проверенных слоёв и обучена "
-                f"новая копия модели ({epochs} эпох, рекомендовано: {recommended_epochs}).\n"
+                f"новая копия модели (до {epochs} эпох, рабочий ориентир: {recommended_epochs}).\n"
+                f"При отсутствии улучшения {recommendation.patience} эпох подряд обучение остановится раньше.\n"
+                f"Надёжность расчёта: {recommendation.confidence}.\n"
                 f"Устройство: {device_label}. Исходный файл модели не изменится."
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
@@ -1614,11 +2092,23 @@ class MainWindow(QMainWindow):
             published_dir,
             epochs=epochs,
             dataset_summary={
+                "split_strategy": dataset.get("split_strategy"),
+                "source_digest": dataset.get("source_digest"),
+                "val_class_counts": dataset.get("val_class_counts"),
+                "unsupported_validation_classes": dataset.get("unsupported_validation_classes"),
                 "sample_count": dataset["sample_count"],
                 "class_counts": dataset["class_counts"],
+                "source_photo_count": recommendation.source_photos,
+                "well_count": recommendation.wells,
+                "train_photo_count": dataset["train_photo_count"],
+                "val_photo_count": dataset["val_photo_count"],
+                "validation_grouped_by_photo": dataset["validation_grouped_by_photo"],
+                "recommendation_confidence": recommendation.confidence,
+                "recommendation_reasons": list(recommendation.reasons),
                 "quality": quality.summary,
             },
             recommended_epochs=recommended_epochs,
+            early_stopping_patience=recommendation.patience,
         )
         self._training_epoch_current = 0
         self._training_epoch_total = epochs
@@ -1636,22 +2126,21 @@ class MainWindow(QMainWindow):
         self._training_thread.finished.connect(self._training_thread.deleteLater)
         self._refresh_training_bar()
         self.statusBar().showMessage(
-            f"Подготовлено {dataset['sample_count']} разметок · запускаю дообучение на {epochs} эпох…"
+            f"Подготовлено {dataset['sample_count']} разметок · до {epochs} эпох · "
+            f"автостоп {recommendation.patience}…"
         )
         self._training_thread.start()
 
     def _on_fine_tune_succeeded(self, model_path: str) -> None:
         self._close_activity()
-        self._selected_model_path = Path(model_path)
-        self._fine_tune_success_model = self._selected_model_path
-        self.statusBar().showMessage(f"Дообучение завершено · новая модель сохранена: {self._selected_model_path}")
+        self._fine_tune_success_model = Path(model_path)
+        self.statusBar().showMessage(f"Дообучение завершено · кандидат сохранён: {model_path}")
         QMessageBox.information(
             self,
             "Дообучение завершено",
-            "Новая модель и справочник фаций сохранены в понятной папке:\n"
-            f"{self._selected_model_path.parent}",
+            "Кандидат модели, справочник и результаты проверки сохранены:\n"
+            f"{Path(model_path).parent}\n\nРучная разметка сохранена. Посмотрите training_info.json и историю обучения перед выбором модели.",
         )
-        self.statusBar().showMessage("Новая модель выбрана · повторная сегментация начнётся после корректного завершения обучения…")
 
     def _on_fine_tune_failed(self, message: str) -> None:
         self._close_activity()
@@ -1678,12 +2167,8 @@ class MainWindow(QMainWindow):
         self._training_epoch_current = 0
         self._training_epoch_total = 0
         self._refresh_training_bar()
-        if completed_model is not None and self._records:
-            # Do not initialize another CUDA model until Ultralytics and the
-            # training QThread have both exited; concurrent initialization was
-            # a frequent source of post-training application crashes.
-            self.statusBar().showMessage("Дообучение завершено · запускаю повторную сегментацию новой моделью…")
-            self.run_segmentation(self._records)
+        if completed_model is not None:
+            self.statusBar().showMessage("Кандидат сохранён. Выберите модель через меню «Модель» после проверки результатов; разметка не изменена.")
 
     def import_las_file(self) -> None:
         self._import_log_file("gis")
@@ -1994,11 +2479,53 @@ class MainWindow(QMainWindow):
         return preview
 
     def _ordered_detections(self, well_name: str | None = None):
-        return [
-            detection
-            for record in (self._records_for_well(well_name) if well_name else self._records)
-            for detection in StackColumnItem._sort_by_reading_order(record.detections)
-        ]
+        records = self._records_for_well(well_name) if well_name else self._records
+        return [detection for _, detection in StackColumnItem.ordered_layer_entries(records)]
+
+    def _can_move_layer(self, record: PhotoRecord, detection, direction: int) -> bool:
+        entries = StackColumnItem.ordered_layer_entries(self._records_for_well(record.well_name))
+        current = next((index for index, (_, item) in enumerate(entries) if item is detection), -1)
+        target = current + (-1 if direction < 0 else 1)
+        return current >= 0 and 0 <= target < len(entries)
+
+    def _move_layer(self, record: PhotoRecord, detection, direction: int) -> None:
+        """Move a facies layer in the continuous well column and keep it filled."""
+
+        entries = StackColumnItem.ordered_layer_entries(self._records_for_well(record.well_name))
+        current = next((index for index, (_, item) in enumerate(entries) if item is detection), -1)
+        target = current + (-1 if direction < 0 else 1)
+        if current < 0 or not 0 <= target < len(entries):
+            self.statusBar().showMessage("Слой уже находится на границе собранного столбика")
+            return
+
+        spans: dict[int, float] = {}
+        complete_depths = True
+        depth_top = float("inf")
+        for _, item in entries:
+            if item.depth_from is None or item.depth_to is None:
+                complete_depths = False
+                break
+            top, base = sorted((float(item.depth_from), float(item.depth_to)))
+            spans[id(item)] = max(0.0, base - top)
+            depth_top = min(depth_top, top)
+
+        entries[current], entries[target] = entries[target], entries[current]
+        for stack_order, (_, item) in enumerate(entries):
+            item.stack_order = stack_order
+
+        # In a depth-bound assembled core, vertical placement follows depth.
+        # Re-sequence the moved layers with their own thicknesses so their
+        # intervals touch and the column can never acquire an empty gap.
+        if complete_depths and spans and depth_top != float("inf"):
+            cursor = depth_top
+            for _, item in entries:
+                item.depth_from = cursor
+                item.depth_to = cursor + spans[id(item)]
+                cursor = item.depth_to
+
+        self._refresh_facies_views(record)
+        movement = "выше" if direction < 0 else "ниже"
+        self.statusBar().showMessage(f"Слой {detection.label} перемещён {movement} · столбик остался непрерывным")
 
     def _ask_for_well_depth_setup(self, log_data: dict, well_name: str) -> None:
         depths = [float(value) for value in log_data.get("depths", []) if value is not None]
@@ -2134,6 +2661,9 @@ class MainWindow(QMainWindow):
             cursor = next_depth
 
     def _show_stack(self) -> None:
+        # The facies legend follows the model classes that are actually present
+        # on the currently loaded photos, while retaining saved visual overrides.
+        self._sync_facies_palette()
         wells = {well_name: self._records_for_well(well_name) for well_name in self._well_names()}
         if not wells:
             return
@@ -2341,27 +2871,144 @@ class MainWindow(QMainWindow):
         self._show_stack()
 
     def _paint_stack_column(self, record: PhotoRecord, detection, column: str) -> None:
+        if column == "facies":
+            self._sync_facies_palette()
+            menu = QMenu(self)
+            current_key = str(detection.label or "").strip().casefold()
+            palette_actions = []
+            for item in self._facies_palette:
+                action = menu.addAction(f"{item['symbol']}  ·  {item['name']}")
+                action.setCheckable(True)
+                action.setChecked(item["key"].casefold() == current_key)
+                palette_actions.append((action, item))
+            menu.addSeparator()
+            full_editor = menu.addAction("Открыть полные параметры интервала…")
+            configure_action = menu.addAction("Настроить и сохранить палетку фаций…")
+            selected = menu.exec(QCursor.pos())
+            if selected is None:
+                return
+            if selected is configure_action:
+                self.configure_facies_palette()
+                return
+            if selected is full_editor:
+                self._open_facies_editor(record, detection)
+                return
+            chosen = next((item for action, item in palette_actions if selected is action), None)
+            if chosen is None:
+                return
+            detection.label = chosen["key"]
+            for field_name in (
+                "Код фации",
+                "Индекс фации",
+                "Название фации",
+                "Энергия среды",
+                "Гидродинамический режим",
+            ):
+                detection.attributes.pop(field_name, None)
+            detection.attributes.update(facies_metadata(detection.label))
+            detection.training_ready = True
+            self._refresh_facies_views(record)
+            self.statusBar().showMessage(
+                f"Фация интервала: {chosen['name']} · разметка отмечена для дообучения"
+            )
+            return
+
         if column == "lithology":
-            field, title, fallback = "Цвет литологии", "Кисть литологии", "#d8b45b"
-        else:
-            field, title, fallback = "Цвет насыщения", "Кисть насыщения", "#e0b653"
+            menu = QMenu(self)
+            menu.setTitle("Литология")
+            current_name = str(detection.attributes.get("Название породы") or "").strip().casefold()
+            palette_actions = []
+            for item in self._lithology_palette:
+                action = menu.addAction(f"{item['symbol']}  ·  {item['name']}")
+                action.setCheckable(True)
+                action.setChecked(item["name"].casefold() == current_name)
+                palette_actions.append((action, item))
+            menu.addSeparator()
+            custom_color_action = menu.addAction("Свой цвет для этого интервала…")
+            configure_action = menu.addAction("Настроить и сохранить палетку…")
+            selected = menu.exec(QCursor.pos())
+            if selected is None:
+                return
+            if selected is configure_action:
+                self.configure_lithology_palette()
+                return
+            if selected is custom_color_action:
+                initial = QColor(str(detection.attributes.get("Цвет литологии") or "#d8b45b"))
+                color = QColorDialog.getColor(initial, self, "Свой цвет литологии")
+                if not color.isValid():
+                    return
+                detection.attributes["Цвет литологии"] = color.name(QColor.NameFormat.HexRgb)
+                self._refresh_facies_views(record)
+                self.statusBar().showMessage("Литология: цвет интервала изменён")
+                return
+            chosen = next((item for action, item in palette_actions if selected is action), None)
+            if chosen is None:
+                return
+            detection.attributes["Название породы"] = chosen["name"]
+            detection.attributes.pop("Цвет литологии", None)
+            self._settings.setValue("last/lithology", chosen["name"])
+            self._refresh_facies_views(record)
+            self.statusBar().showMessage(
+                f"Литология интервала: {chosen['name']} ({chosen['symbol']})"
+            )
+            return
+
+        field, title, fallback = "Цвет насыщения", "Кисть насыщения", "#e0b653"
         initial = QColor(str(detection.attributes.get(field) or fallback))
         color = QColorDialog.getColor(initial, self, title)
         if not color.isValid():
             return
         value = color.name(QColor.NameFormat.HexRgb)
         detection.attributes[field] = value
-        if column == "saturation":
-            saturation = str(detection.attributes.get("Флюидонасыщение") or "")
-            if saturation:
-                self._settings.setValue(f"saturation_colors/{saturation}", value)
-        else:
-            self._settings.setValue("last/lithology_color", value)
+        saturation = str(detection.attributes.get("Флюидонасыщение") or "")
+        if saturation:
+            self._settings.setValue(f"saturation_colors/{saturation}", value)
         self._refresh_facies_views(record)
         self.statusBar().showMessage(f"{title}: цвет интервала изменён")
 
     def _create_interpretation_interval(self, well_name: str, kind: str, depth_from: float, depth_to: float) -> None:
-        title = "Литология" if kind == "lithology" else "Насыщение"
+        title = {"lithology": "Литология", "facies": "Фации"}.get(kind, "Насыщение")
+        if kind in {"lithology", "facies"}:
+            if kind == "facies":
+                self._sync_facies_palette()
+            palette = self._lithology_palette if kind == "lithology" else self._facies_palette
+            if not palette:
+                QMessageBox.information(self, title, "Для этой дорожки пока нет доступных классов.")
+                return
+            titles = [f"{item['symbol']} · {item['name']}" for item in palette]
+            setting_key = "last/lithology" if kind == "lithology" else "last/facies_track"
+            last_key = str(self._settings.value(setting_key, "") or "")
+            keys = [str(item.get("key") or item["name"]) for item in palette]
+            initial = keys.index(last_key) if last_key in keys else 0
+            selected_title, accepted = QInputDialog.getItem(
+                self,
+                title,
+                "Элемент из сохранённой палетки:",
+                titles,
+                initial,
+                False,
+            )
+            if not accepted or not selected_title:
+                return
+            item = palette[titles.index(selected_title)]
+            item_key = str(item.get("key") or item["name"])
+            self._settings.setValue(setting_key, item_key)
+            self._well_interpretations.setdefault(well_name, []).append(
+                {
+                    "kind": kind,
+                    "key": item_key,
+                    "name": item["name"],
+                    "symbol": item["symbol"],
+                    "color": item["color"],
+                    "pattern": item["pattern"],
+                    "depth_from": depth_from,
+                    "depth_to": depth_to,
+                }
+            )
+            self._show_stack()
+            self.statusBar().showMessage(f"Добавлен интервал «{item['name']}»: {depth_from:g}–{depth_to:g} м")
+            return
+
         default_name = "Новый литологический интервал" if kind == "lithology" else "Новый интервал насыщения"
         name, accepted = QInputDialog.getText(self, title, "Название интервала:", text=default_name)
         if not accepted or not name.strip():
@@ -2397,13 +3044,52 @@ class MainWindow(QMainWindow):
             return
         interval = intervals[index]
         menu = QMenu(self)
+        palette = None
+        if str(interval.get("kind")) in {"lithology", "facies"}:
+            palette = menu.addAction("Выбрать из палетки…")
+            menu.addSeparator()
         rename = menu.addAction("Изменить название…")
         recolor = menu.addAction("Изменить цвет…")
         delete = menu.addAction("Удалить интервал")
         rename.triggered.connect(lambda: self._rename_interpretation_interval(well_name, index))
         recolor.triggered.connect(lambda: self._recolor_interpretation_interval(well_name, index))
         delete.triggered.connect(lambda: self._delete_interpretation_interval(well_name, index))
+        if palette is not None:
+            palette.triggered.connect(lambda: self._set_interpretation_palette(well_name, index))
         menu.exec(QCursor.pos())
+
+    def _set_interpretation_palette(self, well_name: str, index: int) -> None:
+        interval = self._well_interpretations[well_name][index]
+        kind = str(interval.get("kind") or "")
+        if kind == "facies":
+            self._sync_facies_palette()
+        palette = self._lithology_palette if kind == "lithology" else self._facies_palette
+        if not palette:
+            QMessageBox.information(self, "Палетка", "Для этой дорожки пока нет доступных классов.")
+            return
+        titles = [f"{item['symbol']} · {item['name']}" for item in palette]
+        keys = [str(item.get("key") or item["name"]) for item in palette]
+        current = str(interval.get("key") or interval.get("name") or "")
+        initial = keys.index(current) if current in keys else 0
+        selected_title, accepted = QInputDialog.getItem(
+            self,
+            "Литология" if kind == "lithology" else "Фации",
+            "Элемент из сохранённой палетки:",
+            titles,
+            initial,
+            False,
+        )
+        if not accepted or not selected_title:
+            return
+        item = palette[titles.index(selected_title)]
+        interval.update(
+            key=str(item.get("key") or item["name"]),
+            name=item["name"],
+            symbol=item["symbol"],
+            color=item["color"],
+            pattern=item["pattern"],
+        )
+        self._show_stack()
 
     def _rename_interpretation_interval(self, well_name: str, index: int) -> None:
         interval = self._well_interpretations[well_name][index]
@@ -2596,10 +3282,12 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(label)
         self._update_activity(label, current, total)
 
-    def _apply_image_detections(self, image_path: str, detections) -> None:
+    def _apply_image_detections(self, image_path: str, detections, core_columns) -> None:
         record = next((item for item in self._records if item.path == image_path), None)
         if record is None:
             return
+        record.core_columns = [dict(column) for column in core_columns]
+        self._update_depth_segments_for_columns(record)
         record.detections = postprocess_detections(record, list(detections))
         self.workspace.update_photo_detections(record)
         self._segmentation_updated_count += 1
@@ -2629,6 +3317,30 @@ class MainWindow(QMainWindow):
                 self._save_current_project(self._project_folder)
             count = sum(len(record.detections) for record in self._records)
             self.statusBar().showMessage(f"Сегментация завершена · фаций: {count} · общий столбик справа от фотографий создан")
+
+    def _update_depth_segments_for_columns(self, record: PhotoRecord) -> None:
+        """Calibrate the continuous stage-1 tape when a photo interval is known."""
+        columns = [
+            {key: float(item[key]) for key in ("left", "top", "right", "bottom")}
+            for item in record.core_columns
+            if all(key in item for key in ("left", "top", "right", "bottom"))
+        ]
+        if not columns:
+            record.depth_segments = []
+            return
+        photo_top, photo_base = self._record_photo_interval(record)
+        if photo_top is None or photo_base is None or photo_base <= photo_top:
+            record.depth_segments = columns
+            return
+        total_height = sum(max(1.0, item["bottom"] - item["top"]) for item in columns)
+        cursor = float(photo_top)
+        segments: list[dict[str, float]] = []
+        for index, column in enumerate(columns):
+            span = (float(photo_base) - float(photo_top)) * max(1.0, column["bottom"] - column["top"]) / total_height
+            depth_to = float(photo_base) if index == len(columns) - 1 else cursor + span
+            segments.append({**column, "depth_from": cursor, "depth_to": depth_to})
+            cursor = depth_to
+        record.depth_segments = segments
 
     def _open_facies_editor(self, record: PhotoRecord, detection) -> None:
         # Correlation editing is deliberately disabled while Kern Analyzer focuses
@@ -2662,14 +3374,17 @@ class MainWindow(QMainWindow):
             detection.depth_from,
             detection.depth_to,
             self,
+            training_ready=detection.training_ready,
         )
         dialog.setModal(False)
         dialog.accepted.connect(lambda: self._save_lithology(record, detection, dialog))
         dialog.delete_requested.connect(lambda: self._delete_facies(record, detection))
+        dialog.move_up_requested.connect(lambda: self._move_layer(record, detection, -1))
+        dialog.move_down_requested.connect(lambda: self._move_layer(record, detection, 1))
         dialog.finished.connect(lambda _: self._forget_facies_dialog(dialog))
         self._facies_dialogs.append(dialog)
         dialog.show()
-        self.statusBar().showMessage("Выберите фацию и независимые параметры описания")
+        self.statusBar().showMessage("Выберите фацию/параметры или переместите слой выше/ниже в колонке")
 
     def _align_layer_to_existing_curve(self, record: PhotoRecord, detection, curve: dict) -> None:
         depths = [float(value) for value in (detection.depth_from, detection.depth_to) if value is not None]
@@ -2736,7 +3451,7 @@ class MainWindow(QMainWindow):
         # It was drawn by the user, so it should be visible in the counter
         # immediately.  It becomes a trainable example once a facies code is
         # selected; an unnamed YOLO class would be invalid training data.
-        detection.training_ready = True
+        detection.training_ready = False
         record.detections.append(detection)
         self.workspace.set_new_contour_mode(False)
         self._new_contour_action.setChecked(False)
@@ -2750,17 +3465,20 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "Проверьте глубины", str(exc))
             return
-        detection.label = dialog.selected_facies()
-        if not detection.label:
+        selected_label = dialog.selected_facies()
+        if not selected_label:
             QMessageBox.warning(self, "Не указана фация", "Введите или выберите основную метку фации, например DWCh.")
             return
-        detection.attributes = dialog.selected_attributes()
+        selected_attributes = dialog.selected_attributes()
+        if dialog.training_confirmed.isChecked() and not resolve_facies_class(selected_label, selected_attributes.get("Индекс фации")):
+            QMessageBox.warning(self, "Уточните фацию", "Для обучения финальной модели выберите точную фацию из справочника. Свою метку можно сохранить без отметки об обучении.")
+            return
+        detection.label = selected_label
+        detection.attributes = selected_attributes
         detection.depth_from = depth_from
         detection.depth_to = depth_to
         geometry_updated = self._sync_polygon_to_depth_range(record, detection)
-        # The user explicitly saved this layer, so it is safe to use as a
-        # training example. Fresh automatic predictions never get this flag.
-        detection.training_ready = True
+        detection.training_ready = dialog.training_confirmed.isChecked()
         self._refresh_facies_views(record)
         suffix = " · подсветка контура обновлена" if geometry_updated else ""
         self.statusBar().showMessage(f"Параметры фации сохранены: {detection.label}{suffix}")
@@ -2790,11 +3508,8 @@ class MainWindow(QMainWindow):
 
     def _on_facies_geometry_changed(self, record: PhotoRecord, detection) -> None:
         depth_updated = self._sync_depth_range_from_polygon(record, detection)
-        # Moving a vertex is an explicit user review.  A model suggestion only
-        # becomes a training example after this action (or after saving it in
-        # the facies dialog), never merely because the model drew it.
-        if str(detection.label or "").strip() not in {"", "Новый контур"}:
-            detection.training_ready = True
+        # Editing geometry alone does not confirm the model's class choice.
+        # An already reviewed sample retains its explicit confirmation.
         self._refresh_facies_views(record)
         suffix = " · интервал глубин обновлён" if depth_updated else ""
         if detection.training_ready:

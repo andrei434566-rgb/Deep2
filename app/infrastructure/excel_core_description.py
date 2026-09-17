@@ -18,6 +18,7 @@ from app.domain.facies_catalog import facies_metadata
 from app.domain.lithology_attributes import LITHOLOGY_ATTRIBUTE_OPTIONS
 from app.domain.models import FaciesDetection
 from app.infrastructure.ml.rule_based_facies import RuleBasedFaciesDetector
+from app.infrastructure.ml.core_column_service import CoreColumnRecognizer
 
 
 EXCEL_FACIES_ATTRIBUTE_FIELDS = (
@@ -62,6 +63,9 @@ class DescriptionLayer:
     attributes: dict[str, str]
     sheet: str
     row: int
+    field_name: str = ""
+    lithology_description: str = ""
+    thickness: float | None = None
     core_top: float | None = None
     core_base: float | None = None
 
@@ -75,6 +79,7 @@ class CoreInterval:
     well: str
     top: float
     base: float
+    field_name: str = ""
 
     @property
     def title(self) -> str:
@@ -136,6 +141,8 @@ def read_description_workbook(path: Path) -> tuple[list[DescriptionLayer], list[
         if not (has_pair or has_range) or ("well" not in columns and not sheet_well):
             continue
         last_well = ""
+        last_field = ""
+        last_core_top = last_core_base = None
         for row in range(columns.get("data_start", 1), sheet.max_row + 1):
             top, base = _row_interval(sheet, row, columns)
             if top is None or base is None or base <= top:
@@ -145,10 +152,24 @@ def read_description_workbook(path: Path) -> tuple[list[DescriptionLayer], list[
                 issues.append(ImportIssue(f"{sheet.title}!{row}", "Не указан номер скважины."))
                 continue
             last_well = well
+            field_name = _display_text(_cell_value(sheet, row, columns.get("field"))) or last_field
+            last_field = field_name
             name = _display_text(_cell_value(sheet, row, columns.get("facies_name")))
             code = _display_text(_cell_value(sheet, row, columns.get("facies_code")))
             index = _display_text(_cell_value(sheet, row, columns.get("facies_index")))
             description = _display_text(_cell_value(sheet, row, columns.get("description")))
+            lithology_description = _display_text(_cell_value(sheet, row, columns.get("lithology_description")))
+            thickness = _as_float(_cell_value(sheet, row, columns.get("facies_thickness")))
+            core_top = _as_float(_cell_value(sheet, row, columns.get("core_top")))
+            core_base = _as_float(_cell_value(sheet, row, columns.get("core_base")))
+            if core_top is None:
+                core_top = last_core_top
+            else:
+                last_core_top = core_top
+            if core_base is None:
+                core_base = last_core_base
+            else:
+                last_core_base = core_base
             attributes = {
                 field: value
                 for field in EXCEL_FACIES_ATTRIBUTE_FIELDS
@@ -160,7 +181,7 @@ def read_description_workbook(path: Path) -> tuple[list[DescriptionLayer], list[
             # text.  Keep it as a reviewable facies instead of dropping the
             # row: colour/lithology are still extracted into its card.
             if not (name or code or index):
-                name = _infer_facies_name(description, attributes) or "Не задано"
+                name = _infer_facies_name("; ".join(filter(None, (description, lithology_description))), attributes) or "Не задано"
                 issues.append(ImportIssue(
                     f"{sheet.title}!{row}",
                     "Нет кода/индекса фации: создана метка «Не задано», проверьте её перед обучением.",
@@ -177,10 +198,18 @@ def read_description_workbook(path: Path) -> tuple[list[DescriptionLayer], list[
                     attributes=attributes,
                     sheet=sheet.title,
                     row=row,
-                    core_top=_as_float(_cell_value(sheet, row, columns.get("core_top"))),
-                    core_base=_as_float(_cell_value(sheet, row, columns.get("core_base"))),
+                    field_name=field_name,
+                    lithology_description=lithology_description,
+                    thickness=thickness if thickness is not None else round(base - top, 6),
+                    core_top=core_top,
+                    core_base=core_base,
                 )
             )
+            if thickness is not None and abs(thickness - (base - top)) > max(0.01, abs(base - top) * 0.02):
+                issues.append(ImportIssue(
+                    f"{sheet.title}!{row}",
+                    f"Толщина фации {thickness:g} м не совпадает с интервалом {base - top:g} м; для маски использованы кровля и подошва.",
+                ))
     if not layers:
         raise ValueError(
             "Не найдены строки с интервалом фации. Укажите скважину, верх/низ "
@@ -207,9 +236,95 @@ def core_intervals(layers: list[DescriptionLayer]) -> list[CoreInterval]:
         base = layer.core_base if layer.core_base is not None else layer.base
         if base <= top:
             continue
-        item = CoreInterval(layer.well, top, base)
+        item = CoreInterval(layer.well, top, base, layer.field_name)
         grouped[(_well_key(item.well), round(item.top, 4), round(item.base, 4))] = item
     return sorted(grouped.values(), key=lambda item: (_well_key(item.well), item.top, item.base))
+
+
+def workbook_import_summary(layers: list[DescriptionLayer]) -> dict[str, object]:
+    """Summarise the Excel fields that will be attached to projected masks."""
+    intervals = core_intervals(layers)
+    fields = sorted({item.field_name for item in layers if item.field_name}, key=str.casefold)
+    wells = sorted({item.well for item in layers if item.well}, key=str.casefold)
+    described = sum(bool(item.lithology_description or item.attributes) for item in layers)
+    explicit_attribute_values = sum(
+        sum(bool(item.attributes.get(field)) for field in LITHOLOGY_ATTRIBUTE_OPTIONS)
+        for item in layers
+    )
+    return {
+        "fields": fields,
+        "wells": wells,
+        "core_intervals": intervals,
+        "facies_layers": len(layers),
+        "described_layers": described,
+        "explicit_attribute_values": explicit_attribute_values,
+    }
+
+
+def suggest_photo_intervals_from_excel(
+    rows: list[tuple[Path, CoreInterval | None, str]],
+    layers: list[DescriptionLayer],
+) -> list[tuple[Path, CoreInterval | None, str]]:
+    """Prefill missing photo intervals from Excel without silently accepting them.
+
+    Exact filename/OCR results are preserved. Excel is used only when the
+    mapping is unambiguous (one photo per interval) or when one continuous
+    core interval is the sole source for an entirely unresolved photo batch.
+    The latter is an equal provisional split and is labelled accordingly in
+    the confirmation table.
+    """
+    result = list(rows)
+    unresolved = [index for index, (_, interval, _) in enumerate(result) if interval is None]
+    if not unresolved:
+        return result
+    intervals = core_intervals(layers)
+    if not intervals:
+        return result
+
+    # First use well hints embedded in a filename, even if no depths are there.
+    claimed: set[tuple[str, float, float]] = set()
+    for index, (_, interval, _) in enumerate(result):
+        if interval is not None:
+            claimed.add((_well_key(interval.well), round(interval.top, 4), round(interval.base, 4)))
+    for index in list(unresolved):
+        path, _, _ = result[index]
+        stem_key = _well_key(path.stem)
+        candidates = [
+            item for item in intervals
+            if _well_key(item.well) and _well_key(item.well) in stem_key
+            and (_well_key(item.well), round(item.top, 4), round(item.base, 4)) not in claimed
+        ]
+        if len(candidates) == 1:
+            item = candidates[0]
+            result[index] = (path, item, "интервал керна найден в Excel — подтвердите")
+            claimed.add((_well_key(item.well), round(item.top, 4), round(item.base, 4)))
+            unresolved.remove(index)
+
+    available = [
+        item for item in intervals
+        if (_well_key(item.well), round(item.top, 4), round(item.base, 4)) not in claimed
+    ]
+    if unresolved and len(available) == len(unresolved):
+        for index, item in zip(unresolved, available):
+            path = result[index][0]
+            result[index] = (path, item, "интервал керна найден в Excel — подтвердите")
+        return result
+
+    # One continuous Excel interval plus an unresolved batch: the equal split
+    # is useful as a starting point, but never presented as measured truth.
+    if len(intervals) == 1 and len(unresolved) == len(result):
+        source = intervals[0]
+        step = (source.base - source.top) / len(unresolved)
+        for offset, index in enumerate(unresolved):
+            top = source.top + offset * step
+            base = source.base if offset == len(unresolved) - 1 else source.top + (offset + 1) * step
+            path = result[index][0]
+            result[index] = (
+                path,
+                CoreInterval(source.well, top, base, source.field_name),
+                "Excel: равное предварительное деление интервала керна — обязательно проверьте",
+            )
+    return result
 
 
 def create_depth_bound_detections(
@@ -232,7 +347,10 @@ def create_depth_bound_detections(
     image = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError(f"Не удалось открыть изображение: {image_path.name}")
-    columns = RuleBasedFaciesDetector._find_core_columns(image)
+    columns = [
+        (round(item["left"]), round(item["top"]), round(item["right"]), round(item["bottom"]))
+        for item in CoreColumnRecognizer().recognize(image)
+    ]
     if not columns:
         height, width = image.shape[:2]
         # A fallback remains usable for a single long core photograph. It is
@@ -268,17 +386,18 @@ def create_depth_bound_detections(
                 QPointF(left * x_scale, y1 * y_scale),
             ]
             attributes = _attributes_from_description(layer)
+            attributes["__annotation_source"] = "excel_depth_projection"
             detections.append(
                 FaciesDetection(
                     label=layer.label,
-                    confidence=1.0,
+                    confidence=0.0,
                     polygon=polygon,
                     attributes=attributes,
                     depth_from=overlap_top,
                     depth_to=overlap_base,
-                    # The source is a human-written depth description. The
-                    # geometry is automatic and remains visibly editable.
-                    training_ready=True,
+                    # A depth description does not verify the projected image
+                    # boundary. A human must review both geometry and facies.
+                    training_ready=False,
                 )
             )
     if not detections:
@@ -306,11 +425,14 @@ def create_automatic_interval_detections(
         raise ValueError(f"Не удалось открыть изображение: {image_path.name}")
 
     detector = RuleBasedFaciesDetector()
-    _, intervals = detector.analyse(image)
-    columns = detector._find_core_columns(image)
+    columns = [
+        (round(item["left"]), round(item["top"]), round(item["right"]), round(item["bottom"]))
+        for item in CoreColumnRecognizer().recognize(image)
+    ]
     height, width = image.shape[:2]
     if not columns:
         columns = [(0, 0, width, max(1, int(height * 0.87)))]
+    _, intervals = detector.analyse(image, columns)
     columns = sorted(columns, key=lambda item: (item[0], item[1]))
     if not intervals:
         intervals = [
@@ -377,7 +499,11 @@ def _find_columns(sheet) -> dict[str, int]:
         for column in range(1, sheet.max_column + 1)
     ]
     columns: dict[str, int] = {"data_start": header_end + 1}
-    for role in ("well", "facies_name", "facies_code", "facies_index", "description", "facies_top", "facies_base", "core_top", "core_base"):
+    for role in (
+        "field", "well", "facies_name", "facies_code", "facies_index",
+        "description", "lithology_description", "facies_top", "facies_base",
+        "facies_thickness", "core_top", "core_base",
+    ):
         if column := _best_column(descriptions, role):
             columns[role] = column
     # A number of exports put both limits in one cell: "3915,00–3915,55".
@@ -386,18 +512,15 @@ def _find_columns(sheet) -> dict[str, int]:
         if column := _best_column(descriptions, "facies_interval"):
             columns["facies_interval"] = column
     for field in EXCEL_FACIES_ATTRIBUTE_FIELDS:
-        needles = (_normalized(field), *(_normalized(value) for value in ATTRIBUTE_HEADER_ALIASES.get(field, ())))
-        for column, text in descriptions:
-            if any(needle in text for needle in needles):
-                columns[f"attribute:{field}"] = column
-                break
+        if column := _best_attribute_column(descriptions, field):
+            columns[f"attribute:{field}"] = column
     return columns
 
 
 def _header_end_row(sheet) -> int:
     """Return the final header row without treating the data area as a header."""
     limit = min(30, sheet.max_row)
-    header_words = ("скваж", "скв", "интервал", "кровл", "подошв", "глубин", "описан", "depth", "well", "from", "to", "индекс", "код", "название")
+    header_words = ("месторожд", "скваж", "скв", "интервал", "кровл", "подошв", "толщин", "глубин", "описан", "depth", "well", "from", "to", "индекс", "код", "название")
     last = 1
     for row in range(1, limit + 1):
         text = " ".join(_normalized(_merged_value(sheet, row, column)) for column in range(1, sheet.max_column + 1))
@@ -421,6 +544,8 @@ def _column_score(text: str, role: str) -> int:
     core_group = 70 if has("отбор керна", "core interval", "керн") else 0
     direction_top = 30 if has("кровл", "верх", "от", "from", "top") else 0
     direction_base = 30 if has("подошв", "низ", "до", "to", "base", "bottom") else 0
+    if role == "field":
+        return 110 if has("месторожд", "площадь", "field") else 0
     if role == "well":
         return 100 if has("скваж", "№ скв", "no скв", "well") else 0
     if role == "facies_name":
@@ -430,11 +555,17 @@ def _column_score(text: str, role: str) -> int:
     if role == "facies_index":
         return 100 if has("индекс фаци", "facies index") or ("фациальн" in text and "индекс" in text) else 0
     if role == "description":
+        if has("литологическое описание", "16 параметр"):
+            return 0
         return 100 if has("краткое описание") else (70 if has("описан", "характерист", "description") else 0)
+    if role == "lithology_description":
+        return 140 if has("литологическое описание") and has("16 параметр") else (110 if has("литологическое описание", "описание породы") else 0)
     if role == "facies_top":
-        return facies_group + direction_top if facies_group and direction_top else (generic_interval + direction_top if direction_top else (18 if direction_top else 0))
+        return facies_group + direction_top if facies_group and direction_top else (0 if core_group else (generic_interval + direction_top if direction_top else (18 if direction_top else 0)))
     if role == "facies_base":
-        return facies_group + direction_base if facies_group and direction_base else (generic_interval + direction_base if direction_base else (18 if direction_base else 0))
+        return facies_group + direction_base if facies_group and direction_base else (0 if core_group else (generic_interval + direction_base if direction_base else (18 if direction_base else 0)))
+    if role == "facies_thickness":
+        return 120 if has("толщина фаци", "мощность фаци") else (85 if has("толщина слоя", "мощность слоя") else 0)
     if role == "core_top":
         return core_group + direction_top if core_group and direction_top else 0
     if role == "core_base":
@@ -442,6 +573,29 @@ def _column_score(text: str, role: str) -> int:
     if role == "facies_interval":
         return facies_group or generic_interval
     return 0
+
+
+def _best_attribute_column(descriptions: list[tuple[int, str]], field: str) -> int | None:
+    """Resolve one of the 16 observed fields without substring collisions."""
+    needles = [_normalized(field), *(_normalized(value) for value in ATTRIBUTE_HEADER_ALIASES.get(field, ()))]
+    scored: list[tuple[int, int]] = []
+    for column, text in descriptions:
+        if not text:
+            continue
+        # These pairs otherwise collide by simple substring matching.
+        if field == "Цемент" and "степень цементации" in text:
+            continue
+        if field == "Контакт" and "ориентация контакта" in text:
+            continue
+        score = 0
+        for needle in needles:
+            if text == needle or text.endswith(" " + needle):
+                score = max(score, 130 + len(needle))
+            elif re.search(rf"(?:^|\s){re.escape(needle)}(?:$|\s)", text):
+                score = max(score, 90 + len(needle))
+        if score:
+            scored.append((score, column))
+    return max(scored, default=(0, 0))[1] or None
 
 
 def _merged_value(sheet, row: int, column: int):
@@ -493,20 +647,30 @@ def _well_from_sheet_title(title: str) -> str:
 
 
 def _attributes_from_description(layer: DescriptionLayer) -> dict[str, str]:
-    text = _normalized(layer.description)
-    attributes = facies_metadata(layer.facies_code)
+    combined_description = "; ".join(filter(None, (layer.description, layer.lithology_description)))
+    text = _normalized(combined_description)
+    attributes = facies_metadata(layer.facies_code, layer.facies_index)
     imported = {
         "Название фации": layer.facies_name,
         "Код фации": layer.facies_code,
         "Индекс фации": layer.facies_index,
         "Краткое описание": layer.description,
+        "Литологическое описание (16 параметров)": layer.lithology_description,
+        "Месторождение": layer.field_name,
+        "№ скважины": layer.well,
+        "Интервал фации": f"{layer.top:g}–{layer.base:g} м",
+        "Толщина фации": f"{(layer.thickness if layer.thickness is not None else layer.base - layer.top):g} м",
+        "Интервал керна": (
+            f"{layer.core_top:g}–{layer.core_base:g} м"
+            if layer.core_top is not None and layer.core_base is not None else ""
+        ),
         "Источник описания": f"Excel: {layer.sheet}, строка {layer.row}",
     }
     attributes.update({key: value for key, value in imported.items() if value})
     # A prose cell like "Цвет: серый; порода: песчаник" is accepted in
     # addition to the controlled vocabulary below.  Explicit table columns
     # still win, so prepared datasets remain deterministic.
-    attributes.update(_inline_description_attributes(layer.description))
+    attributes.update(_inline_description_attributes(combined_description))
     for field, options in LITHOLOGY_ATTRIBUTE_OPTIONS.items():
         matches = [option for option in options if _option_is_mentioned(text, option)]
         if len(matches) == 1:

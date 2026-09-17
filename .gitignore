@@ -3,6 +3,7 @@
 UNKNOWN.egg-info/
 __pycache__/
 *.py[cod]
+launch_error.log
 build/
 dist/
 *.spec

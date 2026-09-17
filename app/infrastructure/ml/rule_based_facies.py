@@ -33,17 +33,38 @@ class RuleBasedFaciesDetector:
     intentionally outside its scope.
     """
 
-    def analyse(self, source_bgr: np.ndarray) -> tuple[np.ndarray, list[TextureInterval]]:
+    def analyse(
+        self,
+        source_bgr: np.ndarray,
+        core_columns: list[tuple[int, int, int, int]] | None = None,
+    ) -> tuple[np.ndarray, list[TextureInterval]]:
         if source_bgr is None or source_bgr.size == 0:
             raise ValueError("Empty image")
         if source_bgr.ndim != 3 or source_bgr.shape[2] != 3:
             raise ValueError("Expected a BGR color image")
 
-        columns = self._find_core_columns(source_bgr)
-        intervals: list[TextureInterval] = []
-        for index, (left, top, right, bottom) in enumerate(columns, start=1):
-            intervals.extend(self._split_column(source_bgr, index, left, top, right, bottom))
+        columns = self._find_core_columns(source_bgr) if core_columns is None else list(core_columns)
+        intervals = self.split_columns(source_bgr, columns)
         return self._render(source_bgr, intervals), intervals
+
+    def split_columns(
+        self,
+        source_bgr: np.ndarray,
+        core_columns: list[tuple[int, int, int, int]],
+    ) -> list[TextureInterval]:
+        """Split known core columns at persistent changes of texture/structure."""
+        if source_bgr is None or source_bgr.size == 0:
+            return []
+        height, width = source_bgr.shape[:2]
+        intervals: list[TextureInterval] = []
+        for index, values in enumerate(core_columns, start=1):
+            left, top, right, bottom = (int(round(value)) for value in values)
+            left, right = max(0, left), min(width, right)
+            top, bottom = max(0, top), min(height, bottom)
+            if right - left < 3 or bottom - top < 20:
+                continue
+            intervals.extend(self._split_column(source_bgr, index, left, top, right, bottom))
+        return intervals
 
     @staticmethod
     def _find_core_columns(image: np.ndarray) -> list[tuple[int, int, int, int]]:

@@ -16,6 +16,9 @@ class FaciesDetection:
     depth_to: float | None = None
     training_ready: bool = False
     alternatives: dict[str, float] = field(default_factory=dict)
+    # Interpreter-defined vertical order in the continuous assembled core.
+    # ``None`` keeps the natural left-column/top-to-bottom photo reading order.
+    stack_order: int | None = None
 
 
 @dataclass
@@ -37,3 +40,7 @@ class PhotoRecord:
     # separately from depth calibration so segmentation can ignore rulers,
     # labels and slag even before depth intervals are assigned.
     core_columns: list[dict[str, float]] = field(default_factory=list)
+    # Only interpreter-confirmed rectangles may be used to train the separate
+    # stage-1 column recognizer.  Automatically detected rectangles are kept
+    # for inference and display, but never silently become training truth.
+    core_columns_verified: bool = False

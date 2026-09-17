@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from hashlib import md5
 
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, Signal
@@ -8,7 +9,21 @@ from PySide6.QtWidgets import QFrame, QGraphicsObject, QGraphicsScene, QGraphics
 
 from app.domain.models import FaciesDetection, PhotoRecord
 from app.domain.facies_catalog import facies_metadata
-from app.domain.lithology import LITHOLOGY_LEGEND
+from app.domain.facies_palette import normalize_facies_palette
+from app.domain.lithology import LITHOLOGY_LEGEND, normalize_lithology_palette
+
+
+_STACK_CROP_CACHE: OrderedDict[tuple, QPixmap] = OrderedDict()
+_STACK_CROP_CACHE_PIXELS = 0
+_STACK_CROP_CACHE_MAX_PIXELS = 24_000_000
+
+
+def clear_stack_crop_cache() -> None:
+    """Release masked core crops retained between assembled-column rebuilds."""
+
+    global _STACK_CROP_CACHE_PIXELS
+    _STACK_CROP_CACHE.clear()
+    _STACK_CROP_CACHE_PIXELS = 0
 
 
 class WorkspaceCanvas(QGraphicsView):
@@ -32,7 +47,9 @@ class WorkspaceCanvas(QGraphicsView):
         self.setScene(QGraphicsScene(self))
         self.scene().setSceneRect(-30_000, -30_000, 60_000, 60_000)
         self.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
-        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
+        # Repainting only changed item bounds is markedly smoother than
+        # redrawing every source photo and every log track on each mouse event.
+        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.BoundingRectViewportUpdate)
         self.setBackgroundBrush(QColor("#fbfcfe"))
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
@@ -47,6 +64,7 @@ class WorkspaceCanvas(QGraphicsView):
         # The strongest/verified crop for each facies is reused in confidence
         # popovers across the current project.
         self._facies_samples: dict[str, QPixmap] = {}
+        self._facies_sample_quality: dict[str, tuple[bool, float]] = {}
         self._stack_item: StackColumnItem | None = None
         self._correlation_items: list[StackColumnItem] = []
         self._correlation_lines: list[CorrelationCurveItem] = []
@@ -145,6 +163,8 @@ class WorkspaceCanvas(QGraphicsView):
     def clear_workspace(self) -> None:
         self._items_by_identifier.clear()
         self._facies_samples.clear()
+        self._facies_sample_quality.clear()
+        clear_stack_crop_cache()
         self.clear_generated_items()
         self._correlation_curves = []
         self._gis_preview = None
@@ -197,7 +217,15 @@ class WorkspaceCanvas(QGraphicsView):
         self._clear_correlation_items()
         if self._stack_item is not None:
             self.scene().removeItem(self._stack_item)
-        self._stack_item = StackColumnItem(records, self._gis_preview, self._rigis_preview, well_name=well_name, interpretation_intervals=interpretation_intervals, description_only=description_only)
+        self._stack_item = StackColumnItem(
+            records,
+            self._gis_preview,
+            self._rigis_preview,
+            well_name=well_name,
+            interpretation_intervals=interpretation_intervals,
+            description_only=description_only,
+            facies_samples=self._facies_samples,
+        )
         self._stack_item.facies_selected.connect(self.facies_selected)
         self._stack_item.facies_context_requested.connect(self.facies_context_requested)
         self._stack_item.depth_binding_requested.connect(self.depth_binding_requested)
@@ -244,7 +272,15 @@ class WorkspaceCanvas(QGraphicsView):
                     photo_item.setPos(cursor, photo_y)
                     photo_y += photo_item.boundingRect().height() + 12
                 cursor += photo_width + 18
-            item = StackColumnItem(records, gis_preview, rigis_preview, well_name=well_name, interpretation_intervals=(well_interpretations or {}).get(well_name, []), description_only=description_only)
+            item = StackColumnItem(
+                records,
+                gis_preview,
+                rigis_preview,
+                well_name=well_name,
+                interpretation_intervals=(well_interpretations or {}).get(well_name, []),
+                description_only=description_only,
+                facies_samples=self._facies_samples,
+            )
             item.facies_selected.connect(self.facies_selected)
             item.facies_context_requested.connect(self.facies_context_requested)
             item.depth_binding_requested.connect(self.depth_binding_requested)
@@ -552,15 +588,19 @@ class WorkspaceCanvas(QGraphicsView):
 
     def _register_facies_samples(self, record: PhotoRecord) -> None:
         """Keep one small representative crop per facies in RAM only."""
-        for label, sample in facies_visual_samples([record]).items():
-            # A verified crop is usually the best visual reference. Otherwise
-            # retain the first non-empty model suggestion for that facies.
-            existing = self._facies_samples.get(label)
-            if existing is None or any(
-                item.training_ready and item.label == label
-                for item in record.detections
-            ):
-                self._facies_samples[label] = sample
+        for detection in record.detections:
+            label = str(detection.label or "").strip()
+            if not label or label == "Новый контур" or len(detection.polygon) < 3:
+                continue
+            quality = (bool(detection.training_ready), float(detection.confidence))
+            if label in self._facies_samples and quality <= self._facies_sample_quality.get(label, (False, -1.0)):
+                continue
+            bounds = QPolygonF(detection.polygon).boundingRect().toAlignedRect()
+            bounds = bounds.intersected(QRect(0, 0, record.pixmap.width(), record.pixmap.height()))
+            if bounds.width() < 4 or bounds.height() < 4:
+                continue
+            self._facies_samples[label] = record.pixmap.copy(bounds)
+            self._facies_sample_quality[label] = quality
 
 
 class FaciesOverlayItem(QGraphicsObject):
@@ -1172,16 +1212,21 @@ class CorrelationCurveItem(QGraphicsObject):
 
 class StackColumnItem(QGraphicsObject):
     HEADER = 52
-    GAP = 8
+    # Stage-1 columns form one physical tape.  Visual spacer pixels would look
+    # like an unclassified core interval, so adjacent facies crops touch.
+    GAP = 0
     # One metre uses the same vertical scale in every tablet.  Therefore
     # extending TD adds real space below the well instead of compressing core.
     DEPTH_PIXELS_PER_METRE = 1.45
     MIN_DEPTH_BODY_HEIGHT = 620.0
     DEPTH_WIDTH = 120
     LITHOLOGY_WIDTH = 110
+    FACIES_WIDTH = 110
     SATURATION_WIDTH = 126
     GIS_TRACK_WIDTH = 92
     _legend_tiles: dict[tuple[str, str], QPixmap] = {}
+    _lithology_palette: list[dict[str, str]] = [dict(item) for item in LITHOLOGY_LEGEND]
+    _facies_palette: list[dict[str, str]] = []
     facies_selected = Signal(object, object)
     facies_context_requested = Signal(object, object)
     depth_binding_requested = Signal(object, object)
@@ -1199,6 +1244,7 @@ class StackColumnItem(QGraphicsObject):
         well_name: str | None = None,
         interpretation_intervals: list[dict] | None = None,
         description_only: bool = False,
+        facies_samples: dict[str, QPixmap] | None = None,
     ):
         super().__init__()
         self.records = list(records)
@@ -1219,7 +1265,10 @@ class StackColumnItem(QGraphicsObject):
             None,
         )
         self._placements: list[tuple[QPixmap, PhotoRecord, FaciesDetection, QRectF, FaciesOverlayItem]] = []
-        self._facies_samples = facies_visual_samples(self.records)
+        # The workspace owns these thumbnail crops and updates them only when
+        # a better reviewed example appears. Reusing them avoids recropping
+        # every source photograph whenever the assembled column is rebuilt.
+        self._facies_samples = dict(facies_samples) if facies_samples is not None else facies_visual_samples(self.records)
         self._hovered_column: tuple[PhotoRecord, FaciesDetection, str] | None = None
         self._column_draw_start: tuple[str, float] | None = None
         self._column_draw_current_y: float | None = None
@@ -1229,22 +1278,21 @@ class StackColumnItem(QGraphicsObject):
         layers = self._build_layers()
         max_crop_width = max((pixmap.width() for pixmap, _, _, _ in layers), default=140)
         self.column_width = max(160, max_crop_width + 16)
-        # Petrel-like layout: depth | assembled core | GIS | saturation.
-        # The lithology track is intentionally hidden for now: lithological
-        # observations remain editable in a layer card, without duplicating a
-        # coloured column on the tablet.
-        # GIS therefore remains immediately to the right of the core column.
+        # Petrel-like layout: depth | assembled core | lithology | facies |
+        # GIS | saturation | RIGIS. Both interpretations stay visible in the
+        # compact core-description mode.
         self.depth_x = 8
         self.core_x = self.depth_x + self.DEPTH_WIDTH + 10
-        self.gis_x = self.core_x + self.column_width + 10
+        self.lithology_x = self.core_x + self.column_width + 10
+        self.facies_x = self.lithology_x + self.LITHOLOGY_WIDTH + 10
+        self.gis_x = self.facies_x + self.FACIES_WIDTH + 10
         self.gis_tracks = [] if self.description_only else list(self.gis_preview.get("tracks", []) or [])
         self.gis_width = 0 if self.description_only else max(150, 12 + len(self.gis_tracks) * self.GIS_TRACK_WIDTH)
-        self.lithology_x = -1  # compatibility for old saved interval records
-        self.saturation_x = self.gis_x if self.description_only else self.gis_x + self.gis_width + 10
+        self.saturation_x = self.gis_x + self.gis_width + 10
         self.rigis_x = self.saturation_x + self.SATURATION_WIDTH + 10
         self.rigis_tracks = [] if self.description_only else list(self.rigis_preview.get("tracks", []) or [])
         self.rigis_width = 0 if self.description_only else max(150, 12 + len(self.rigis_tracks) * self.GIS_TRACK_WIDTH)
-        self.width = self.core_x + self.column_width + 10 if self.description_only else self.rigis_x + self.rigis_width + 10
+        self.width = self.facies_x + self.FACIES_WIDTH + 10 if self.description_only else self.rigis_x + self.rigis_width + 10
         self._height = self.HEADER + 10
         full_well_layout = bool(self.depth_range) and bool(layers) and all(
             source_detection.depth_from is not None and source_detection.depth_to is not None
@@ -1300,6 +1348,14 @@ class StackColumnItem(QGraphicsObject):
     def boundingRect(self) -> QRectF:
         return QRectF(0, 0, self.width, self._height)
 
+    def _track_geometry(self, kind: str) -> tuple[float, float]:
+        tracks = {
+            "lithology": (self.lithology_x, self.LITHOLOGY_WIDTH),
+            "facies": (self.facies_x, self.FACIES_WIDTH),
+            "saturation": (self.saturation_x, self.SATURATION_WIDTH),
+        }
+        return tracks.get(str(kind), (self.saturation_x, self.SATURATION_WIDTH))
+
     def paint(self, painter: QPainter, option, widget=None) -> None:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setBrush(QColor("#ffffff"))
@@ -1309,6 +1365,8 @@ class StackColumnItem(QGraphicsObject):
         headers = [
             (QRectF(self.depth_x, 7, self.DEPTH_WIDTH, 24), "ПРИВЯЗКА, м"),
             (QRectF(self.core_x + 8, 7, self.column_width - 16, 24), f"КЕРН · {self.well_name}" if self.well_name else "СОБРАННЫЙ КЕРН"),
+            (QRectF(self.lithology_x, 5, self.LITHOLOGY_WIDTH, 40), "ЛИТОЛОГИЯ\nусловные знаки"),
+            (QRectF(self.facies_x, 5, self.FACIES_WIDTH, 40), "ФАЦИИ\nиз масок фото"),
             (QRectF(self.gis_x, 7, self.gis_width, 24), "ГИС"),
             (QRectF(self.saturation_x, 7, self.SATURATION_WIDTH, 24), "НАСЫЩЕНИЕ"),
             (QRectF(self.rigis_x, 7, self.rigis_width, 24), "РИГИС"),
@@ -1322,21 +1380,27 @@ class StackColumnItem(QGraphicsObject):
             painter.setPen(QColor("#353a50"))
             headers[1] = (QRectF(self.core_x + 8, 20, self.column_width - 16, 24), "\u041a\u0415\u0420\u041d")
         if self.description_only:
-            headers = [headers[0], headers[1]]
+            headers = headers[:4]
         for rect, title in headers:
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, title)
         painter.setPen(QPen(QColor("#e2e6ef"), 1))
-        separators = (self.core_x - 5,) if self.description_only else (self.core_x - 5, self.gis_x - 5, self.saturation_x - 5, self.rigis_x - 5)
+        separators = (
+            (self.core_x - 5, self.lithology_x - 5, self.facies_x - 5)
+            if self.description_only
+            else (self.core_x - 5, self.lithology_x - 5, self.facies_x - 5, self.gis_x - 5, self.saturation_x - 5, self.rigis_x - 5)
+        )
         for x in separators:
             painter.drawLine(x, self.HEADER, x, self._height - 6)
         for pixmap, record, source_detection, rect, overlay in self._placements:
             painter.drawPixmap(rect.toRect(), pixmap)
+            self._draw_lithology_badge(painter, rect, source_detection)
+            self._draw_facies_badge(painter, rect, source_detection)
             if not self.description_only:
                 self._draw_saturation_badge(painter, rect, source_detection)
         self._draw_interpretation_intervals(painter)
         if self._hovered_column is not None:
             hovered_record, hovered_detection, column = self._hovered_column
-            x, width = self.saturation_x, self.SATURATION_WIDTH
+            x, width = self._track_geometry(column)
             painter.setPen(QPen(QColor("#5149ca"), 2))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             for _, record, detection, rect, _ in self._placements:
@@ -1373,7 +1437,8 @@ class StackColumnItem(QGraphicsObject):
         painter.drawText(QRectF(self.depth_x + 6, self._height - 32, self.DEPTH_WIDTH - 12, 20), Qt.AlignmentFlag.AlignCenter, f"{base:g}")
 
     def _draw_lithology_badge(self, painter: QPainter, rect: QRectF, detection: FaciesDetection) -> None:
-        info = self._lithology_info(detection.label)
+        lithology_name = str(detection.attributes.get("Название породы") or detection.label or "").strip()
+        info = self._lithology_info(lithology_name)
         color = QColor((info or {}).get("color") or facies_color(detection.label))
         custom_color = QColor(str(detection.attributes.get("Цвет литологии") or ""))
         if custom_color.isValid():
@@ -1387,10 +1452,38 @@ class StackColumnItem(QGraphicsObject):
         painter.setPen(QPen(color.darker(135), 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRect(badge)
-        symbol = (info or {}).get("symbol") or detection.label[:5]
+        symbol = (info or {}).get("symbol") or lithology_name[:5]
         if badge.height() >= 20:
             painter.setPen(QColor("#ffffff") if color.lightness() < 115 else QColor("#273044"))
-            painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, symbol)
+            text = str(symbol) if badge.height() < 46 else f"{symbol}\n{lithology_name}"
+            painter.drawText(
+                badge.adjusted(2, 1, -2, -1),
+                Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                text,
+            )
+
+    def _draw_facies_badge(self, painter: QPainter, rect: QRectF, detection: FaciesDetection) -> None:
+        info = self._facies_info(detection.label)
+        display_name = str((info or {}).get("name") or detection.label or "—").strip()
+        symbol = str((info or {}).get("symbol") or detection.label or "—").strip()
+        color = QColor(str((info or {}).get("color") or facies_color(detection.label).name()))
+        badge = QRectF(self.facies_x + 8, rect.top() + 1, self.FACIES_WIDTH - 16, max(2, rect.height() - 2))
+        painter.fillRect(badge, color)
+        painter.drawPixmap(
+            badge.toRect(),
+            self._legend_tile(color, str((info or {}).get("pattern") or "solid")),
+        )
+        painter.setPen(QPen(color.darker(135), 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(badge)
+        if badge.height() >= 20:
+            painter.setPen(QColor("#ffffff") if color.lightness() < 115 else QColor("#273044"))
+            text = symbol if badge.height() < 46 else f"{symbol}\n{display_name}"
+            painter.drawText(
+                badge.adjusted(2, 1, -2, -1),
+                Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                text,
+            )
 
     def _draw_saturation_badge(self, painter: QPainter, rect: QRectF, detection: FaciesDetection) -> None:
         value = str(detection.attributes.get("Флюидонасыщение") or "").strip()
@@ -1427,16 +1520,21 @@ class StackColumnItem(QGraphicsObject):
             except (KeyError, TypeError, ValueError):
                 continue
             kind = str(interval.get("kind") or "")
-            if kind != "saturation":
+            if kind not in {"lithology", "facies", "saturation"}:
                 continue
-            if self.description_only:
+            if self.description_only and kind == "saturation":
                 continue
             y1, y2 = self._depth_to_stack_y(top, anchors), self._depth_to_stack_y(base, anchors)
-            x, width = self.saturation_x, self.SATURATION_WIDTH
+            x, width = self._track_geometry(kind)
             color = QColor(str(interval.get("color") or "#8f71d2"))
             color.setAlpha(225)
             badge = QRectF(x + 8, min(y1, y2), width - 16, max(3.0, abs(y2 - y1)))
             painter.fillRect(badge, color)
+            if kind in {"lithology", "facies"}:
+                painter.drawPixmap(
+                    badge.toRect(),
+                    self._legend_tile(color, str(interval.get("pattern") or "solid")),
+                )
             painter.setPen(QPen(color.darker(140), 1.4))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(badge)
@@ -1446,10 +1544,16 @@ class StackColumnItem(QGraphicsObject):
                 painter.drawRect(QRectF(badge.center().x() - 7, y - 2.5, 14, 5))
             if badge.height() >= 20:
                 painter.setPen(QColor("#ffffff") if color.lightness() < 125 else QColor("#273044"))
-                painter.drawText(badge.adjusted(3, 2, -3, -2), Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, str(interval.get("name") or "Интервал"))
+                label = str(interval.get("name") or "Интервал")
+                symbol = str(interval.get("symbol") or "").strip()
+                painter.drawText(
+                    badge.adjusted(3, 2, -3, -2),
+                    Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                    symbol if symbol and badge.height() < 46 else f"{symbol}\n{label}" if symbol else label,
+                )
         if self._column_draw_start is not None and self._column_draw_current_y is not None:
-            _, start_y = self._column_draw_start
-            x, width = self.saturation_x, self.SATURATION_WIDTH
+            kind, start_y = self._column_draw_start
+            x, width = self._track_geometry(kind)
             preview = QRectF(x + 8, min(start_y, self._column_draw_current_y), width - 16, abs(self._column_draw_current_y - start_y))
             color = QColor("#5149ca")
             color.setAlpha(70)
@@ -1462,9 +1566,30 @@ class StackColumnItem(QGraphicsObject):
                 painter.setPen(QColor("#37307d"))
                 painter.drawText(preview.adjusted(2, 2, -2, -2), Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, f"{min(depth_a, depth_b):g}–{max(depth_a, depth_b):g} м")
 
-    @staticmethod
-    def _lithology_info(label: str) -> dict | None:
-        label = str(label or "").casefold()
+    @classmethod
+    def set_lithology_palette(cls, palette: list[dict[str, str]]) -> None:
+        normalized = normalize_lithology_palette(palette)
+        updated = normalized or [dict(item) for item in LITHOLOGY_LEGEND]
+        if updated != cls._lithology_palette:
+            cls._lithology_palette = updated
+            cls._legend_tiles.clear()
+
+    @classmethod
+    def set_facies_palette(cls, palette: list[dict[str, str]]) -> None:
+        normalized = normalize_facies_palette(palette)
+        if normalized != cls._facies_palette:
+            cls._facies_palette = normalized
+            cls._legend_tiles.clear()
+
+    @classmethod
+    def _facies_info(cls, label: str) -> dict | None:
+        key = str(label or "").strip()
+        exact = next((item for item in cls._facies_palette if item["key"] == key), None)
+        return exact or next((item for item in cls._facies_palette if item["key"].casefold() == key.casefold()), None)
+
+    @classmethod
+    def _lithology_info(cls, label: str) -> dict | None:
+        label = str(label or "").strip().casefold()
         aliases = {
             "sandstone": "Песчаник",
             "siltstone": "Алевролит",
@@ -1473,11 +1598,34 @@ class StackColumnItem(QGraphicsObject):
             "shale": "Аргиллит",
             "coal": "Уголь",
             "gravel": "Гравелит",
+            "битуминоз": "Битуминозный аргиллит",
+            "углист": "Углистый аргиллит",
+            "переслаив": "Переслаивание",
+            "песчан": "Песчаник",
+            "алеврол": "Алевролит",
+            "аргил": "Аргиллит",
+            "уголь": "Уголь",
+            "гравел": "Гравелит",
+            "фундамент": "Породы фундамента",
         }
         name = aliases.get(label)
         if name is None:
-            name = next((item["name"] for item in LITHOLOGY_LEGEND if item["name"].casefold() == label), None)
-        return next((item for item in LITHOLOGY_LEGEND if item["name"] == name), None)
+            exact = next((item for item in cls._lithology_palette if item["name"].casefold() == label), None)
+            if exact is not None:
+                return exact
+            name = next((value for token, value in aliases.items() if token in label), None)
+        if name is not None:
+            found = next((item for item in cls._lithology_palette if item["name"].casefold() == name.casefold()), None)
+            if found is not None:
+                return found
+        return next(
+            (
+                item
+                for item in cls._lithology_palette
+                if item["name"].casefold() in label or (label and label in item["name"].casefold())
+            ),
+            None,
+        )
 
     @classmethod
     def _legend_tile(cls, color: QColor, pattern: str) -> QPixmap:
@@ -1729,6 +1877,10 @@ class StackColumnItem(QGraphicsObject):
         for _, record, detection, rect, _ in self._placements:
             if not rect.top() <= point.y() <= rect.bottom():
                 continue
+            if QRectF(self.lithology_x, rect.top(), self.LITHOLOGY_WIDTH, rect.height()).contains(point):
+                return record, detection, "lithology"
+            if QRectF(self.facies_x, rect.top(), self.FACIES_WIDTH, rect.height()).contains(point):
+                return record, detection, "facies"
             if not self.description_only and QRectF(self.saturation_x, rect.top(), self.SATURATION_WIDTH, rect.height()).contains(point):
                 return record, detection, "saturation"
         return None
@@ -1736,6 +1888,10 @@ class StackColumnItem(QGraphicsObject):
     def _track_kind_at(self, point: QPointF) -> str | None:
         if not self.HEADER <= point.y() <= self._height - 6:
             return None
+        if self.lithology_x <= point.x() <= self.lithology_x + self.LITHOLOGY_WIDTH:
+            return "lithology"
+        if self.facies_x <= point.x() <= self.facies_x + self.FACIES_WIDTH:
+            return "facies"
         if not self.description_only and self.saturation_x <= point.x() <= self.saturation_x + self.SATURATION_WIDTH:
             return "saturation"
         return None
@@ -1751,9 +1907,9 @@ class StackColumnItem(QGraphicsObject):
                 base_y = self._depth_to_stack_y(float(interval["depth_to"]), anchors)
             except (KeyError, TypeError, ValueError):
                 continue
-            if self.description_only or kind != "saturation":
+            if kind not in {"lithology", "facies", "saturation"} or (self.description_only and kind == "saturation"):
                 continue
-            x, width = self.saturation_x, self.SATURATION_WIDTH
+            x, width = self._track_geometry(kind)
             if not (x <= point.x() <= x + width):
                 continue
             if abs(point.y() - top_y) <= 7:
@@ -1773,9 +1929,9 @@ class StackColumnItem(QGraphicsObject):
                 y2 = self._depth_to_stack_y(float(interval["depth_to"]), anchors)
             except (KeyError, TypeError, ValueError):
                 continue
-            if self.description_only or kind != "saturation":
+            if kind not in {"lithology", "facies", "saturation"} or (self.description_only and kind == "saturation"):
                 continue
-            x, width = self.saturation_x, self.SATURATION_WIDTH
+            x, width = self._track_geometry(kind)
             if x <= point.x() <= x + width and min(y1, y2) <= point.y() <= max(y1, y2):
                 return index
         return None
@@ -1790,23 +1946,56 @@ class StackColumnItem(QGraphicsObject):
 
     def _build_layers(self) -> list[tuple[QPixmap, PhotoRecord, FaciesDetection, FaciesDetection]]:
         layers: list[tuple[QPixmap, PhotoRecord, FaciesDetection, FaciesDetection]] = []
-        for record in self.records:
-            # A core photo can contain several physical columns.  Preserve the
-            # Kern Analyzer reading order: top-to-bottom inside the left column,
-            # then move to the next column on the right.
-            detections = self._sort_by_reading_order(record.detections)
-            for detection in detections:
-                crop = self._crop_detection(record, detection)
-                if crop is not None:
-                    pixmap, translated = crop
-                    layers.append((pixmap, record, detection, translated))
+        for record, detection in self.ordered_layer_entries(self.records):
+            crop = self._crop_detection(record, detection)
+            if crop is not None:
+                pixmap, translated = crop
+                layers.append((pixmap, record, detection, translated))
         return layers
 
+    @classmethod
+    def ordered_layer_entries(cls, records: list[PhotoRecord]) -> list[tuple[PhotoRecord, FaciesDetection]]:
+        """Return natural or interpreter-overridden order across a whole well."""
+
+        natural = [
+            (record, detection)
+            for record in records
+            for detection in cls._sort_by_reading_order(record.detections, honor_stack_order=False)
+        ]
+        if not any(detection.stack_order is not None for _, detection in natural):
+            return natural
+        return [
+            entry
+            for _, entry in sorted(
+                enumerate(natural),
+                key=lambda indexed: (
+                    indexed[1][1].stack_order is None,
+                    indexed[1][1].stack_order if indexed[1][1].stack_order is not None else 1_000_000_000,
+                    indexed[0],
+                ),
+            )
+        ]
+
     @staticmethod
-    def _sort_by_reading_order(detections: list[FaciesDetection]) -> list[FaciesDetection]:
+    def _sort_by_reading_order(
+        detections: list[FaciesDetection],
+        honor_stack_order: bool = True,
+    ) -> list[FaciesDetection]:
         indexed = list(enumerate(detections))
         if len(indexed) <= 1:
             return list(detections)
+        if honor_stack_order and any(detection.stack_order is not None for detection in detections):
+            return [
+                detection
+                for _, detection in sorted(
+                    indexed,
+                    key=lambda entry: (
+                        entry[1].stack_order is None,
+                        entry[1].stack_order if entry[1].stack_order is not None else 1_000_000_000,
+                        entry[0],
+                    ),
+                )
+            ]
 
         measured = []
         for original_index, detection in indexed:
@@ -1853,24 +2042,45 @@ class StackColumnItem(QGraphicsObject):
 
     @staticmethod
     def _crop_detection(record: PhotoRecord, detection: FaciesDetection) -> tuple[QPixmap, FaciesDetection] | None:
+        global _STACK_CROP_CACHE_PIXELS
+
         bounds = QPolygonF(detection.polygon).boundingRect().toAlignedRect()
         bounds = bounds.intersected(QRect(0, 0, record.pixmap.width(), record.pixmap.height()))
         if bounds.width() <= 0 or bounds.height() <= 0:
             return None
-        # Keep only the exact edited polygon, not a rectangular bounding-box crop.
-        pixmap = QPixmap(bounds.size())
-        pixmap.fill(Qt.GlobalColor.transparent)
         translated_polygon = QPolygonF(
             [QPointF(point.x() - bounds.left(), point.y() - bounds.top()) for point in detection.polygon]
         )
-        painter = QPainter(pixmap)
-        clip_path = QPainterPath()
-        clip_path.setFillRule(Qt.FillRule.WindingFill)
-        clip_path.addPolygon(translated_polygon)
-        clip_path.closeSubpath()
-        painter.setClipPath(clip_path)
-        painter.drawPixmap(QRect(0, 0, bounds.width(), bounds.height()), record.pixmap, bounds)
-        painter.end()
+        cache_key = (
+            record.identifier,
+            int(record.pixmap.cacheKey()),
+            bounds.x(),
+            bounds.y(),
+            bounds.width(),
+            bounds.height(),
+            tuple((round(point.x(), 2), round(point.y(), 2)) for point in detection.polygon),
+        )
+        pixmap = _STACK_CROP_CACHE.pop(cache_key, None)
+        if pixmap is not None:
+            _STACK_CROP_CACHE[cache_key] = pixmap
+        else:
+            # Keep only the exact edited polygon, not a rectangular bounding-box crop.
+            pixmap = QPixmap(bounds.size())
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+            clip_path = QPainterPath()
+            clip_path.setFillRule(Qt.FillRule.WindingFill)
+            clip_path.addPolygon(translated_polygon)
+            clip_path.closeSubpath()
+            painter.setClipPath(clip_path)
+            painter.drawPixmap(QRect(0, 0, bounds.width(), bounds.height()), record.pixmap, bounds)
+            painter.end()
+            if not pixmap.isNull():
+                _STACK_CROP_CACHE[cache_key] = pixmap
+                _STACK_CROP_CACHE_PIXELS += pixmap.width() * pixmap.height()
+                while _STACK_CROP_CACHE and _STACK_CROP_CACHE_PIXELS > _STACK_CROP_CACHE_MAX_PIXELS:
+                    _, removed = _STACK_CROP_CACHE.popitem(last=False)
+                    _STACK_CROP_CACHE_PIXELS -= removed.width() * removed.height()
         if pixmap.isNull():
             return None
         translated = FaciesDetection(
@@ -1878,7 +2088,11 @@ class StackColumnItem(QGraphicsObject):
             confidence=detection.confidence,
             polygon=list(translated_polygon),
             attributes=dict(detection.attributes),
+            depth_from=detection.depth_from,
+            depth_to=detection.depth_to,
+            training_ready=detection.training_ready,
             alternatives=dict(detection.alternatives),
+            stack_order=detection.stack_order,
         )
         return pixmap, translated
 

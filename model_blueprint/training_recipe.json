@@ -1,0 +1,51 @@
+{
+  "schema": "kern-facies-blueprint-v1",
+  "status": "specification_only_no_weights",
+  "task": "segment",
+  "input_model": "A trusted local YOLO segmentation .pt on the training computer",
+  "class_registry": "class_registry.json",
+  "class_identity": "case-sensitive letter code + workbook index",
+  "device": "NVIDIA CUDA; CPU training disabled in the current worker",
+  "seed": 42,
+  "image_size": 640,
+  "batch": "automatic GPU batch",
+  "epochs": "chosen in UI/CLI; upper limit, not an accuracy guarantee",
+  "early_stopping_patience_default": 12,
+  "augmentation": {
+    "mosaic": 0.0,
+    "mixup": 0.0,
+    "copy_paste": 0.0,
+    "flipud": 0.0,
+    "degrees": 0.0,
+    "perspective": 0.0,
+    "translate": 0.05,
+    "scale": 0.15,
+    "hsv_h": 0.0,
+    "hsv_s": 0.1,
+    "hsv_v": 0.15
+  },
+  "imbalance": {
+    "strategy": "bounded_sqrt_train_only",
+    "maximum_per_class_multiplier": 3,
+    "maximum_total_train_multiplier": 2,
+    "validation_resampling": false,
+    "warning": "Repeated examples change training exposure, not independent evidence or class coverage."
+  },
+  "validation": {
+    "split": "separate wells where feasible; otherwise independent source photographs",
+    "duplicate_photo_leakage": "forbidden between train and val",
+    "primary_metric": "segmentation mAP50-95",
+    "per_class": [
+      "precision",
+      "recall",
+      "f1",
+      "mAP50",
+      "mAP50-95"
+    ],
+    "absent_classes": "untrained/not evaluated, never assigned synthetic quality metrics",
+    "final_test": "reserve additional untouched wells before production acceptance"
+  },
+  "promotion": "candidate requires human review; training does not certify geological accuracy",
+  "lithology": "16 attributes are separate observations; the facies reference supplies hypotheses, not measured facts",
+  "implementation": "app/infrastructure/ml/fine_tune_worker.py"
+}

@@ -28,7 +28,7 @@ from app.infrastructure.excel_core_description import (
     layers_for_photo,
     photo_interval_from_filename,
 )
-from app.infrastructure.ml.rule_based_facies import RuleBasedFaciesDetector
+from app.infrastructure.ml.core_column_service import CoreColumnRecognizer
 from app.infrastructure.photo_caption_ocr import _configure_tesseract, read_caption_metadata
 
 
@@ -101,21 +101,29 @@ class CoreColumnAgent:
 
     name = "core-column-agent"
 
+    def __init__(self, model_path: Path | None = None) -> None:
+        self.recognizer = CoreColumnRecognizer(model_path)
+
     def detect(self, image: np.ndarray, known_columns: list[tuple[int, int, int, int]] | None = None) -> tuple[list[CoreColumn], list[AgentMessage]]:
         height, width = image.shape[:2]
-        boxes = known_columns if known_columns is not None else RuleBasedFaciesDetector._find_core_columns(image)
+        boxes = known_columns if known_columns is not None else self.recognizer.recognize(image)
         columns = [
             CoreColumn(
                 left=max(0, int(left)), top=max(0, int(top)),
                 right=min(width, int(right)), bottom=min(height, int(bottom)),
             )
-            for left, top, right, bottom in boxes
+            for left, top, right, bottom in (
+                (
+                    item["left"], item["top"], item["right"], item["bottom"]
+                ) if isinstance(item, dict) else item
+                for item in boxes
+            )
             if right > left and bottom > top
         ]
         columns.sort(key=lambda item: (item.left, item.top))
         if not columns:
             return [], [AgentMessage("error", "Не найдены колонки керна. Исправьте маску этапа 1 до привязки Excel.")]
-        origin = "manifest этапа 1" if known_columns is not None else "детектор колонок"
+        origin = "manifest этапа 1" if known_columns is not None else self.recognizer.source_label
         return columns, [AgentMessage("info", f"Найдено колонок: {len(columns)} ({origin}).")]
 
 

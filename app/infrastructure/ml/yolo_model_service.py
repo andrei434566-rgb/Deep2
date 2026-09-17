@@ -3,11 +3,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import cv2
+import numpy as np
 from PySide6.QtCore import QObject, QPointF, Qt, Signal, Slot
 from PySide6.QtGui import QPainterPath, QPolygonF
 
+from app.domain.facies_catalog import facies_identity, resolve_facies_class
 from app.domain.models import FaciesDetection
-from app.infrastructure.ml.rule_based_facies import RuleBasedFaciesDetector
+from app.infrastructure.facies_postprocess import UNRECOGNIZED_FACIES, complete_core_column_coverage
+from app.infrastructure.ml.core_column_service import CoreColumnRecognizer, normalize_columns
+from app.infrastructure.ml.rule_based_facies import RuleBasedFaciesDetector, TextureInterval
 
 
 class YoloModelService:
@@ -29,6 +34,7 @@ class YoloModelService:
         self.model = YOLO(str(model_path))
         self.device, self.device_label = self._best_device()
         self._facies_catalog = self._load_facies_catalog(model_path)
+        self.fallback_facies_label = UNRECOGNIZED_FACIES
         self.confidence_threshold = self._normalize_confidence(confidence_threshold)
         self.image_size = self._normalize_image_size(image_size)
         self.max_detections = max(50, min(3000, int(max_detections)))
@@ -55,7 +61,9 @@ class YoloModelService:
             max_det=self.max_detections,
         )
 
-        core_columns = self._core_columns(image_path)
+        core_columns = self._core_columns(image_path) if core_columns_override is None else []
+        source_height = target_size[1] if target_size is not None else 1
+        source_width = target_size[0] if target_size is not None else 1
         for result in results:
             source_height, source_width = getattr(result, "orig_shape", (1, 1))
             x_scale = 1.0 if target_size is None else target_size[0] / max(1, source_width)
@@ -84,22 +92,208 @@ class YoloModelService:
                     polygon = [QPointF(x1, y1), QPointF(x2, y1), QPointF(x2, y2), QPointF(x1, y2)]
                 if x_scale != 1.0 or y_scale != 1.0:
                     polygon = [QPointF(point.x() * x_scale, point.y() * y_scale) for point in polygon]
-                if core_columns_override:
+                if core_columns_override is not None:
                     polygon = self._clip_polygon_to_rectangles(polygon, core_columns_override)
                 else:
                     polygon = self._clip_polygon_to_core_columns(polygon, core_columns, x_scale, y_scale)
                 if len(polygon) < 3:
                     continue
 
+                attributes = self._facies_attributes(label)
                 detections.append(
                     FaciesDetection(
-                        label=label,
+                        label=attributes.get("Код фации", label),
                         confidence=confidence,
                         polygon=polygon,
-                        attributes=dict(self._facies_catalog.get(str(names[class_id]), {})),
+                        attributes=attributes,
                     )
                 )
-        return self._remove_overlapping_detections(detections)
+        detections = self._remove_overlapping_detections(detections)
+        coverage_columns = core_columns_override
+        if coverage_columns is None:
+            coverage_columns = [
+                {
+                    "left": left * (1.0 if target_size is None else target_size[0] / max(1, source_width)),
+                    "top": top * (1.0 if target_size is None else target_size[1] / max(1, source_height)),
+                    "right": right * (1.0 if target_size is None else target_size[0] / max(1, source_width)),
+                    "bottom": bottom * (1.0 if target_size is None else target_size[1] / max(1, source_height)),
+                }
+                for left, top, right, bottom in core_columns
+            ]
+        # A full-photo prediction can miss contacts after a long narrow core
+        # column is reduced to ``imgsz``.  Detect persistent visual packages in
+        # every stage-1 column and classify those crops separately at full model
+        # resolution.  The full-photo masks remain useful context and fallback.
+        interval_detections = self._predict_structure_intervals(
+            image_path,
+            target_size,
+            coverage_columns,
+            detections,
+        )
+        detections.extend(interval_detections)
+        return complete_core_column_coverage(detections, coverage_columns, self.fallback_facies_label)
+
+    def _predict_structure_intervals(
+        self,
+        image_path: str,
+        target_size: tuple[int, int] | None,
+        columns: list[dict[str, float]],
+        context: list[FaciesDetection],
+    ) -> list[FaciesDetection]:
+        """Find and independently classify visual intervals inside core columns."""
+        if not columns:
+            return []
+        try:
+            encoded = np.frombuffer(Path(image_path).read_bytes(), dtype=np.uint8)
+            source = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+        except OSError:
+            return []
+        if source is None or source.size == 0:
+            return []
+        source_height, source_width = source.shape[:2]
+        target_width, target_height = target_size or (source_width, source_height)
+        x_scale = target_width / max(1, source_width)
+        y_scale = target_height / max(1, source_height)
+
+        source_columns: list[tuple[int, int, int, int]] = []
+        for values in columns:
+            try:
+                source_columns.append((
+                    round(float(values["left"]) / x_scale),
+                    round(float(values["top"]) / y_scale),
+                    round(float(values["right"]) / x_scale),
+                    round(float(values["bottom"]) / y_scale),
+                ))
+            except (KeyError, TypeError, ValueError):
+                continue
+        intervals = RuleBasedFaciesDetector().split_columns(source, source_columns)
+        if not intervals:
+            return []
+
+        # Limit the pathological case of an exceptionally noisy photograph and
+        # process small batches to keep inference memory bounded.
+        intervals = intervals[: min(160, self.max_detections)]
+        crops: list[np.ndarray] = []
+        usable: list[TextureInterval] = []
+        for interval in intervals:
+            crop = source[interval.top:interval.bottom, interval.left:interval.right]
+            if crop.size == 0 or crop.shape[0] < 4 or crop.shape[1] < 4:
+                continue
+            crops.append(crop.copy())
+            usable.append(interval)
+        if not crops:
+            return []
+
+        crop_results = []
+        try:
+            for start in range(0, len(crops), 16):
+                crop_results.extend(self.model(
+                    crops[start:start + 16],
+                    verbose=False,
+                    device=self.device,
+                    half=self.device != "cpu",
+                    imgsz=self.image_size,
+                    # Keep weak candidates visible for review, but never make
+                    # an arbitrary class assignment when no evidence exists.
+                    conf=0.01,
+                    max_det=min(50, self.max_detections),
+                ))
+        except Exception:
+            # Structural contacts are still useful with labels inherited from
+            # the full-photo prediction, so a failed crop batch is non-fatal.
+            crop_results = []
+
+        polygons = [
+            [QPointF(x * x_scale, y * y_scale) for x, y in interval.polygon]
+            for interval in usable
+        ]
+        classifications: list[tuple[str, float, dict[str, float]] | None] = []
+        for index, polygon in enumerate(polygons):
+            result = crop_results[index] if index < len(crop_results) else None
+            classified = self._interval_classification(result)
+            if classified is None:
+                classified = self._inherit_interval_class(polygon, context)
+            classifications.append(classified)
+
+        output: list[FaciesDetection] = []
+        for index, (interval, polygon) in enumerate(zip(usable, polygons)):
+            classified = classifications[index]
+            if classified is None:
+                label, confidence, alternatives = UNRECOGNIZED_FACIES, 0.0, {}
+            else:
+                label, confidence, alternatives = classified
+            attributes = self._facies_attributes(label)
+            attributes.update({
+                "Источник распознавания": "интервальный анализ столбика",
+                "Граница интервала": self._translated_texture_evidence(interval.evidence),
+                # Internal stable group: gap filling may subdivide an interval,
+                # but equal labels across a real structural contact must not be
+                # merged back into one long block.
+                "__structural_interval": f"{interval.column_index}:{index}",
+            })
+            output.append(FaciesDetection(
+                label=attributes.get("Код фации", label),
+                confidence=max(0.0, min(1.0, confidence)),
+                polygon=polygon,
+                attributes=attributes,
+                alternatives=alternatives,
+            ))
+        return output
+
+    def _interval_classification(self, result) -> tuple[str, float, dict[str, float]] | None:
+        """Choose the class explaining the largest confident part of a crop."""
+        if result is None or getattr(result, "boxes", None) is None:
+            return None
+        names = result.names
+        height, width = getattr(result, "orig_shape", (1, 1))
+        crop_area = max(1.0, float(height * width))
+        candidates: list[tuple[float, float, str]] = []
+        alternatives: dict[str, float] = {}
+        for box in result.boxes:
+            class_id = int(box.cls.item())
+            label = str(names[class_id])
+            if self._is_excluded_label(label):
+                continue
+            confidence = float(box.conf.item())
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            area_fraction = max(0.0, (x2 - x1) * (y2 - y1)) / crop_area
+            score = confidence * (0.55 + 0.45 * min(1.0, area_fraction) ** 0.5)
+            candidates.append((score, confidence, label))
+            alternatives[label] = max(alternatives.get(label, 0.0), confidence)
+        if not candidates:
+            return None
+        _, confidence, label = max(candidates, key=lambda item: (item[0], item[1]))
+        alternatives.pop(label, None)
+        return label, confidence, alternatives
+
+    @staticmethod
+    def _inherit_interval_class(
+        polygon: list[QPointF],
+        context: list[FaciesDetection],
+    ) -> tuple[str, float, dict[str, float]] | None:
+        target = QPolygonF(polygon).boundingRect()
+        target_area = max(1.0, target.width() * target.height())
+        ranked: list[tuple[float, FaciesDetection]] = []
+        for detection in context:
+            overlap = target.intersected(QPolygonF(detection.polygon).boundingRect())
+            fraction = max(0.0, overlap.width() * overlap.height()) / target_area
+            if fraction > 0:
+                ranked.append((fraction * max(0.05, detection.confidence), detection))
+        if not ranked:
+            return None
+        _, chosen = max(ranked, key=lambda item: item[0])
+        # A displayed code can be ambiguous; retain the precise model class
+        # (Dch@47 vs Dch@92) when inheriting an overlapping prediction.
+        return chosen.attributes.get("Класс модели", chosen.label), chosen.confidence * 0.80, dict(chosen.alternatives)
+
+    @staticmethod
+    def _translated_texture_evidence(evidence: str) -> str:
+        return {
+            "high lamination density": "изменение слоистости",
+            "pale comparatively uniform texture": "переход к светлой однородной структуре",
+            "dark comparatively uniform texture": "переход к тёмной однородной структуре",
+            "persistent change of visual texture": "устойчивое изменение текстуры",
+        }.get(str(evidence), str(evidence))
 
     @staticmethod
     def _is_excluded_label(label: str) -> bool:
@@ -108,19 +302,32 @@ class YoloModelService:
 
     @staticmethod
     def _core_columns(image_path: str) -> list[tuple[int, int, int, int]]:
-        """Find physical core columns; everything around them is ignored."""
+        """Run the independent stage-1 recognizer before facies inference."""
         try:
-            import cv2
-            import numpy as np
-
-            image = cv2.imdecode(np.frombuffer(Path(image_path).read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
-            if image is None:
-                return []
-            return RuleBasedFaciesDetector._find_core_columns(image)
-        except (OSError, ImportError):
+            columns = CoreColumnRecognizer().recognize_path(image_path)
+            return [
+                (round(item["left"]), round(item["top"]), round(item["right"]), round(item["bottom"]))
+                for item in columns
+            ]
+        except (OSError, ImportError, ValueError):
             # Never discard a valid prediction merely because a source image
             # cannot be re-read at this point.
             return []
+
+    def _facies_attributes(self, label: str) -> dict[str, str]:
+        """Only attach reference context, never fabricate observed lithology.
+
+        Historical sidecars held a majority lithology vector per class. Those
+        parameters are class priors, not observations of this core interval.
+        """
+        trained = self._facies_catalog.get(label, {})
+        # A canonical model label is authoritative over stale sidecar indices.
+        resolved = resolve_facies_class(label) if "@" in label else resolve_facies_class(label, trained.get("Индекс фации"))
+        values = dict(resolved["metadata"]) if resolved else {}
+        values["Класс модели"] = resolved["model_label"] if resolved else label
+        values["Статус фации"] = "прогноз, требуется проверка" if resolved else "не сопоставлена со справочником"
+        values["Источник описания"] = "справочник фаций; гипотеза по прогнозу модели, не наблюдение"
+        return values
 
     @staticmethod
     def _clip_polygon_to_core_columns(
@@ -288,9 +495,10 @@ class YoloModelService:
                     # A competing overlapping mask of another class is still
                     # useful to an interpreter, so retain it as an alternative
                     # even though only one visual mask is rendered.
-                    if detection.label != existing.label:
-                        existing.alternatives[detection.label] = max(
-                            existing.alternatives.get(detection.label, 0.0),
+                    if facies_identity(detection.label, detection.attributes) != facies_identity(existing.label, existing.attributes):
+                        alternative_label = detection.attributes.get("Класс модели", detection.label)
+                        existing.alternatives[alternative_label] = max(
+                            existing.alternatives.get(alternative_label, 0.0),
                             detection.confidence,
                         )
                     duplicates_existing = True
@@ -326,17 +534,19 @@ class YoloModelService:
 
 class SegmentationWorker(QObject):
     progress_changed = Signal(int, int, str)
-    image_ready = Signal(str, object)
+    # path, gap-free facies bands, stage-1 core-column rectangles
+    image_ready = Signal(str, object, object)
     failed = Signal(str)
     finished = Signal()
 
     def __init__(
         self,
         model_path: Path,
-        image_paths: list[tuple[str, int, int, list[dict[str, float]] | None]],
+        image_paths: list[tuple[str, int, int, list[dict[str, float]] | None, bool]],
         confidence_threshold: float | None = None,
         image_size: int = 640,
         max_detections: int = 1000,
+        column_model_path: Path | None = None,
     ):
         super().__init__()
         self.model_path = model_path
@@ -344,16 +554,26 @@ class SegmentationWorker(QObject):
         self.confidence_threshold = confidence_threshold
         self.image_size = image_size
         self.max_detections = max_detections
+        self.column_model_path = column_model_path
 
     @Slot()
     def run(self) -> None:
         try:
             service = YoloModelService(self.model_path, self.confidence_threshold, self.image_size, self.max_detections)
+            column_recognizer = CoreColumnRecognizer(self.column_model_path, image_size=self.image_size)
             total = len(self.image_paths)
             self.progress_changed.emit(0, total, f"{service.device_label} · {service.image_size}px · порог {service.confidence_threshold:.0%}")
-            for index, (image_path, width, height, core_columns) in enumerate(self.image_paths, start=1):
-                self.progress_changed.emit(index, total, Path(image_path).name)
-                self.image_ready.emit(image_path, service.predict(image_path, (width, height), core_columns))
+            for index, values in enumerate(self.image_paths, start=1):
+                image_path, width, height, core_columns = values[:4]
+                columns_verified = bool(values[4]) if len(values) >= 5 else bool(core_columns)
+                self.progress_changed.emit(index, total, f"Этап 1/2 · столбики · {Path(image_path).name}")
+                if columns_verified and core_columns:
+                    recognized_columns = normalize_columns(core_columns, (width, height))
+                else:
+                    recognized_columns = column_recognizer.recognize_path(image_path, (width, height))
+                self.progress_changed.emit(index, total, f"Этап 2/2 · интервалы и фации · {Path(image_path).name}")
+                detections = service.predict(image_path, (width, height), recognized_columns)
+                self.image_ready.emit(image_path, detections, recognized_columns)
         except Exception as exc:
             self.failed.emit(str(exc))
         finally:

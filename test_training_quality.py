@@ -27,6 +27,36 @@ class TrainingQualityTests(unittest.TestCase):
         queue = review_queue(records)
         self.assertEqual("A", queue[0][1].label)
 
+    def test_natural_facies_imbalance_is_warning_not_blocker(self):
+        pixmap = QPixmap(100, 200)
+        detections = []
+        for index in range(10):
+            top = float(index * 10)
+            detections.append(FaciesDetection(
+                "Частая",
+                1.0,
+                [QPointF(0, top), QPointF(20, top), QPointF(20, top + 8), QPointF(0, top + 8)],
+                training_ready=True,
+                depth_from=top,
+                depth_to=top + 8,
+            ))
+        for index in range(2):
+            top = float(120 + index * 20)
+            detections.append(FaciesDetection(
+                "Редкая",
+                1.0,
+                [QPointF(30, top), QPointF(50, top), QPointF(50, top + 8), QPointF(30, top + 8)],
+                training_ready=True,
+                depth_from=top,
+                depth_to=top + 8,
+            ))
+
+        quality = training_quality([PhotoRecord("well", "memory", pixmap, detections=detections)])
+
+        self.assertTrue(quality.severe_imbalance)
+        self.assertEqual([], quality.blocking_reasons)
+        self.assertIn("допустим", quality.summary)
+
 
 if __name__ == "__main__":
     unittest.main()

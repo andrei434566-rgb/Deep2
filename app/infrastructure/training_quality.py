@@ -24,12 +24,13 @@ class TrainingQuality:
 
     @property
     def blocking_reasons(self) -> list[str]:
-        """Problems serious enough to make a training run misleading."""
-        reasons: list[str] = []
-        if self.severe_imbalance:
-            counts = ", ".join(f"{label}: {count}" for label, count in self.by_facies.items())
-            reasons.append(f"сильный дисбаланс классов ({counts})")
-        return reasons
+        """Return fatal dataset problems.
+
+        Natural facies frequencies inside one well are not expected to be
+        balanced.  Imbalance is therefore reported for audit, but it must not
+        prevent an interpreter from fine-tuning on the actual geology.
+        """
+        return []
 
     @property
     def summary(self) -> str:
@@ -48,7 +49,7 @@ class TrainingQuality:
         if self.too_large_masks:
             parts.append(f"слишком большие: {self.too_large_masks}")
         if self.severe_imbalance:
-            parts.append("сильный дисбаланс — обучение заблокировано")
+            parts.append("сильный дисбаланс — допустим для скважины")
         return " · ".join(parts)
 
 

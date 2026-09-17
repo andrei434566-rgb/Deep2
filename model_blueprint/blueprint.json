@@ -1,0 +1,7 @@
+{
+  "schema": "kern-facies-blueprint-v1",
+  "status": "specification_only_no_weights",
+  "class_count": 92,
+  "class_identity_sha256": "4aaeac498f8aefe146654c226eb96999c22cb47ba9afac8899038ce888d64de3",
+  "reference_sha256": "A8C09C73D158FD5C2EECE14820605F808E9F536090CEACD4A2320B7D30301558"
+}

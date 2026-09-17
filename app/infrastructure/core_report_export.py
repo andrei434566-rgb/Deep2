@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from app.domain.lithology_attributes import LITHOLOGY_ATTRIBUTE_OPTIONS
+from app.domain.facies_catalog import facies_identity
 
 
 # Adjacent labels generated on separate photo columns are one geological layer.
@@ -59,12 +60,7 @@ def _well_metadata(well: dict) -> list[tuple[str, str]]:
 
 
 def _facies_key(layer: dict) -> tuple[str, str]:
-    attributes = dict(layer.get("attributes") or {})
-    for field in ("Код фации", "Индекс фации"):
-        value = str(attributes.get(field) or "").strip()
-        if value:
-            return field, value.casefold()
-    return "label", str(layer.get("label") or "").strip().casefold()
+    return facies_identity(str(layer.get("label") or ""), layer.get("attributes"))
 
 
 def _depth_or_none(value: object) -> float | None:
@@ -116,6 +112,8 @@ def _merged_layers(well: dict) -> list[dict]:
             and start is not None
             and end is not None
             and _facies_key(merged[-1]) == _facies_key(layer)
+            and all(str(merged[-1]["attributes"].get(field) or "") == str(layer["attributes"].get(field) or "")
+                    for field in LITHOLOGY_ATTRIBUTE_OPTIONS)
         ):
             previous = merged[-1]
             previous_end = _depth_or_none(previous.get("depth_to"))
@@ -139,7 +137,11 @@ def _layer_rows(well: dict) -> list[tuple[str, str, str]]:
             interval = f"{float(start):g} - {float(end):g} {unit}"
         attributes = dict(layer.get("attributes") or {})
         attributes.pop("Литология", None)
-        details = "; ".join(f"{key}: {value}" for key, value in attributes.items() if value not in (None, "")) or "-"
+        details = "; ".join(
+            f"{key}: {value}"
+            for key, value in attributes.items()
+            if value not in (None, "") and not str(key).startswith("__")
+        ) or "-"
         rows.append((interval, str(layer.get("label") or "Слой"), details))
     return rows
 
@@ -148,6 +150,13 @@ def _layer_rows(well: dict) -> list[tuple[str, str, str]]:
 # keeps them as one readable description, rather than widening the Excel form
 # with sixteen technical columns.
 LITHOLOGY_DESCRIPTION_FIELDS = tuple(LITHOLOGY_ATTRIBUTE_OPTIONS.keys())
+FACIES_DESCRIPTION_FIELDS = (
+    "Обстановка седиментации",
+    "Фациальная ассоциация",
+    "Энергия среды",
+    "Гидродинамический режим",
+    "Предполагаемые литотипы",
+)
 
 OFFICIAL_HEADERS = (
     "Месторождение", "№ скв.", "№ долбления", "Интервал отбора керна, м\nКровля",
@@ -169,7 +178,19 @@ def _lithology_description(attributes: dict[str, object]) -> str:
         for field in LITHOLOGY_DESCRIPTION_FIELDS
         if _text(attributes.get(field))
     ]
-    return "\n".join(lines)
+    return "\n".join(lines) or "Литологические параметры не заполнены"
+
+
+def _facies_description(attributes: dict[str, object]) -> str:
+    custom = _text(attributes.get("Краткое описание"))
+    if custom:
+        return custom
+    lines = [
+        f"{field}: {_text(attributes.get(field))}"
+        for field in FACIES_DESCRIPTION_FIELDS
+        if _text(attributes.get(field))
+    ]
+    return ("Справочная характеристика фации (не наблюдения по фото):\n" + "\n".join(lines)) if lines else "Описание не заполнено"
 
 
 def _official_rows(project_title: str, wells: list[dict]) -> list[list[object]]:
@@ -189,7 +210,7 @@ def _official_rows(project_title: str, wells: list[dict]) -> list[list[object]]:
                 thickness = round(abs(float(base) - float(top)), 3)
             facies = _text(attributes.get("Индекс фации"), _text(layer.get("label"), "не указано"))
             name = _text(attributes.get("Название фации"), facies)
-            description = _text(attributes.get("Краткое описание"), "Описание не заполнено")
+            description = _facies_description(attributes)
             rows.append([
                 _text(settings.get("field") or settings.get("месторождение"), project_title or "не указано"),
                 _text(well.get("name"), str(well_index)), _text(settings.get("drilling_number")),

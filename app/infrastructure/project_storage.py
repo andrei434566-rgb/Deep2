@@ -50,6 +50,7 @@ def save_project(
                 "photo_depth_to": record.photo_depth_to,
                 "depth_segments": record.depth_segments,
                 "core_columns": record.core_columns,
+                "core_columns_verified": record.core_columns_verified,
                 "display_size": [record.pixmap.width(), record.pixmap.height()],
                 "position": [positions.get(record.identifier, QPointF()).x(), positions.get(record.identifier, QPointF()).y()],
                 "detections": [
@@ -62,6 +63,7 @@ def save_project(
                         "depth_to": detection.depth_to,
                         "training_ready": detection.training_ready,
                         "alternatives": detection.alternatives,
+                        "stack_order": detection.stack_order,
                     }
                     for detection in record.detections
                 ],
@@ -107,6 +109,7 @@ def load_project(folder: Path) -> tuple[str, list[PhotoRecord], dict[str, QPoint
                 depth_to=_float_or_none(detection.get("depth_to")),
                 training_ready=bool(detection.get("training_ready", False)),
                 alternatives={str(name): float(score) for name, score in dict(detection.get("alternatives") or {}).items()},
+                stack_order=_int_or_none(detection.get("stack_order")),
             )
             for detection in item.get("detections", [])
         ]
@@ -136,6 +139,7 @@ def load_project(folder: Path) -> tuple[str, list[PhotoRecord], dict[str, QPoint
                     for column in item.get("core_columns", [])
                     if isinstance(column, dict)
                 ],
+                core_columns_verified=bool(item.get("core_columns_verified", False)),
             )
         )
         position = item.get("position") or [0, 0]
@@ -147,5 +151,12 @@ def load_project(folder: Path) -> tuple[str, list[PhotoRecord], dict[str, QPoint
 def _float_or_none(value) -> float | None:
     try:
         return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _int_or_none(value) -> int | None:
+    try:
+        return None if value is None else int(value)
     except (TypeError, ValueError):
         return None

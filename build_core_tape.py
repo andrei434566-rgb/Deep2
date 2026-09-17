@@ -34,7 +34,7 @@ from urllib.parse import quote
 import cv2
 import numpy as np
 
-from app.infrastructure.ml.rule_based_facies import RuleBasedFaciesDetector
+from app.infrastructure.ml.core_column_service import CoreColumnRecognizer
 from app.infrastructure.kern_analyzer_pipeline import KernAnalyzerAutomaticPipeline, KernAnalyzerDemoPipeline
 from app.infrastructure.excel_core_description import (
     DescriptionLayer,
@@ -520,7 +520,7 @@ def main() -> int:
     for directory in (output_dir, output_dir / "overlays", output_dir / "masks", output_dir / "crops"):
         directory.mkdir(parents=True, exist_ok=False)
 
-    detector = RuleBasedFaciesDetector()
+    detector = CoreColumnRecognizer()
     crop_records: list[CropRecord] = []
     photos: list[dict[str, object]] = []
     sequence_number = 0
@@ -530,7 +530,10 @@ def main() -> int:
         prefix = f"p{photo_number:04d}_{image_path.stem}"
         try:
             image = read_image(image_path)
-            columns = detector._find_core_columns(image)
+            columns = [
+                (round(item["left"]), round(item["top"]), round(item["right"]), round(item["bottom"]))
+                for item in detector.recognize(image)
+            ]
             columns = sorted(columns, key=lambda item: item[0], reverse=args.right_to_left)
             overlay_file = Path("overlays") / f"{prefix}_overlay.png"
             mask_file = Path("masks") / f"{prefix}_columns_mask.png"

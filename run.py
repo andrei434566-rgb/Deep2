@@ -41,6 +41,26 @@ def _enable_command_console() -> None:
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "--portable-smoke-test":
+        _enable_command_console()
+        import os
+
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        import cv2  # noqa: F401 - verifies bundled runtime
+        import openpyxl  # noqa: F401 - verifies Excel import runtime
+        import torch  # noqa: F401 - verifies model runtime
+        from PySide6.QtWidgets import QApplication
+        from app.domain.facies_catalog import FACIES_MODEL_CLASSES
+        from app.ui.windows.main_window import MainWindow
+
+        app = QApplication.instance() or QApplication([])
+        window = MainWindow()
+        window.close()
+        app.quit()
+        if len(FACIES_MODEL_CLASSES) != 92:
+            raise RuntimeError("Portable facies registry is incomplete")
+        print("Kern Analyzer portable smoke test: OK")
+        return 0
     if len(sys.argv) > 1:
         # Keep the command-line workflow inside the full GUI distribution so
         # that v1.5 never depends on a second, lightweight executable.

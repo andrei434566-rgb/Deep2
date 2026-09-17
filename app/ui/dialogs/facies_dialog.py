@@ -1,24 +1,22 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QSettings, Signal
-from PySide6.QtWidgets import QComboBox, QDialog, QDialogButtonBox, QFormLayout, QInputDialog, QLabel, QLineEdit, QPushButton, QScrollArea, QVBoxLayout, QWidget
+import json
 
-from app.domain.facies_catalog import FACIES_CATALOG, facies_metadata, facies_title
+from PySide6.QtCore import QSettings, Qt, Signal
+from PySide6.QtWidgets import QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QPushButton, QScrollArea, QVBoxLayout, QWidget
+
+from app.domain.facies_catalog import FACIES_MODEL_CLASSES, FACIES_REFERENCE_FIELDS, facies_metadata, facies_title, resolve_facies_class
 from app.domain.lithology_attributes import LITHOLOGY_ATTRIBUTE_OPTIONS
 
 
 CUSTOM_VALUE = "__kern_analyzer_custom_value__"
-FACIES_REFERENCE_FIELDS = {
-    "Код фации",
-    "Индекс фации",
-    "Название фации",
-    "Энергия среды",
-    "Гидродинамический режим",
-}
+FACIES_METADATA_ROLE = Qt.ItemDataRole.UserRole + 1
 
 
 class FaciesDialog(QDialog):
     delete_requested = Signal()
+    move_up_requested = Signal()
+    move_down_requested = Signal()
 
     def __init__(
         self,
@@ -28,16 +26,19 @@ class FaciesDialog(QDialog):
         depth_from: float | None = None,
         depth_to: float | None = None,
         parent=None,
+        *,
+        training_ready: bool = False,
     ):
         super().__init__(parent)
         self.setWindowTitle("Параметры фации")
         self.setMinimumWidth(345)
-        self.resize(375, 620)
+        self.resize(510, 740)
         attributes = dict(attributes or {})
+        requested_index = str(attributes.get("Индекс фации") or "").strip()
         if current_facies and current_facies != "Новый контур":
             # Imported project values remain authoritative over catalogue
             # defaults, which lets an interpreter correct a single layer.
-            reference = facies_metadata(current_facies)
+            reference = facies_metadata(current_facies, requested_index)
             reference.update(attributes)
             attributes = reference
         self._preserved_attributes = {
@@ -51,7 +52,7 @@ class FaciesDialog(QDialog):
         self.attribute_combos: dict[str, QComboBox] = {}
 
         layout = QVBoxLayout(self)
-        confidence_label = QLabel(f"Уверенность модели: {confidence:.0%}")
+        confidence_label = QLabel(f"Оценка модели: {confidence:.0%} (не вероятность правильности)")
         confidence_label.setStyleSheet("color: #687087;")
         layout.addWidget(confidence_label)
 
@@ -59,25 +60,50 @@ class FaciesDialog(QDialog):
         form = QFormLayout(form_container)
         form.setSpacing(10)
         self.facies = QComboBox()
-        known_codes: set[str] = set()
-        for item in FACIES_CATALOG:
+        self.facies.addItem("— фация не выбрана —", "")
+        for model_class in FACIES_MODEL_CLASSES:
+            item = model_class["metadata"]
             code = item["Код фации"]
-            if code.casefold() in known_codes:
-                continue
-            known_codes.add(code.casefold())
             self.facies.addItem(facies_title(item), code)
+            self.facies.setItemData(self.facies.count() - 1, dict(item), FACIES_METADATA_ROLE)
         self.facies.addItem("Самостоятельный выбор…", CUSTOM_VALUE)
-        if not current_facies or current_facies == "Новый контур":
-            current_facies = str(self.settings.value("last/facies", "")).strip()
-        current_index = self.facies.findData(current_facies)
+        resolved = resolve_facies_class(current_facies, requested_index)
+        if resolved:
+            current_facies, requested_index = resolved["code"], resolved["index"]
+        elif current_facies == "Новый контур":
+            current_facies = ""
+        current_index = next(
+            (
+                index
+                for index in range(self.facies.count())
+                if self.facies.itemData(index) == current_facies and (resolved or not current_facies)
+                and (
+                    not requested_index
+                    or str((self.facies.itemData(index, FACIES_METADATA_ROLE) or {}).get("Индекс фации") or "")
+                    == requested_index
+                )
+            ),
+            -1,
+        )
         if current_facies and current_index < 0:
-            self.facies.insertItem(0, current_facies, current_facies)
+            self.facies.insertItem(0, f"{current_facies} · уточните по справочнику", current_facies)
             current_index = 0
         if current_index >= 0:
             self.facies.setCurrentIndex(current_index)
         self.facies.activated.connect(self._choose_custom_facies)
+        self.facies.currentIndexChanged.connect(self._update_facies_reference)
         self.facies.setToolTip("Выберите код из справочника или «Самостоятельный выбор» для своего кода.")
+        search = QLineEdit()
+        search.setPlaceholderText("Код, индекс или часть названия…")
+        search.textChanged.connect(self._filter_facies)
+        form.addRow("Поиск фации:", search)
         form.addRow("Фация (основная метка):", self.facies)
+        self.facies_reference = QLabel()
+        self.facies_reference.setWordWrap(True)
+        self.facies_reference.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.facies_reference.setStyleSheet("color: #596174; background: #f5f7fa; padding: 7px; border-radius: 6px;")
+        form.addRow("Определение:", self.facies_reference)
+        self._update_facies_reference()
         self.depth_from = QLineEdit("" if depth_from is None else self._format_depth(depth_from))
         self.depth_from.setPlaceholderText("например, 2450.5")
         self.depth_to = QLineEdit("" if depth_to is None else self._format_depth(depth_to))
@@ -91,8 +117,6 @@ class FaciesDialog(QDialog):
                 combo.addItem(option, option)
             combo.addItem("Самостоятельный выбор…", CUSTOM_VALUE)
             value = str(attributes.get(field_name) or "").strip()
-            if field_name == "Флюидонасыщение" and not value:
-                value = str(self.settings.value("last/saturation", "")).strip()
             value_index = combo.findData(value)
             if value and value_index < 0:
                 combo.insertItem(combo.count() - 1, value, value)
@@ -107,6 +131,35 @@ class FaciesDialog(QDialog):
         scroll.setWidget(form_container)
         layout.addWidget(scroll, 1)
 
+        self.training_confirmed = QCheckBox("Фация и границы проверены — использовать в обучении")
+        self.training_confirmed.setChecked(training_ready)
+        self.training_confirmed.setToolTip("Отметьте после проверки класса и контура. Сохранить черновик можно без этой отметки.")
+        layout.addWidget(self.training_confirmed)
+        try:
+            suggestions = json.loads(str(attributes.get("__attribute_suggestions") or "{}"))
+        except (ValueError, TypeError):
+            suggestions = {}
+        if isinstance(suggestions, dict) and suggestions:
+            suggested = QLabel("Визуальные подсказки (не подтверждены): " + "; ".join(f"{k}: {v}" for k, v in suggestions.items()))
+            suggested.setWordWrap(True)
+            layout.addWidget(suggested)
+            apply_suggestions = QPushButton("Перенести подсказки в пустые поля")
+            apply_suggestions.clicked.connect(lambda: self._apply_suggestions(suggestions))
+            layout.addWidget(apply_suggestions)
+
+        order_row = QHBoxLayout()
+        move_up = QPushButton("↑ Слой выше")
+        move_up.setObjectName("moveFaciesLayerUp")
+        move_up.setToolTip("Поднять этот слой на одну позицию в собранном столбике керна")
+        move_down = QPushButton("↓ Слой ниже")
+        move_down.setObjectName("moveFaciesLayerDown")
+        move_down.setToolTip("Опустить этот слой на одну позицию в собранном столбике керна")
+        move_up.clicked.connect(self.move_up_requested)
+        move_down.clicked.connect(self.move_down_requested)
+        order_row.addWidget(move_up)
+        order_row.addWidget(move_down)
+        layout.addLayout(order_row)
+
         actions = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         delete_button = QPushButton("Удалить")
         delete_button.setStyleSheet("color: #b33b4d;")
@@ -117,14 +170,32 @@ class FaciesDialog(QDialog):
         layout.addWidget(actions)
 
     def selected_facies(self) -> str:
-        return str(self.facies.currentData() or self.facies.currentText()).strip()
+        value = self.facies.currentData()
+        return "" if value in (None, "", CUSTOM_VALUE) else str(value).strip()
+
+    def _filter_facies(self, text: str) -> None:
+        query = text.strip().casefold()
+        for index in range(self.facies.count()):
+            self.facies.view().setRowHidden(index, bool(query and query not in self.facies.itemText(index).casefold()))
+
+    def _apply_suggestions(self, suggestions: dict) -> None:
+        for field, value in suggestions.items():
+            combo = self.attribute_combos.get(field)
+            if combo is None or combo.currentData():
+                continue
+            index = combo.findData(value)
+            if index < 0:
+                combo.insertItem(combo.count() - 1, str(value), str(value))
+                index = combo.count() - 2
+            combo.setCurrentIndex(index)
 
     def selected_lithology(self) -> str:
         """Compatibility alias for code that used the old dialog API."""
         return self.selected_facies()
 
     def selected_attributes(self) -> dict[str, str]:
-        values = facies_metadata(self.selected_facies())
+        selected_reference = self.facies.currentData(FACIES_METADATA_ROLE)
+        values = dict(selected_reference) if isinstance(selected_reference, dict) else facies_metadata(self.selected_facies())
         values.setdefault("Код фации", self.selected_facies())
         values.update(self._preserved_attributes)
         values.update({
@@ -151,6 +222,20 @@ class FaciesDialog(QDialog):
             self.facies.insertItem(self.facies.count() - 1, code, code)
             existing = self.facies.count() - 2
         self.facies.setCurrentIndex(existing)
+
+    def _update_facies_reference(self, _index: int = -1) -> None:
+        metadata = self.facies.currentData(FACIES_METADATA_ROLE)
+        if not isinstance(metadata, dict):
+            self.facies_reference.setText("Метка не сопоставлена справочнику. Для финальной модели выберите точный код и индекс. Наблюдения по слою можно сохранить отдельно.")
+            return
+        rows = [
+            ("Обстановка", metadata.get("Обстановка седиментации")),
+            ("Ассоциация", metadata.get("Фациальная ассоциация")),
+            ("Энергия", metadata.get("Энергия среды")),
+            ("Режим", metadata.get("Гидродинамический режим")),
+            ("Литотипы", metadata.get("Предполагаемые литотипы")),
+        ]
+        self.facies_reference.setText("Справочная характеристика, не измерение по фото:\n" + "\n".join(f"{title}: {value}" for title, value in rows if value))
 
     def _choose_custom_attribute(self, field_name: str, combo: QComboBox, index: int) -> None:
         if combo.itemData(index) != CUSTOM_VALUE:
