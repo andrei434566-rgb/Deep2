@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,17 +22,18 @@ class ModelResegmentationTests(unittest.TestCase):
         window = MainWindow()
         record = PhotoRecord("one", "memory.jpg", QPixmap(10, 10))
         window._records = [record]
-        model_path = Path("models/best.pt").resolve()
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = (Path(directory) / "candidate.pt").resolve()
+            model_path.write_bytes(b"test model placeholder")
+            with (
+                patch("app.ui.windows.main_window.QFileDialog.getOpenFileName", return_value=(str(model_path), "")),
+                patch("app.ui.windows.main_window.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes),
+                patch.object(window, "run_segmentation") as run_segmentation,
+            ):
+                window.select_detection_model()
 
-        with (
-            patch("app.ui.windows.main_window.QFileDialog.getOpenFileName", return_value=(str(model_path), "")),
-            patch("app.ui.windows.main_window.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes),
-            patch.object(window, "run_segmentation") as run_segmentation,
-        ):
-            window.select_detection_model()
-
-        self.assertEqual(model_path, window._selected_model_path.resolve())
-        run_segmentation.assert_called_once_with(window._records)
+            self.assertEqual(model_path, window._selected_model_path.resolve())
+            run_segmentation.assert_called_once_with(window._records)
         window.close()
 
 
