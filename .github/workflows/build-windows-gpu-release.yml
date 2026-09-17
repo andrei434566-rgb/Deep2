@@ -1,0 +1,153 @@
+name: Build Windows GPU application
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['gpu-v*']
+
+permissions:
+  contents: write
+
+env:
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: 'utf-8'
+
+concurrency:
+  group: kern-analyzer-windows-gpu-release
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Get source code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install CUDA dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+          python -m pip install --upgrade --force-reinstall torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu126
+          python -c "import torch; assert torch.version.cuda == '12.6', torch.version.cuda; print('PyTorch:', torch.__version__, 'CUDA build:', torch.version.cuda)"
+
+      - name: Install portable OCR runtime
+        shell: pwsh
+        run: |
+          choco install tesseract --yes --no-progress
+          New-Item -ItemType Directory -Force -Path tools/tesseract | Out-Null
+          Copy-Item -Path 'C:\Program Files\Tesseract-OCR\*' -Destination tools/tesseract -Recurse -Force
+          Invoke-WebRequest -Uri 'https://github.com/tesseract-ocr/tessdata_fast/raw/main/rus.traineddata' -OutFile tools/tesseract/tessdata/rus.traineddata
+
+      - name: Run unit tests
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -B -m unittest discover -v
+
+      - name: Build portable Kern Analyzer GPU
+        run: python -m PyInstaller --noconfirm --clean Kern_Analyzer.spec
+
+      - name: Remove incompatible ICU DLLs
+        shell: pwsh
+        run: |
+          Remove-Item -LiteralPath dist/Kern_Analyzer/_internal/icuuc.dll -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath dist/Kern_Analyzer/_internal/icudt78.dll -Force -ErrorAction SilentlyContinue
+
+      - name: Verify packaged executable
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath 'dist/Kern_Analyzer/Kern_Analyzer.exe' -ArgumentList '--portable-smoke-test' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Portable smoke test failed with exit code $($process.ExitCode)" }
+
+      - name: Split GPU application into two ZIP files
+        shell: pwsh
+        run: |
+          $distRoot = (Resolve-Path 'dist').Path
+          $files = Get-ChildItem -LiteralPath 'dist/Kern_Analyzer' -Recurse -File | Sort-Object Length -Descending
+          $part1 = [System.Collections.Generic.List[string]]::new()
+          $part2 = [System.Collections.Generic.List[string]]::new()
+          [int64]$size1 = 0
+          [int64]$size2 = 0
+          foreach ($file in $files) {
+            $relative = [System.IO.Path]::GetRelativePath($distRoot, $file.FullName)
+            if ($size1 -le $size2) {
+              $part1.Add($relative)
+              $size1 += $file.Length
+            } else {
+              $part2.Add($relative)
+              $size2 += $file.Length
+            }
+          }
+          $utf8 = [System.Text.UTF8Encoding]::new($false)
+          $list1 = Join-Path $env:RUNNER_TEMP 'gpu-part1.txt'
+          $list2 = Join-Path $env:RUNNER_TEMP 'gpu-part2.txt'
+          [System.IO.File]::WriteAllLines($list1, $part1, $utf8)
+          [System.IO.File]::WriteAllLines($list2, $part2, $utf8)
+          $archive1 = Join-Path $env:GITHUB_WORKSPACE 'Kern_Analyzer-GPU-Windows-part1.zip'
+          $archive2 = Join-Path $env:GITHUB_WORKSPACE 'Kern_Analyzer-GPU-Windows-part2.zip'
+          Push-Location $distRoot
+          try {
+            & 'C:\Program Files\7-Zip\7z.exe' a -tzip -mx=7 -scsUTF-8 $archive1 "@$list1"
+            if ($LASTEXITCODE -ne 0) { throw "7-Zip part 1 failed with exit code $LASTEXITCODE" }
+            & 'C:\Program Files\7-Zip\7z.exe' a -tzip -mx=7 -scsUTF-8 $archive2 "@$list2"
+            if ($LASTEXITCODE -ne 0) { throw "7-Zip part 2 failed with exit code $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
+          $limit = 2000000000
+          foreach ($archive in @($archive1, $archive2)) {
+            $length = (Get-Item -LiteralPath $archive).Length
+            if ($length -ge $limit) { throw "Release part is too large for GitHub: $archive ($length bytes)" }
+          }
+
+      - name: Verify split archive coverage
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $sourceFiles = @(Get-ChildItem -LiteralPath 'dist/Kern_Analyzer' -Recurse -File)
+          $entryNames = [System.Collections.Generic.List[string]]::new()
+          [int64]$archivedLength = 0
+          foreach ($archivePath in @('Kern_Analyzer-GPU-Windows-part1.zip', 'Kern_Analyzer-GPU-Windows-part2.zip')) {
+            $archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $archivePath))
+            try {
+              foreach ($entry in $archive.Entries) {
+                if ($entry.Name) {
+                  $entryNames.Add($entry.FullName.Replace('/', '\'))
+                  $archivedLength += $entry.Length
+                }
+              }
+            } finally {
+              $archive.Dispose()
+            }
+          }
+          $duplicates = @($entryNames | Group-Object | Where-Object Count -gt 1)
+          $sourceLength = ($sourceFiles | Measure-Object Length -Sum).Sum
+          if ($entryNames.Count -ne $sourceFiles.Count) { throw "Archive file count mismatch: $($entryNames.Count) != $($sourceFiles.Count)" }
+          if ($duplicates.Count) { throw "Split archives contain duplicate paths" }
+          if ($archivedLength -ne $sourceLength) { throw "Archive byte coverage mismatch: $archivedLength != $sourceLength" }
+          $hashLines = foreach ($path in @('Kern_Analyzer-GPU-Windows-part1.zip', 'Kern_Analyzer-GPU-Windows-part2.zip')) {
+            $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLower()
+            "$hash  $path"
+          }
+          $hashLines | Set-Content -LiteralPath 'Kern_Analyzer-GPU-Windows.sha256' -Encoding ascii
+
+      - name: Publish GPU GitHub Release
+        if: startsWith(github.ref, 'refs/tags/gpu-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Kern Analyzer v2.0.4 GPU (CUDA 12.6)
+          body: |
+            Windows GPU/CUDA 12.6 edition. Download both ZIP files and extract both into the same directory, then run Kern_Analyzer.exe. Model weights are not included; select the .pt file through the Model menu.
+          files: |
+            Kern_Analyzer-GPU-Windows-part1.zip
+            Kern_Analyzer-GPU-Windows-part2.zip
+            Kern_Analyzer-GPU-Windows.sha256
