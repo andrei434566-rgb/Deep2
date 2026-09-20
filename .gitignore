@@ -7,6 +7,7 @@ launch_error.log
 build/
 dist/
 *.spec
+!excel_photo_model_studio/Excel_Photo_Model_Studio.spec
 outputs/
 projects/
 runs/

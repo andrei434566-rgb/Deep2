@@ -1,0 +1,179 @@
+from __future__ import annotations
+
+import csv
+import json
+from dataclasses import asdict, replace
+from datetime import datetime
+from pathlib import Path
+
+from .matching import match_photos, read_photo_map, suggest_missing_intervals, write_photo_map
+from .models import Annotation, Issue, PhotoRecord
+from .photos import discover_photos
+from .tabular import read_many_tables, save_mappings
+from .vision import project_matches, render_previews
+
+
+PROJECT_SCHEMA = "excel-photo-model-studio-v1"
+
+
+def create_project(
+    excel_path: Path | list[Path],
+    photos_dir: Path,
+    project_dir: Path,
+    *,
+    mapping_file: Path | None = None,
+    use_ocr: bool = False,
+) -> dict:
+    project_dir = Path(project_dir).expanduser().absolute()
+    if project_dir.exists():
+        raise FileExistsError(f"Папка проекта уже существует: {project_dir}")
+    photos_dir = Path(photos_dir).expanduser().resolve(strict=True)
+    excel_inputs = [Path(excel_path)] if isinstance(excel_path, (str, Path)) else [Path(value) for value in excel_path]
+    rows, mappings, issues, excel_files = read_many_tables(excel_inputs, mapping_file)
+    photos = discover_photos(photos_dir, use_ocr=use_ocr)
+    if not photos:
+        raise ValueError("В выбранной папке не найдены поддерживаемые изображения.")
+    photos = suggest_missing_intervals(photos, rows)
+    project_dir.mkdir(parents=True)
+    config = {
+        "schema": PROJECT_SCHEMA,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "excel_paths": [str(path) for path in excel_files],
+        "photos_dir": str(photos_dir),
+        "use_ocr": bool(use_ocr),
+    }
+    _write_json(project_dir / "project.json", config)
+    save_mappings(project_dir / "column_mapping.json", mappings)
+    write_photo_map(project_dir / "photo_map.csv", photos)
+    _write_json(project_dir / "excel_issues.json", [item.to_dict() for item in issues])
+    return refresh_project(project_dir)
+
+
+def refresh_project(project_dir: Path) -> dict:
+    project_dir = Path(project_dir).expanduser().resolve(strict=True)
+    config = _read_project(project_dir)
+    excel_paths = [Path(value) for value in config.get("excel_paths", ())]
+    if not excel_paths and config.get("excel_path"):
+        excel_paths = [Path(config["excel_path"])]
+    rows, mappings, issues, excel_files = read_many_tables(excel_paths, project_dir / "column_mapping.json")
+    save_mappings(project_dir / "column_mapping.json", mappings)
+    photos = read_photo_map(project_dir / "photo_map.csv")
+    old_approvals = _existing_approvals(project_dir / "annotations.csv")
+    confirmed = [photo for photo in photos if photo.mapping_confirmed]
+    matches, unresolved_confirmed = match_photos(confirmed, rows)
+    unconfirmed = [photo for photo in photos if not photo.mapping_confirmed]
+    annotations, columns = project_matches(matches)
+    annotations = [replace(item, approved=old_approvals.get(item.annotation_id, False)) for item in annotations]
+    preview_paths = render_previews(annotations, project_dir / "previews")
+    _write_matches(project_dir / "matches.csv", matches)
+    _write_annotations(project_dir / "annotations.csv", annotations, preview_paths)
+    _write_json(project_dir / "detected_columns.json", {
+        str(path): [list(box) for box in boxes] for path, boxes in columns.items()
+    })
+    all_issues = list(issues)
+    all_issues.extend(Issue("warning", photo.path.name, "Подтвердите скважину и интервал в photo_map.csv.") for photo in unconfirmed)
+    all_issues.extend(Issue("warning", photo.path.name, "Для подтверждённого фото не найдено пересекающихся строк Excel.") for photo in unresolved_confirmed)
+    report = {
+        "schema": PROJECT_SCHEMA,
+        "excel_rows": len(rows),
+        "excel_files": len(excel_files),
+        "photos": len(photos),
+        "confirmed_photos": len(confirmed),
+        "unconfirmed_photos": len(unconfirmed),
+        "matches": len(matches),
+        "annotations": len(annotations),
+        "approved_annotations": sum(item.approved for item in annotations),
+        "text_targets": sum(bool(item.target_text.strip()) for item in annotations),
+        "classes": sorted({item.label for item in annotations}, key=str.casefold),
+        "issues": [item.to_dict() for item in all_issues],
+        "project_dir": str(project_dir),
+    }
+    _write_json(project_dir / "report.json", report)
+    return report
+
+
+def set_annotation_approvals(project_dir: Path, approvals: dict[str, bool]) -> dict:
+    path = Path(project_dir) / "annotations.csv"
+    rows = _read_csv(path)
+    for row in rows:
+        if row["annotation_id"] in approvals:
+            row["approved"] = "1" if approvals[row["annotation_id"]] else "0"
+    _write_dict_rows(path, rows)
+    report_path = Path(project_dir) / "report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["approved_annotations"] = sum(row.get("approved") == "1" for row in rows)
+    _write_json(report_path, report)
+    return report
+
+
+def load_annotations(project_dir: Path) -> list[dict[str, str]]:
+    return _read_csv(Path(project_dir) / "annotations.csv")
+
+
+def _read_project(project_dir: Path) -> dict:
+    config = json.loads((project_dir / "project.json").read_text(encoding="utf-8"))
+    if config.get("schema") != PROJECT_SCHEMA:
+        raise ValueError("Неизвестная версия проекта.")
+    return config
+
+
+def _existing_approvals(path: Path) -> dict[str, bool]:
+    if not path.is_file():
+        return {}
+    return {row["annotation_id"]: row.get("approved", "") == "1" for row in _read_csv(path)}
+
+
+def _write_matches(path: Path, matches) -> None:
+    rows = []
+    for item in matches:
+        rows.append({
+            "photo": str(item.photo.path), "well": item.photo.well,
+            "photo_top": item.photo.top, "photo_base": item.photo.base,
+            "label": item.description.label, "layer_top": item.description.top,
+            "layer_base": item.description.base, "overlap_top": item.overlap_top,
+            "overlap_base": item.overlap_base, "source_sheet": item.description.sheet,
+            "source_row": item.description.row,
+        })
+    _write_dict_rows(path, rows, fieldnames=(
+        "photo", "well", "photo_top", "photo_base", "label", "layer_top", "layer_base",
+        "overlap_top", "overlap_base", "source_sheet", "source_row",
+    ))
+
+
+def _write_annotations(path: Path, annotations: list[Annotation], previews: dict[Path, Path]) -> None:
+    rows = []
+    for item in annotations:
+        rows.append({
+            "annotation_id": item.annotation_id, "photo": str(item.photo_path),
+            "preview": str(previews.get(item.photo_path, "")), "well": item.well,
+            "photo_top": item.photo_top, "photo_base": item.photo_base,
+            "depth_top": item.depth_top, "depth_base": item.depth_base,
+            "label": item.label, "polygon_json": json.dumps(item.polygon),
+            "image_width": item.image_width, "image_height": item.image_height,
+            "source_sheet": item.source_sheet, "source_row": item.source_row,
+            "source_file": item.source_file, "target_text": item.target_text,
+            "association": item.association, "environment": item.environment,
+            "approved": "1" if item.approved else "0",
+        })
+    _write_dict_rows(path, rows, fieldnames=(
+        "annotation_id", "photo", "preview", "well", "photo_top", "photo_base",
+        "depth_top", "depth_base", "label", "polygon_json", "image_width", "image_height",
+        "source_sheet", "source_row", "source_file", "target_text", "association", "environment", "approved",
+    ))
+
+
+def _read_csv(path: Path) -> list[dict[str, str]]:
+    with path.open("r", encoding="utf-8-sig", newline="") as source:
+        return list(csv.DictReader(source, delimiter=";"))
+
+
+def _write_dict_rows(path: Path, rows: list[dict], fieldnames=None) -> None:
+    fields = list(fieldnames or (rows[0].keys() if rows else ()))
+    with path.open("w", encoding="utf-8-sig", newline="") as target:
+        writer = csv.DictWriter(target, fieldnames=fields, delimiter=";", extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_json(path: Path, payload) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
