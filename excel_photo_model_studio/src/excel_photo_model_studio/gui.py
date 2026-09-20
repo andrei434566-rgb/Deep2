@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 from PySide6.QtCore import Qt, QProcess
 from PySide6.QtGui import QPixmap
@@ -58,23 +61,22 @@ class MainWindow(QMainWindow):
         self._build_project_tab()
         self._build_review_tab()
         self._build_train_tab()
+        self.current_project: Path | None = None
         self.process: QProcess | None = None
 
     def _build_project_tab(self) -> None:
         page = QWidget(self)
         layout = QVBoxLayout(page)
         form = QFormLayout()
-        self.excel = PathField(directory=True)
+        self.excel = PathField(file_filter="Таблицы (*.xlsx *.xlsm *.xltx *.xltm *.xls *.csv *.tsv)")
         self.photos = PathField(directory=True)
-        self.project = PathField(directory=True)
         self.ocr = QCheckBox("Использовать Tesseract для фото без интервала в имени")
-        form.addRow("Папка с Excel/CSV:", self.excel)
+        form.addRow("Файл Excel/CSV:", self.excel)
         form.addRow("Папка фотографий:", self.photos)
-        form.addRow("Новая папка проекта:", self.project)
         form.addRow("OCR:", self.ocr)
         layout.addLayout(form)
         row = QHBoxLayout()
-        create = QPushButton("Создать проект и сопоставить")
+        create = QPushButton("Сопоставить Excel и фотографии")
         create.clicked.connect(self._create_project)
         refresh = QPushButton("Пересчитать текущий проект")
         refresh.clicked.connect(self._refresh_project)
@@ -164,16 +166,28 @@ class MainWindow(QMainWindow):
 
     def _create_project(self) -> None:
         try:
-            result = create_project(self.excel.value(), self.photos.value(), self.project.value(), use_ocr=self.ocr.isChecked())
+            excel_path = self.excel.value()
+            photos_path = self.photos.value()
+            if not self.excel.edit.text().strip() or not excel_path.is_file():
+                raise ValueError("Выберите один существующий файл Excel или CSV.")
+            if excel_path.suffix.lower() not in {".xlsx", ".xlsm", ".xltx", ".xltm", ".xls", ".csv", ".tsv"}:
+                raise ValueError("Поддерживаются файлы XLSX, XLSM, XLTX, XLTM, XLS, CSV и TSV.")
+            if not self.photos.edit.text().strip() or not photos_path.is_dir():
+                raise ValueError("Выберите существующую папку с фотографиями.")
+            project_dir = self._automatic_project_dir(excel_path)
+            result = create_project(excel_path, photos_path, project_dir, use_ocr=self.ocr.isChecked())
         except Exception as exc:
             return self._error(str(exc))
+        self.current_project = project_dir
+        self.dataset_output.set_value(project_dir / "dataset")
+        self.model_output.set_value(project_dir / "model_candidate")
         self._show_report(result)
         self._load_photo_map()
         self._load_review()
 
     def _refresh_project(self) -> None:
         try:
-            result = refresh_project(self.project.value())
+            result = refresh_project(self._project_dir())
         except Exception as exc:
             return self._error(str(exc))
         self._show_report(result)
@@ -182,7 +196,7 @@ class MainWindow(QMainWindow):
 
     def _load_photo_map(self) -> None:
         try:
-            records = read_photo_map(self.project.value() / "photo_map.csv")
+            records = read_photo_map(self._project_dir() / "photo_map.csv")
         except Exception as exc:
             return self._error(str(exc))
         self.photo_table.setRowCount(len(records))
@@ -218,8 +232,9 @@ class MainWindow(QMainWindow):
                 mapping_confirmed=confirmed,
             ))
         try:
-            write_photo_map(self.project.value() / "photo_map.csv", records)
-            result = refresh_project(self.project.value())
+            project_dir = self._project_dir()
+            write_photo_map(project_dir / "photo_map.csv", records)
+            result = refresh_project(project_dir)
         except Exception as exc:
             return self._error(str(exc))
         self._show_report(result)
@@ -227,6 +242,7 @@ class MainWindow(QMainWindow):
 
     def _show_report(self, report: dict) -> None:
         lines = [
+            f"Служебная папка создана автоматически: {report['project_dir']}",
             f"Excel/CSV-файлов: {report.get('excel_files', 1)}", f"Строк Excel: {report['excel_rows']}", f"Фото: {report['photos']}",
             f"Подтверждены интервалы фото: {report['confirmed_photos']}",
             f"Нужно подтвердить интервалы: {report['unconfirmed_photos']}",
@@ -237,12 +253,12 @@ class MainWindow(QMainWindow):
         if report.get("issues"):
             lines.append("\nПроверить:")
             lines.extend(f"- {item['source']}: {item['message']}" for item in report["issues"])
-        lines.append("\nДля неизвестных интервалов отредактируйте photo_map.csv, поставьте mapping_confirmed=1 и нажмите «Пересчитать».")
+        lines.append("\nНеизвестные интервалы исправьте прямо в таблице выше, отметьте OK и нажмите «Сохранить интервалы и пересчитать».")
         self.project_log.setPlainText("\n".join(lines))
 
     def _load_review(self) -> None:
         try:
-            rows = load_annotations(self.project.value())
+            rows = load_annotations(self._project_dir())
         except Exception as exc:
             return self._error(str(exc))
         self.review_table.setRowCount(len(rows))
@@ -270,7 +286,7 @@ class MainWindow(QMainWindow):
         for row in range(self.review_table.rowCount()):
             approvals[self.review_table.item(row, 8).text()] = self.review_table.item(row, 0).checkState() == Qt.CheckState.Checked
         try:
-            report = set_annotation_approvals(self.project.value(), approvals)
+            report = set_annotation_approvals(self._project_dir(), approvals)
         except Exception as exc:
             return self._error(str(exc))
         self.project_log.append(f"Сохранено подтверждений: {report['approved_annotations']}")
@@ -293,7 +309,7 @@ class MainWindow(QMainWindow):
 
     def _build_dataset(self) -> None:
         try:
-            result = build_dataset(self.project.value(), self.dataset_output.value())
+            result = build_dataset(self._project_dir(), self.dataset_output.value())
         except Exception as exc:
             return self._error(str(exc))
         self.train_log.setPlainText(json.dumps({key: value for key, value in result.items() if key != "samples"}, ensure_ascii=False, indent=2))
@@ -301,14 +317,16 @@ class MainWindow(QMainWindow):
     def _start_training(self) -> None:
         if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
             return self._error("Обучение уже запущено.")
-        launcher = Path(__file__).resolve().parents[2] / "run.py"
         command = [
-            str(launcher), "train",
+            "train",
             "--dataset", str(self.dataset_output.value()), "--base-model", str(self.base_model.value()),
             "--output", str(self.model_output.value()), "--epochs", str(self.epochs.value()),
             "--patience", str(self.patience.value()),
             "--description-epochs", str(self.description_epochs.value()),
         ]
+        if not getattr(sys, "frozen", False):
+            launcher = Path(__file__).resolve().parents[2] / "run.py"
+            command.insert(0, str(launcher))
         self.process = QProcess(self)
         self.process.setProgram(sys.executable)
         self.process.setArguments(command)
@@ -324,6 +342,17 @@ class MainWindow(QMainWindow):
 
     def _training_finished(self, code: int, _status) -> None:
         self.train_log.append(f"\nПроцесс завершён, код {code}.")
+
+    def _automatic_project_dir(self, excel_path: Path) -> Path:
+        local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        safe_stem = re.sub(r"[^0-9A-Za-zА-Яа-я_-]+", "_", excel_path.stem).strip("_") or "project"
+        unique_name = f"{safe_stem}_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:6]}"
+        return local_app_data / "ExcelPhotoModelStudio" / "projects" / unique_name
+
+    def _project_dir(self) -> Path:
+        if self.current_project is None:
+            raise RuntimeError("Сначала выберите Excel, папку фотографий и выполните сопоставление.")
+        return self.current_project
 
     def _error(self, message: str) -> None:
         QMessageBox.critical(self, "Ошибка", message)
