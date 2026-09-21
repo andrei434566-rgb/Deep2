@@ -42,7 +42,7 @@ def parser() -> argparse.ArgumentParser:
     train.add_argument("--device", help="Например 0, 1 или cpu")
     train.add_argument("--description-epochs", type=int, default=40)
     train.add_argument("--description-patience", type=int, default=8)
-    train.add_argument("--visual-only", action="store_true", help="Обучить только YOLO best.pt без текста №22")
+    train.add_argument("--visual-only", action="store_true", help="Обучить только YOLO best.pt без модели краткого описания")
 
     analyze = commands.add_parser("analyze", help="Применить единый best.pt и создать стандартный Excel из 22 столбцов")
     analyze.add_argument("--model", type=Path, required=True)

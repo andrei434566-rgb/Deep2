@@ -26,7 +26,7 @@ def train_description_model(
     batch_size: int = 8,
     progress: Callable[[str], None] = print,
 ) -> dict:
-    """Train a compact image-and-facies-to-text head directly on column 22."""
+    """Train a compact image-and-facies-to-text head on the short-description field."""
     try:
         import torch
         from torch import nn
@@ -38,13 +38,13 @@ def train_description_model(
     output_dir = Path(output_dir).expanduser().resolve(strict=True)
     caption_path = dataset_dir / "caption_dataset.jsonl"
     if not caption_path.is_file():
-        raise ValueError("В датасете нет caption_dataset.jsonl с целями из столбца 22.")
+        raise ValueError("В датасете нет caption_dataset.jsonl с целями «Краткое описание».")
     rows = [json.loads(line) for line in caption_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     train_rows = [row for row in rows if row.get("split") == "train" and row.get("target_text", "").strip()]
     val_rows = [row for row in rows if row.get("split") == "val" and row.get("target_text", "").strip()]
     if len(train_rows) < 5 or not val_rows:
         raise ValueError(
-            "Для модели описания нужно минимум 5 обучающих фрагментов и хотя бы 1 независимый val-фрагмент с текстом №22."
+            "Для модели описания нужно минимум 5 обучающих фрагментов и хотя бы 1 независимый val-фрагмент с кратким описанием."
         )
     if epochs < 1 or patience < 1:
         raise ValueError("epochs и patience должны быть положительными.")
@@ -107,7 +107,7 @@ def train_description_model(
     for epoch in range(1, epochs + 1):
         train_loss = _run_epoch(torch, model, train_loader, criterion, device, optimizer)
         val_loss = _run_epoch(torch, model, val_loader, criterion, device, None)
-        progress(f"Текст №22: эпоха {epoch}/{epochs}, train loss={train_loss:.4f}, val loss={val_loss:.4f}")
+        progress(f"Краткое описание: эпоха {epoch}/{epochs}, train loss={train_loss:.4f}, val loss={val_loss:.4f}")
         if val_loss < best_loss - 1e-5:
             best_loss = val_loss
             best_epoch = epoch
@@ -127,7 +127,7 @@ def train_description_model(
         else:
             stale_epochs += 1
             if stale_epochs >= patience:
-                progress(f"Текст №22: ранняя остановка после эпохи {epoch}.")
+                progress(f"Краткое описание: ранняя остановка после эпохи {epoch}.")
                 break
     if not output_path.is_file():
         raise RuntimeError("Обучение текста завершилось без description_best.pt.")
@@ -147,7 +147,7 @@ def train_description_model(
 
 
 def generate_description(model_path: Path, image_path: Path, facies: str = "") -> str:
-    """Generate a column-22 draft from one already segmented interval crop."""
+    """Generate a short-description draft from one segmented interval crop."""
     try:
         import torch
         from torch import nn

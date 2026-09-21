@@ -77,6 +77,8 @@ def _score(header: str, role: str) -> int:
             score = max(score, 100 + len(alias_normalized))
     is_core = any(word in text for word in ("керн", "core"))
     is_facies = any(word in text for word in ("фаци", "слоя", "layer"))
+    is_drilling = any(word in text for word in ("по бурен", "буров", "drilling"))
+    is_gis = any(word in text for word in ("по гис", "gis", "logging"))
     is_top = any(word in text for word in ("кровл", "верх", "начало", " from", " top", " start"))
     is_base = any(word in text for word in ("подошв", "низ", "конец", " to", " base", " bottom", " end"))
     if role == "core_top" and is_core and is_top:
@@ -94,6 +96,14 @@ def _score(header: str, role: str) -> int:
     if role in {"top", "base", "interval"}:
         score += 40 if is_facies else 0
         score -= 80 if is_core else 0
+        # Training masks use the facies interval measured by drilling. A GIS
+        # interval can have the same subheaders and must not win by position.
+        score += 120 if is_facies and is_drilling else 0
+        score -= 70 if is_facies and is_gis and not is_drilling else 0
+    if role == "target_text" and "краткое описание" in text:
+        # Source workbooks may place this field at column 22, 30 or anywhere
+        # else. The semantic header is the contract, not the column number.
+        score = max(score, 340)
     if role == "label" and any(word in text for word in ("код", "индекс", "code", "index")):
         score -= 120
     if role == "class_code" and "индекс" in text:

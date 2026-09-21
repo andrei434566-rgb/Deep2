@@ -86,7 +86,8 @@ class MainWindow(QMainWindow):
         form = QFormLayout()
         self.excel = PathField(file_filter="Таблицы (*.xlsx *.xlsm *.xltx *.xltm *.xls *.csv *.tsv)")
         self.photos = PathField(directory=True)
-        self.ocr = QCheckBox("Использовать Tesseract для фото без интервала в имени")
+        self.ocr = QCheckBox("Автоматически читать интервал из подписи фото (Tesseract)")
+        self.ocr.setChecked(True)
         form.addRow("Файл Excel/CSV:", self.excel)
         form.addRow("Папка фотографий:", self.photos)
         form.addRow("OCR:", self.ocr)
@@ -148,7 +149,7 @@ class MainWindow(QMainWindow):
         controls.addStretch(1)
         left.addLayout(controls)
         self.review_table = QTableWidget(0, 9)
-        self.review_table.setHorizontalHeaderLabels(("OK", "Фото", "Скважина", "От", "До", "Фация", "Текст №22", "Excel", "ID"))
+        self.review_table.setHorizontalHeaderLabels(("OK", "Фото", "Скважина", "От", "До", "Фация", "Краткое описание", "Excel", "ID"))
         self.review_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         self.review_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         self.review_table.itemSelectionChanged.connect(self._show_preview)
@@ -185,7 +186,7 @@ class MainWindow(QMainWindow):
         form.addRow("Архитектура со случайными весами:", self.architecture)
         form.addRow("Эпохи (верхний предел):", self.epochs)
         form.addRow("Early stopping patience:", self.patience)
-        form.addRow("Эпохи модели текста №22:", self.description_epochs)
+        form.addRow("Эпохи модели «Краткое описание»:", self.description_epochs)
         layout.addLayout(form)
         self.catalog_status = QLabel()
         self.catalog_status.setWordWrap(True)
@@ -193,7 +194,7 @@ class MainWindow(QMainWindow):
         buttons = QHBoxLayout()
         self.dataset_button = QPushButton("Собрать датасет")
         self.dataset_button.clicked.connect(self._build_dataset)
-        train = QPushButton("Обучить с нуля единый best.pt: слои + фации + столбец 22")
+        train = QPushButton("Обучить с нуля единый best.pt: слои + фации + описание")
         train.clicked.connect(self._start_training)
         buttons.addWidget(self.dataset_button)
         buttons.addWidget(train)
@@ -374,10 +375,21 @@ class MainWindow(QMainWindow):
             f"Excel/CSV-файлов: {report.get('excel_files', 1)}", f"Строк Excel: {report['excel_rows']}", f"Фото: {report['photos']}",
             f"Подтверждены интервалы фото: {report['confirmed_photos']}",
             f"Нужно подтвердить интервалы: {report['unconfirmed_photos']}",
+            f"Автоматически подтверждено OCR: {report.get('ocr_verified_photos', 0)}",
             f"Спроецировано масок: {report['annotations']}",
-            f"Масок с целевым текстом №22: {report.get('text_targets', 0)}",
+            f"Строк Excel с «Кратким описанием»: {report.get('excel_text_targets', 0)}",
+            f"Масок с «Кратким описанием»: {report.get('text_targets', 0)}",
             f"Подтверждено масок: {report['approved_annotations']}",
         ]
+        mappings = report.get("column_mappings", [])
+        if mappings:
+            lines.append("\nРаспознанные столбцы Excel (по названиям):")
+            lines.extend(
+                f"- {item.get('sheet', '')}: интервал фации по бурению "
+                f"{item.get('facies_top') or '?'}–{item.get('facies_base') or '?'}, "
+                f"«Краткое описание» {item.get('target_text') or '?'}"
+                for item in mappings
+            )
         if report.get("issues"):
             lines.append("\nПроверить:")
             lines.extend(f"- {item['source']}: {item['message']}" for item in report["issues"])

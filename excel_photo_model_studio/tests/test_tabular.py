@@ -68,6 +68,53 @@ class TableReaderTests(unittest.TestCase):
         self.assertEqual("DWCh@80", rows[1].label)
         self.assertEqual(2, mappings[0].header_row)
 
+    def test_finds_drilling_interval_and_short_description_by_header_not_position(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "extended_31_columns.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "седимент"
+            sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=31)
+            sheet.cell(1, 1, "Послойное седиментологическое описание керна")
+            headers = [
+                "Месторождение", "№ скв.", "№ долбления", "Интервал отбора керна, м", None,
+                "Стратиграфия", "Смещение по ГИС, м", "Интервал отбора по ГИС, м", None,
+                "Проходка, м", "Вынос керна, м", "Вынос, %", "№", "Интервал фации по бурению, м", None,
+                "Интервал фации по ГИС, м", None, "№ слоя", "Толщина фации, м", "Индекс фации",
+                "Название фации", "Код фации", "Индекс макрофации", "Название макрофации",
+                "Код макрофации", "Индекс ассоциации фаций", "Ассоциация фаций",
+                "Обстановка осадконакопления", "Комплекс осадконакопления", "Краткое описание", "Примечание",
+            ]
+            sheet.append(headers)
+            for start, end in ((4, 5), (8, 9), (14, 15), (16, 17)):
+                sheet.merge_cells(start_row=2, start_column=start, end_row=2, end_column=end)
+            subheaders = [None] * 31
+            for start, end in ((4, 5), (8, 9), (14, 15), (16, 17)):
+                subheaders[start - 1] = "Кровля"
+                subheaders[end - 1] = "Подошва"
+            sheet.append(subheaders)
+            sheet.append(list(range(1, 32)))
+            data = [None] * 31
+            values = {
+                1: "Восточно-Тазовское", 2: "67ПО", 4: 4105.0, 5: 4117.0,
+                14: 4105.0, 15: 4108.65, 16: 4104.90, 17: 4108.55,
+                20: "Dch", 21: "Каналы распределительные", 22: 92,
+                27: "Дельтовая ассоциация", 28: "Дельтовая обстановка",
+                30: "Песчаник светло-серый, слоистый.", 31: "Контроль",
+            }
+            for column, value in values.items():
+                data[column - 1] = value
+            sheet.append(data)
+            workbook.save(path)
+
+            rows, mappings, issues = read_table(path)
+
+        self.assertEqual([], [item for item in issues if item.severity == "error"])
+        self.assertEqual((14, 15), (mappings[0].top, mappings[0].base))
+        self.assertEqual(30, mappings[0].target_text)
+        self.assertEqual("Песчаник светло-серый, слоистый.", rows[0].target_text)
+        self.assertEqual((4105.0, 4108.65), (rows[0].top, rows[0].base))
+
     def test_reads_csv_with_one_interval_column(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "description.csv"

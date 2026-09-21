@@ -35,7 +35,22 @@ def match_photos(records: list[PhotoRecord], rows: list[DescriptionRow]) -> tupl
 
 
 def suggest_missing_intervals(records: list[PhotoRecord], rows: list[DescriptionRow]) -> list[PhotoRecord]:
-    """Suggest unique Excel core intervals while keeping them unconfirmed."""
+    """Resolve wells, validate OCR intervals, then suggest remaining intervals."""
+    canonical_wells: dict[str, str] = {}
+    for row in rows:
+        key = well_key(row.well)
+        if key:
+            canonical_wells.setdefault(key, row.well)
+    single_well = next(iter(canonical_wells.values())) if len(canonical_wells) == 1 else ""
+
+    result = []
+    for record in records:
+        well = _resolve_well(record, canonical_wells, single_well)
+        updated = replace(record, well=well) if well != record.well else record
+        if updated.has_interval and updated.source == "ocr" and _ocr_matches_core_interval(updated, rows):
+            updated = replace(updated, source="ocr_verified", mapping_confirmed=True)
+        result.append(updated)
+
     intervals: dict[tuple[str, float, float], tuple[str, float, float]] = {}
     for row in rows:
         top = row.core_top if row.core_top is not None else row.top
@@ -44,10 +59,9 @@ def suggest_missing_intervals(records: list[PhotoRecord], rows: list[Description
             intervals[(well_key(row.well), round(top, 5), round(base, 5))] = (row.well, top, base)
     claimed = {
         (well_key(record.well), round(float(record.top), 5), round(float(record.base), 5))
-        for record in records if record.has_interval
+        for record in result if record.has_interval
     }
     available = [value for key, value in sorted(intervals.items()) if key not in claimed]
-    result = list(records)
     unresolved = [index for index, record in enumerate(result) if not record.has_interval]
     for index in list(unresolved):
         name_key = well_key(result[index].path.stem)
@@ -61,6 +75,34 @@ def suggest_missing_intervals(records: list[PhotoRecord], rows: list[Description
         for index, item in zip(unresolved, available):
             result[index] = replace(result[index], well=item[0], top=item[1], base=item[2], source="excel_suggestion")
     return result
+
+
+def _resolve_well(record: PhotoRecord, canonical_wells: dict[str, str], single_well: str) -> str:
+    if single_well:
+        return single_well
+    source_key = well_key(f"{record.well} {record.path.stem}")
+    matches = [(key, value) for key, value in canonical_wells.items() if key and key in source_key]
+    if not matches:
+        return record.well
+    return max(matches, key=lambda item: len(item[0]))[1]
+
+
+def _ocr_matches_core_interval(record: PhotoRecord, rows: list[DescriptionRow]) -> bool:
+    if not record.has_interval:
+        return False
+    photo_well = well_key(record.well)
+    matching_rows = [row for row in rows if not photo_well or well_key(row.well) == photo_well]
+    candidates: set[tuple[float, float]] = set()
+    for row in matching_rows:
+        if row.core_top is not None and row.core_base is not None and row.core_base > row.core_top:
+            candidates.add((float(row.core_top), float(row.core_base)))
+    for top, base in candidates:
+        span = base - top
+        tolerance = max(1.0, span * 0.08)
+        coverage = (float(record.base) - float(record.top)) / max(span, 1e-9)
+        if abs(float(record.top) - top) <= tolerance and abs(float(record.base) - base) <= tolerance and coverage >= 0.65:
+            return True
+    return False
 
 
 def write_photo_map(path: Path, records: list[PhotoRecord]) -> None:

@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 from excel_photo_model_studio.dataset import build_dataset
-from excel_photo_model_studio.matching import match_photos, read_photo_map, write_photo_map
+from excel_photo_model_studio.matching import match_photos, read_photo_map, suggest_missing_intervals, write_photo_map
 from excel_photo_model_studio.models import (
     COLUMN_ORDER_RIGHT_TO_LEFT, DescriptionRow, PhotoRecord,
 )
@@ -18,6 +18,27 @@ from excel_photo_model_studio.photos import parse_filename
 
 
 class MatchingTests(unittest.TestCase):
+    def test_ocr_interval_is_auto_confirmed_only_when_it_matches_excel_core_interval(self):
+        rows = [DescriptionRow(
+            well="67ПО", top=4105.0, base=4108.65, label="Dch", sheet="седимент", row=5,
+            core_top=4104.9, core_base=4116.9, target_text="Песчаник серый.",
+        )]
+        good = PhotoRecord(
+            Path("Рис. 5.1-5.20 Восточно-Тазовское, скв№ 67ПО-0001.jpg"),
+            top=4104.9, base=4116.55, source="ocr",
+        )
+        false_pair = PhotoRecord(
+            Path("Рис. 5.1-5.20 Восточно-Тазовское, скв№ 67ПО-0003.jpg"),
+            top=4105.0, base=4106.0, source="ocr",
+        )
+
+        resolved = suggest_missing_intervals([good, false_pair], rows)
+
+        self.assertEqual("67ПО", resolved[0].well)
+        self.assertTrue(resolved[0].mapping_confirmed)
+        self.assertEqual("ocr_verified", resolved[0].source)
+        self.assertFalse(resolved[1].mapping_confirmed)
+
     def test_photo_map_preserves_column_order(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "photo_map.csv"

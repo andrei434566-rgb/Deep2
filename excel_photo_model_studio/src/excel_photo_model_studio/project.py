@@ -30,7 +30,14 @@ def create_project(
     photos_dir = Path(photos_dir).expanduser().resolve(strict=True)
     excel_inputs = [Path(excel_path)] if isinstance(excel_path, (str, Path)) else [Path(value) for value in excel_path]
     rows, mappings, issues, excel_files = read_many_tables(excel_inputs, mapping_file)
-    photos = discover_photos(photos_dir, use_ocr=use_ocr)
+    expected_intervals = sorted({
+        (float(row.core_top), float(row.core_base))
+        for row in rows
+        if row.core_top is not None and row.core_base is not None and row.core_base > row.core_top
+    })
+    photos = discover_photos(
+        photos_dir, use_ocr=use_ocr, expected_intervals=expected_intervals,
+    )
     if not photos:
         raise ValueError("В выбранной папке не найдены поддерживаемые изображения.")
     photos = suggest_missing_intervals(photos, rows)
@@ -81,7 +88,15 @@ def refresh_project(project_dir: Path) -> dict:
         for path, boxes in columns.items()
     })
     all_issues = list(issues)
-    all_issues.extend(Issue("warning", photo.path.name, "Подтвердите скважину и интервал в photo_map.csv.") for photo in unconfirmed)
+    all_issues.extend(
+        Issue(
+            "warning", photo.path.name,
+            "Tesseract не найден; интервал нельзя прочитать из подписи фото."
+            if photo.source == "ocr_unavailable"
+            else "Интервал не найден в имени или подписи фото; укажите его в таблице и отметьте OK.",
+        )
+        for photo in unconfirmed
+    )
     all_issues.extend(Issue("warning", photo.path.name, "Для подтверждённого фото не найдено пересекающихся строк Excel.") for photo in unresolved_confirmed)
     report = {
         "schema": PROJECT_SCHEMA,
@@ -93,7 +108,17 @@ def refresh_project(project_dir: Path) -> dict:
         "matches": len(matches),
         "annotations": len(annotations),
         "approved_annotations": sum(item.approved for item in annotations),
+        "excel_text_targets": sum(bool(item.target_text.strip()) for item in rows),
         "text_targets": sum(bool(item.target_text.strip()) for item in annotations),
+        "ocr_verified_photos": sum(item.source == "ocr_verified" for item in photos),
+        "column_mappings": [
+            {
+                "sheet": item.sheet, "facies_top": item.top, "facies_base": item.base,
+                "target_text": item.target_text,
+            }
+            for item in mappings
+            if item.top or item.base or item.target_text
+        ],
         "classes": sorted({item.label for item in annotations}, key=str.casefold),
         "issues": [item.to_dict() for item in all_issues],
         "project_dir": str(project_dir),

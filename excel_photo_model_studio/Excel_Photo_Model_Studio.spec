@@ -10,6 +10,9 @@ datas = [
     (str(project_root / "PORTABLE_README.txt"), "."),
     (str(project_root / "requirements.txt"), "."),
 ]
+portable_tesseract = project_root.parent / "tools" / "tesseract"
+if portable_tesseract.is_dir():
+    datas.append((str(portable_tesseract), "tools/tesseract"))
 binaries = collect_dynamic_libs("shiboken6")
 hiddenimports = collect_submodules("excel_photo_model_studio") + [
     "PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets",
