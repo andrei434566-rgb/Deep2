@@ -21,6 +21,8 @@ def match_photos(records: list[PhotoRecord], rows: list[DescriptionRow]) -> tupl
             photo_well = next(iter(wells))
         photo_matches = []
         for row in rows:
+            if not row.thickness_valid:
+                continue
             if photo_well and well_key(row.well) != photo_well:
                 continue
             overlap_top = max(float(photo.top), row.top)

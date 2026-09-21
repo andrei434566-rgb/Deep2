@@ -10,7 +10,7 @@ from .matching import match_photos, read_photo_map, suggest_missing_intervals, w
 from .models import Annotation, ColumnMapping, DescriptionRow, Issue, PhotoRecord
 from .photos import discover_photos
 from .tabular import read_many_tables, save_mappings
-from .vision import project_matches, render_previews
+from .vision import calibrate_core_columns, project_matches, render_previews
 
 
 PROJECT_SCHEMA = "excel-photo-model-studio-v1"
@@ -80,10 +80,19 @@ def refresh_project(project_dir: Path) -> dict:
     preview_paths = render_previews(annotations, project_dir / "previews")
     _write_matches(project_dir / "matches.csv", matches)
     _write_annotations(project_dir / "annotations.csv", annotations, preview_paths)
+    photo_by_path = {photo.path: photo for photo in photos}
     _write_json(project_dir / "detected_columns.json", {
         str(path): {
             "order": orders.get(path, "left_to_right"),
             "boxes": [list(box) for box in boxes],
+            "depth_ranges": [
+                {"box": list(box), "top": top, "base": base}
+                for box, top, base in calibrate_core_columns(
+                    boxes,
+                    float(photo_by_path[path].top),
+                    float(photo_by_path[path].base),
+                )
+            ] if path in photo_by_path and photo_by_path[path].has_interval else [],
         }
         for path, boxes in columns.items()
     })
@@ -98,6 +107,15 @@ def refresh_project(project_dir: Path) -> dict:
         for photo in unconfirmed
     )
     all_issues.extend(Issue("warning", photo.path.name, "Для подтверждённого фото не найдено пересекающихся строк Excel.") for photo in unresolved_confirmed)
+    matched_paths = {item.photo.path for item in matches}
+    all_issues.extend(
+        Issue(
+            "error", path.name,
+            "Столбики керна не распознаны; маски не созданы. Проверьте исходное фото и границы колонок.",
+        )
+        for path in sorted(matched_paths, key=lambda item: item.name.casefold())
+        if not columns.get(path)
+    )
     report = {
         "schema": PROJECT_SCHEMA,
         "excel_rows": len(rows),
@@ -109,12 +127,13 @@ def refresh_project(project_dir: Path) -> dict:
         "annotations": len(annotations),
         "approved_annotations": sum(item.approved for item in annotations),
         "excel_text_targets": sum(bool(item.target_text.strip()) for item in rows),
+        "invalid_thickness_rows": sum(not item.thickness_valid for item in rows),
         "text_targets": sum(bool(item.target_text.strip()) for item in annotations),
         "ocr_verified_photos": sum(item.source == "ocr_verified" for item in photos),
         "column_mappings": [
             {
                 "sheet": item.sheet, "facies_top": item.top, "facies_base": item.base,
-                "target_text": item.target_text,
+                "facies_thickness": item.facies_thickness, "target_text": item.target_text,
             }
             for item in mappings
             if item.top or item.base or item.target_text

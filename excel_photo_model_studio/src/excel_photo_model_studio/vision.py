@@ -25,7 +25,12 @@ def read_image(path: Path) -> np.ndarray:
 
 
 def detect_core_columns(image: np.ndarray) -> list[tuple[int, int, int, int]]:
-    """Transparent bootstrap detector for elongated, low-saturation core columns."""
+    """Detect physical core columns with the Kern Analyzer stage-1 method.
+
+    This mirrors the main application's deterministic ``CoreColumnRecognizer``
+    fallback: compact connected components are attempted first, followed by a
+    conservative vertical-occupancy projection. Facies are never inferred here.
+    """
     if image is None or image.size == 0 or image.ndim != 3:
         return []
     height, width = image.shape[:2]
@@ -45,46 +50,107 @@ def detect_core_columns(image: np.ndarray) -> list[tuple[int, int, int, int]]:
             for left, top, right, bottom in reduced_boxes
         ]
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    candidate = ((hsv[:, :, 1] < 75) & (hsv[:, :, 2] < 240)).astype(np.uint8) * 255
-    kernel_height = max(9, min(31, round(height * 0.008)))
+    candidate = (hsv[:, :, 1] < 70) & (hsv[:, :, 2] < 235)
+
+    component_boxes = _core_component_boxes(candidate)
+    if component_boxes:
+        return _filter_width_outliers(_deduplicate(component_boxes))
+
+    column_score = _smooth(candidate.mean(axis=0).astype(np.float32), 7)
+    active_columns = column_score >= 0.48
+    min_width = max(10, int(width * 0.018))
+    boxes: list[tuple[int, int, int, int]] = []
+    for left, right in _runs(active_columns):
+        if right - left < min_width or right - left > width * 0.30:
+            continue
+        row_score = _smooth(candidate[:, left:right].mean(axis=1).astype(np.float32), 15)
+        row_runs = _runs(row_score >= 0.24)
+        if not row_runs:
+            continue
+        top, bottom = max(row_runs, key=lambda run: run[1] - run[0])
+        if bottom - top < height * 0.25:
+            continue
+        boxes.append((
+            max(0, left - 1), max(0, top - 1),
+            min(width, right + 1), min(height, bottom + 1),
+        ))
+    if boxes:
+        return _filter_width_outliers(_deduplicate(boxes))
+    return _filter_width_outliers(_deduplicate(_fallback_component_boxes(candidate.astype(np.uint8) * 255)))
+
+
+def _core_component_boxes(candidate: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Find complete core objects before analysing full-height projections."""
+    height, width = candidate.shape
+    kernel_height = max(9, min(25, round(height * 0.006)))
     connected = cv2.morphologyEx(
-        candidate, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (5, kernel_height))
+        candidate.astype(np.uint8) * 255,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (5, kernel_height)),
     )
     count, _, stats, _ = cv2.connectedComponentsWithStats(connected, connectivity=8)
     boxes: list[tuple[int, int, int, int]] = []
     for component in range(1, count):
         left, top, box_width, box_height, area = (int(value) for value in stats[component])
-        aspect = box_height / max(1, box_width)
-        fill = area / max(1, box_width * box_height)
+        aspect = box_height / max(box_width, 1)
         center_x = left + box_width / 2
+        filled_fraction = area / max(1, box_width * box_height)
         if (
-            box_width >= max(10, int(width * 0.015))
-            and box_width <= width * 0.38
-            and box_height >= max(45, int(height * 0.08))
-            and 0.7 <= aspect <= 45
-            and fill >= 0.12
+            box_width >= max(10, int(width * 0.018))
+            and box_width <= width * 0.30
+            and box_height >= max(50, int(height * 0.012))
+            and 0.70 <= aspect <= 35.0
+            and filled_fraction >= 0.15
             and width * 0.08 < center_x < width * 0.92
-            and top < height * 0.85
+            and top < height * 0.75
         ):
             boxes.append((left, top, left + box_width, top + box_height))
-    boxes = _deduplicate(boxes)
-    boxes = _filter_width_outliers(boxes)
-    if boxes:
-        return boxes
+    return sorted(boxes, key=lambda item: item[0])
 
-    # Conservative fallback: detect persistent vertical occupancy.
-    binary = candidate > 0
-    column_score = _smooth(binary.mean(axis=0).astype(np.float32), 9)
-    for left, right in _runs(column_score >= 0.40):
-        if right - left < max(10, int(width * 0.015)) or right - left > width * 0.38:
-            continue
-        row_score = _smooth(binary[:, left:right].mean(axis=1).astype(np.float32), 17)
-        row_runs = _runs(row_score >= 0.20)
-        if row_runs:
-            top, bottom = max(row_runs, key=lambda item: item[1] - item[0])
-            if bottom - top >= height * 0.18:
-                boxes.append((left, top, right, bottom))
-    return _filter_width_outliers(_deduplicate(boxes))
+
+def _fallback_component_boxes(candidate: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Fallback for photographs where the tray and core have similar colour."""
+    height, width = candidate.shape
+    connected = cv2.morphologyEx(
+        candidate,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (5, max(17, int(height * 0.075)))),
+    )
+    count, _, stats, _ = cv2.connectedComponentsWithStats(connected, connectivity=8)
+    boxes: list[tuple[int, int, int, int]] = []
+    for component in range(1, count):
+        left, top, box_width, box_height, area = (int(value) for value in stats[component])
+        aspect = box_height / max(box_width, 1)
+        if (
+            box_width >= max(10, int(width * 0.018))
+            and box_width <= width * 0.30
+            and box_height >= height * 0.25
+            and 2.0 <= aspect <= 35.0
+            and area >= box_width * box_height * 0.20
+        ):
+            boxes.append((left, top, left + box_width, top + box_height))
+    return sorted(boxes, key=lambda item: item[0])
+
+
+def calibrate_core_columns(
+    columns: list[tuple[int, int, int, int]], photo_top: float, photo_base: float,
+) -> list[tuple[tuple[int, int, int, int], float, float]]:
+    """Fill each ordered physical column with its continuous depth interval."""
+    if not columns or photo_base <= photo_top:
+        return []
+    visual_length = sum(max(1, bottom - top) for _, top, _, bottom in columns)
+    cursor = float(photo_top)
+    calibrated: list[tuple[tuple[int, int, int, int], float, float]] = []
+    for index, box in enumerate(columns):
+        _, pixel_top, _, pixel_bottom = box
+        if index == len(columns) - 1:
+            column_base = float(photo_base)
+        else:
+            span = (float(photo_base) - float(photo_top)) * max(1, pixel_bottom - pixel_top) / visual_length
+            column_base = cursor + span
+        calibrated.append((box, cursor, column_base))
+        cursor = column_base
+    return calibrated
 
 
 def project_matches(matches: list[Match]) -> tuple[
@@ -104,7 +170,12 @@ def project_matches(matches: list[Match]) -> tuple[
         height, width = image.shape[:2]
         columns = detect_core_columns(image)
         if not columns:
-            columns = [(0, 0, width, max(1, int(height * 0.88)))]
+            columns_by_photo[photo_path] = []
+            requested_order = normalize_column_order(photo_matches[0].photo.column_order)
+            orders_by_photo[photo_path] = (
+                requested_order if requested_order != COLUMN_ORDER_AUTO else COLUMN_ORDER_LEFT_TO_RIGHT
+            )
+            continue
         columns = sorted(columns, key=lambda box: (box[0], box[1]))
         requested_order = normalize_column_order(photo_matches[0].photo.column_order)
         effective_order = detect_column_order(image, columns) if requested_order == COLUMN_ORDER_AUTO else requested_order
@@ -115,12 +186,9 @@ def project_matches(matches: list[Match]) -> tuple[
         photo = photo_matches[0].photo
         if not photo.has_interval:
             continue
-        visual_length = sum(max(1, bottom - top) for _, top, _, bottom in columns)
-        depth_cursor = float(photo.top)
-        for column_index, (left, pixel_top, right, pixel_bottom) in enumerate(columns):
-            depth_span = (float(photo.base) - float(photo.top)) * (pixel_bottom - pixel_top) / visual_length
-            column_top, column_base = depth_cursor, depth_cursor + depth_span
-            depth_cursor = column_base
+        calibrated = calibrate_core_columns(columns, float(photo.top), float(photo.base))
+        for column_index, (box, column_top, column_base) in enumerate(calibrated):
+            left, pixel_top, right, pixel_bottom = box
             for match in photo_matches:
                 overlap_top = max(match.description.top, column_top)
                 overlap_base = min(match.description.base, column_base)

@@ -1,4 +1,4 @@
-Excel Photo Model Studio 0.3.1
+Excel Photo Model Studio 0.3.2
 ================================
 
 1. Полностью распакуйте ZIP в отдельную папку.

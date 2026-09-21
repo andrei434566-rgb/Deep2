@@ -18,6 +18,7 @@ ROLE_ALIASES: dict[str, tuple[str, ...]] = {
     "interval": ("интервал фаци", "интервал слоя", "facies interval", "depth interval", "интервал", "глубин"),
     "top": ("кровл", "верх", "начало", "от", "from", "top", "start"),
     "base": ("подошв", "низ", "конец", "до", "to", "base", "bottom", "end"),
+    "facies_thickness": ("толщина фаци", "мощность фаци", "толщина слоя", "мощность слоя", "facies thickness"),
     "core_top": ("отбор керна кровл", "интервал керна кровл", "core top", "core from"),
     "core_base": ("отбор керна подошв", "интервал керна подошв", "core base", "core to"),
     "label": ("название фаци", "наименование фаци", "литофаци", "класс", "метка", "label", "class", "facies name", "порода", "литология"),
@@ -91,6 +92,11 @@ def _score(header: str, role: str) -> int:
         score = max(score, 230)
     if role == "interval" and is_facies:
         score = max(score, 170)
+    if role == "facies_thickness":
+        if any(word in text for word in ("толщина фаци", "мощность фаци", "facies thickness")):
+            score = max(score, 300)
+        elif any(word in text for word in ("толщина слоя", "мощность слоя")):
+            score = max(score, 220)
     if role in {"core_top", "core_base"}:
         score += 80 if is_core else -100
     if role in {"top", "base", "interval"}:
@@ -120,6 +126,61 @@ def _best(headers: list[str], role: str, used: set[int]) -> int | None:
         reverse=True,
     )
     return ranked[0][0] if ranked and ranked[0][1] > 0 else None
+
+
+def _best_facies_pair(
+    headers: list[str], rows: list[list[Any]], header_row: int,
+    used: set[int], thickness_column: int | None,
+) -> tuple[int | None, int | None]:
+    """Choose drilling facies limits together and verify them by facies thickness.
+
+    Wide field forms contain several almost identical pairs named ``Кровля`` /
+    ``Подошва``. Header meaning is primary, while the row-level equality
+    ``Подошва - Кровля == Толщина фации`` is an independent safeguard against
+    accidentally selecting the much wider core-sampling interval.
+    """
+    tops = [
+        (index + 1, _score(value, "top"))
+        for index, value in enumerate(headers)
+        if index + 1 not in used and _score(value, "top") > 0
+    ]
+    bases = [
+        (index + 1, _score(value, "base"))
+        for index, value in enumerate(headers)
+        if index + 1 not in used and _score(value, "base") > 0
+    ]
+    candidates: list[tuple[float, int, int]] = []
+    for top_column, top_score in tops:
+        for base_column, base_score in bases:
+            if top_column == base_column:
+                continue
+            valid_pairs = 0
+            thickness_checks = 0
+            thickness_matches = 0
+            for row in rows[header_row:]:
+                top = as_float(_cell(row, top_column))
+                base = as_float(_cell(row, base_column))
+                if top is None or base is None or base <= top:
+                    continue
+                valid_pairs += 1
+                thickness = as_float(_cell(row, thickness_column))
+                if thickness is None:
+                    continue
+                thickness_checks += 1
+                span = base - top
+                if abs(thickness - span) <= max(0.01, abs(span) * 0.02):
+                    thickness_matches += 1
+            score = float(top_score + base_score + min(valid_pairs, 20))
+            if base_column == top_column + 1:
+                score += 25
+            if thickness_checks:
+                match_ratio = thickness_matches / thickness_checks
+                score += 500 * match_ratio - 400 * (1.0 - match_ratio)
+            candidates.append((score, top_column, base_column))
+    if not candidates:
+        return None, None
+    _, top_column, base_column = max(candidates, key=lambda item: (item[0], -item[1], -item[2]))
+    return top_column, base_column
 
 
 def detect_mapping(sheet: str, rows: list[list[Any]]) -> ColumnMapping:
@@ -160,14 +221,16 @@ def detect_mapping(sheet: str, rows: list[list[Any]]) -> ColumnMapping:
     for role in (
         "core_top", "core_base", "well", "class_code", "class_index", "label",
         "target_text", "association", "environment", "description", "field_name",
+        "facies_thickness",
     ):
         values[role] = _best(headers, role, used)
         if values[role]:
             used.add(int(values[role]))
-    values["top"] = _best(headers, "top", used)
+    values["top"], values["base"] = _best_facies_pair(
+        headers, rows, header_row, used, values.get("facies_thickness"),
+    )
     if values["top"]:
         used.add(int(values["top"]))
-    values["base"] = _best(headers, "base", used)
     if values["base"]:
         used.add(int(values["base"]))
     values["interval"] = None
@@ -336,6 +399,17 @@ def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[De
             top, base = parse_interval(_cell(row, mapping.interval))
         if top is None or base is None or base <= top:
             continue
+        thickness = as_float(_cell(row, mapping.facies_thickness))
+        thickness_valid = True
+        if thickness is not None:
+            span = base - top
+            thickness_valid = abs(thickness - span) <= max(0.01, abs(span) * 0.02)
+            if not thickness_valid:
+                issues.append(Issue(
+                    "error", f"{mapping.sheet}!{row_number}",
+                    f"Толщина фации {thickness:g} м не совпадает с интервалом фации по бурению "
+                    f"{top:g}–{base:g} м ({span:g} м); строка не будет использована для маски.",
+                ))
         well = display_text(_cell(row, mapping.well)) or last_well or sheet_well
         if not well:
             issues.append(Issue("error", f"{mapping.sheet}!{row_number}", "Не указана скважина."))
@@ -381,6 +455,8 @@ def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[De
             description=description, target_text=target_text, association=association,
             environment=environment, field_name=field_name, source_file=mapping.source_file,
             core_top=core_top, core_base=core_base,
+            thickness=thickness if thickness is not None else round(base - top, 6),
+            thickness_valid=thickness_valid,
             metadata={key: value for key, value in metadata.items() if value},
         ))
     return output, issues

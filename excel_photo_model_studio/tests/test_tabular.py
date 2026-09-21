@@ -98,7 +98,7 @@ class TableReaderTests(unittest.TestCase):
             values = {
                 1: "Восточно-Тазовское", 2: "67ПО", 4: 4105.0, 5: 4117.0,
                 14: 4105.0, 15: 4108.65, 16: 4104.90, 17: 4108.55,
-                20: "Dch", 21: "Каналы распределительные", 22: 92,
+                19: 3.65, 20: "Dch", 21: "Каналы распределительные", 22: 92,
                 27: "Дельтовая ассоциация", 28: "Дельтовая обстановка",
                 30: "Песчаник светло-серый, слоистый.", 31: "Контроль",
             }
@@ -111,9 +111,30 @@ class TableReaderTests(unittest.TestCase):
 
         self.assertEqual([], [item for item in issues if item.severity == "error"])
         self.assertEqual((14, 15), (mappings[0].top, mappings[0].base))
+        self.assertEqual(19, mappings[0].facies_thickness)
         self.assertEqual(30, mappings[0].target_text)
         self.assertEqual("Песчаник светло-серый, слоистый.", rows[0].target_text)
         self.assertEqual((4105.0, 4108.65), (rows[0].top, rows[0].base))
+        self.assertTrue(rows[0].thickness_valid)
+
+    def test_thickness_mismatch_blocks_row_from_masking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bad_thickness.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append([
+                "Скважина", "Интервал фации по бурению Кровля",
+                "Интервал фации по бурению Подошва", "Толщина фации, м", "Класс",
+            ])
+            sheet.append(["W-1", 100.0, 112.0, 3.65, "Dch"])
+            workbook.save(path)
+
+            rows, mappings, issues = read_table(path)
+
+        self.assertEqual((2, 3, 4), (mappings[0].top, mappings[0].base, mappings[0].facies_thickness))
+        self.assertEqual(1, len(rows))
+        self.assertFalse(rows[0].thickness_valid)
+        self.assertTrue(any("не будет использована для маски" in item.message for item in issues))
 
     def test_reads_csv_with_one_interval_column(self):
         with tempfile.TemporaryDirectory() as directory:

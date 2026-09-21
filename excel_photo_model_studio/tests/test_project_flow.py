@@ -36,6 +36,8 @@ class ProjectFlowTests(unittest.TestCase):
 
             report = create_project(excel, photos, root / "project")
             self.assertTrue((root / "project" / "table_cache.json").is_file())
+            detected = json.loads((root / "project" / "detected_columns.json").read_text(encoding="utf-8"))
+            self.assertTrue(all(len(item["depth_ranges"]) == 1 for item in detected.values()))
             with patch(
                 "excel_photo_model_studio.project.read_many_tables",
                 side_effect=AssertionError("unchanged Excel must be loaded from the project cache"),

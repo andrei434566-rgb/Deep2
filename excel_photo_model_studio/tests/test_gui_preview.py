@@ -29,8 +29,8 @@ class GuiPreviewTests(unittest.TestCase):
             photos.mkdir()
             workbook = Workbook()
             sheet = workbook.active
-            sheet.append(["Скважина", "Кровля", "Подошва", "Класс"])
-            sheet.append(["W-1", 100.0, 102.0, "Sand"])
+            sheet.append(["Скважина", "Кровля", "Подошва", "Класс", "Краткое описание"])
+            sheet.append(["W-1", 100.0, 102.0, "Sand", "Sandstone description"])
             workbook.save(excel)
             image = np.full((240, 160, 3), (20, 80, 150), dtype=np.uint8)
             cv2.rectangle(image, (55, 20), (105, 220), (115, 115, 115), -1)
@@ -53,10 +53,15 @@ class GuiPreviewTests(unittest.TestCase):
             self.assertEqual("yolo11n-seg.yaml", window.architecture.currentData())
             self.assertEqual("auto", window.photo_table.cellWidget(0, 5).currentData())
             self.assertIn("Колонок керна найдено: 1", window.matching_preview_title.text())
+            self.assertIn("Интервалы колонок: 1) 100–102 м", window.matching_preview_title.text())
             self.assertIn("Порядок:", window.matching_preview_title.text())
             self.assertIn("Найдено интервалов", window.matching_preview_title.text())
             self.assertIsNotNone(window.matching_preview.pixmap())
             self.assertFalse(window.matching_preview.pixmap().isNull())
+            self.assertIn(
+                "Краткое описание: Sandstone description",
+                window.matching_preview.tooltip_for_image_point(80, 120),
+            )
             window.close()
 
 

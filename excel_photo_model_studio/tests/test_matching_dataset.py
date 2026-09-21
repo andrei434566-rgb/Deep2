@@ -64,6 +64,18 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(["A", "B"], [item.description.label for item in matches])
         self.assertAlmostEqual(3002.0, matches[0].overlap_top)
 
+    def test_row_with_failed_facies_thickness_check_is_not_masked(self):
+        photo = PhotoRecord(Path("W-1 100-112.jpg"), "W-1", 100.0, 112.0, "filename", True)
+        rows = [DescriptionRow(
+            "W-1", 100.0, 112.0, "Dch", "Data", 2,
+            thickness=3.65, thickness_valid=False,
+        )]
+
+        matches, unresolved = match_photos([photo], rows)
+
+        self.assertEqual([], matches)
+        self.assertEqual([photo], unresolved)
+
     def test_dataset_uses_only_approved_rows_and_separates_photos(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

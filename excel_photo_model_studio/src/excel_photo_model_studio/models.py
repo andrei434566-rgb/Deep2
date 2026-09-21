@@ -41,6 +41,7 @@ class ColumnMapping:
     interval: int | None = None
     top: int | None = None
     base: int | None = None
+    facies_thickness: int | None = None
     core_top: int | None = None
     core_base: int | None = None
     label: int | None = None
@@ -77,6 +78,8 @@ class DescriptionRow:
     source_file: str = ""
     core_top: float | None = None
     core_base: float | None = None
+    thickness: float | None = None
+    thickness_valid: bool = True
     metadata: dict[str, str] = field(default_factory=dict)
 
     @property

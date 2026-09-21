@@ -8,12 +8,12 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
-from PySide6.QtCore import Qt, QProcess
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import QPointF, Qt, QProcess
+from PySide6.QtGui import QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSpinBox,
-    QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
+    QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QToolTip, QVBoxLayout, QWidget,
 )
 
 from .catalog import catalog_summary, default_catalog_path, register_project
@@ -57,6 +57,71 @@ class PathField(QWidget):
             self.edit.setText(value)
 
 
+class MaskPreviewLabel(QLabel):
+    """Image preview which shows the matched short description over a mask."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self._regions: list[dict] = []
+        self._last_tip = ""
+        self.setMouseTracking(True)
+
+    def set_regions(self, regions: list[dict]) -> None:
+        self._regions = list(regions)
+        self._last_tip = ""
+
+    def tooltip_for_image_point(self, x: float, y: float) -> str:
+        candidates: list[tuple[float, dict]] = []
+        point = QPointF(float(x), float(y))
+        for region in self._regions:
+            try:
+                polygon = QPolygonF([QPointF(float(px), float(py)) for px, py in region["polygon"]])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if polygon.containsPoint(point, Qt.FillRule.OddEvenFill):
+                bounds = polygon.boundingRect()
+                candidates.append((max(1.0, bounds.width() * bounds.height()), region))
+        if not candidates:
+            return ""
+        region = min(candidates, key=lambda item: item[0])[1]
+        description = str(region.get("target_text", "")).strip() or "Описание отсутствует"
+        label = str(region.get("label", "")).strip()
+        interval = f"{region.get('depth_top', '')}–{region.get('depth_base', '')} м"
+        parts = [interval]
+        if label:
+            parts.append(f"Фация: {label}")
+        parts.append(f"Краткое описание: {description}")
+        return "\n".join(parts)
+
+    def mouseMoveEvent(self, event) -> None:
+        pixmap = self.pixmap()
+        text = ""
+        if pixmap is not None and not pixmap.isNull() and self._regions:
+            x_offset = (self.width() - pixmap.width()) / 2.0
+            y_offset = (self.height() - pixmap.height()) / 2.0
+            local_x = event.position().x() - x_offset
+            local_y = event.position().y() - y_offset
+            if 0 <= local_x < pixmap.width() and 0 <= local_y < pixmap.height():
+                width = max(float(region.get("image_width", 0) or 0) for region in self._regions)
+                height = max(float(region.get("image_height", 0) or 0) for region in self._regions)
+                if width > 0 and height > 0:
+                    text = self.tooltip_for_image_point(
+                        local_x * width / pixmap.width(),
+                        local_y * height / pixmap.height(),
+                    )
+        if text and text != self._last_tip:
+            QToolTip.showText(event.globalPosition().toPoint(), text, self)
+        elif not text and self._last_tip:
+            QToolTip.hideText()
+        self._last_tip = text
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        QToolTip.hideText()
+        self._last_tip = ""
+        super().leaveEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -65,8 +130,10 @@ class MainWindow(QMainWindow):
         self.current_project: Path | None = None
         self.matching_preview_paths: dict[str, str] = {}
         self.matching_preview_details: dict[str, list[str]] = {}
+        self.matching_preview_regions: dict[str, list[dict]] = {}
         self.matching_column_orders: dict[str, str] = {}
         self.matching_column_counts: dict[str, int] = {}
+        self.matching_column_depths: dict[str, list[str]] = {}
         self.tabs = QTabWidget(self)
         self.setCentralWidget(self.tabs)
         self._build_project_tab()
@@ -125,7 +192,7 @@ class MainWindow(QMainWindow):
         self.matching_preview_title.setWordWrap(True)
         self.matching_preview_title.setStyleSheet("font-size: 14px; font-weight: 600;")
         right.addWidget(self.matching_preview_title)
-        self.matching_preview = QLabel("Выберите фотографию в таблице.")
+        self.matching_preview = MaskPreviewLabel("Выберите фотографию в таблице.")
         self.matching_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.matching_preview.setWordWrap(True)
         self.matching_preview.setMinimumWidth(380)
@@ -155,7 +222,7 @@ class MainWindow(QMainWindow):
         self.review_table.itemSelectionChanged.connect(self._show_preview)
         left.addWidget(self.review_table, 1)
         layout.addLayout(left, 3)
-        self.preview = QLabel("Выберите строку. Цветная область — автоматически построенная маска.")
+        self.preview = MaskPreviewLabel("Выберите строку. Цветная область — автоматически построенная маска.")
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview.setWordWrap(True)
         self.preview.setMinimumWidth(380)
@@ -357,8 +424,10 @@ class MainWindow(QMainWindow):
         if self._pending_project_action == "create":
             self.matching_preview_paths.clear()
             self.matching_preview_details.clear()
+            self.matching_preview_regions.clear()
             self.matching_column_orders.clear()
             self.matching_column_counts.clear()
+            self.matching_column_depths.clear()
             try:
                 register_project(project_dir)
             except OSError as exc:
@@ -377,6 +446,7 @@ class MainWindow(QMainWindow):
             f"Нужно подтвердить интервалы: {report['unconfirmed_photos']}",
             f"Автоматически подтверждено OCR: {report.get('ocr_verified_photos', 0)}",
             f"Спроецировано масок: {report['annotations']}",
+            f"Строк с ошибкой толщины фации: {report.get('invalid_thickness_rows', 0)}",
             f"Строк Excel с «Кратким описанием»: {report.get('excel_text_targets', 0)}",
             f"Масок с «Кратким описанием»: {report.get('text_targets', 0)}",
             f"Подтверждено масок: {report['approved_annotations']}",
@@ -387,6 +457,7 @@ class MainWindow(QMainWindow):
             lines.extend(
                 f"- {item.get('sheet', '')}: интервал фации по бурению "
                 f"{item.get('facies_top') or '?'}–{item.get('facies_base') or '?'}, "
+                f"толщина фации {item.get('facies_thickness') or '?'}, "
                 f"«Краткое описание» {item.get('target_text') or '?'}"
                 for item in mappings
             )
@@ -407,6 +478,7 @@ class MainWindow(QMainWindow):
             return self._error(str(exc))
         self.matching_preview_paths.clear()
         self.matching_preview_details.clear()
+        self.matching_preview_regions.clear()
         self._load_detected_column_orders()
         self.review_table.blockSignals(True)
         self.review_table.setUpdatesEnabled(False)
@@ -433,6 +505,20 @@ class MainWindow(QMainWindow):
             self.matching_preview_details.setdefault(photo_key, []).append(
                 f"{row['depth_top']}–{row['depth_base']} м: {row['label']}"
             )
+            try:
+                polygon = json.loads(row.get("polygon_json", "[]"))
+            except (TypeError, ValueError):
+                polygon = []
+            if polygon:
+                self.matching_preview_regions.setdefault(photo_key, []).append({
+                    "polygon": polygon,
+                    "image_width": as_float(row.get("image_width")) or 0,
+                    "image_height": as_float(row.get("image_height")) or 0,
+                    "depth_top": row.get("depth_top", ""),
+                    "depth_base": row.get("depth_base", ""),
+                    "label": row.get("label", ""),
+                    "target_text": row.get("target_text", ""),
+                })
         self.review_table.setUpdatesEnabled(True)
         self.review_table.blockSignals(False)
         if rows:
@@ -453,25 +539,33 @@ class MainWindow(QMainWindow):
     def _show_preview(self) -> None:
         row = self.review_table.currentRow()
         if row < 0:
+            self.preview.set_regions([])
             return
         preview = self.review_table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+        photo_item = self.review_table.item(row, 1)
+        photo_key = self._photo_key(photo_item.text()) if photo_item is not None else ""
+        self.preview.set_regions(self.matching_preview_regions.get(photo_key, []))
         self._set_preview_pixmap(self.preview, preview, "Предпросмотр не найден.")
 
     def _show_matching_preview(self) -> None:
         row = self.photo_table.currentRow()
         if row < 0 or self.photo_table.item(row, 1) is None:
             self.matching_preview_title.setText("После сопоставления здесь появится фото с найденными интервалами.")
+            self.matching_preview.set_regions([])
             self.matching_preview.setText("Выберите фотографию в таблице.")
             return
         photo_path = self.photo_table.item(row, 1).text()
         photo_key = self._photo_key(photo_path)
         preview_path = self.matching_preview_paths.get(photo_key)
         details = self.matching_preview_details.get(photo_key, [])
+        self.matching_preview.set_regions(self.matching_preview_regions.get(photo_key, []))
         order_widget = self.photo_table.cellWidget(row, 5)
         requested_order = order_widget.currentData() if isinstance(order_widget, QComboBox) else COLUMN_ORDER_AUTO
         effective_order = self.matching_column_orders.get(photo_key)
         column_count = self.matching_column_counts.get(photo_key)
+        column_depths = self.matching_column_depths.get(photo_key, [])
         columns_text = f"Колонок керна найдено: {column_count}" if column_count else "Колонки керна ещё не определены"
+        depth_text = f"\nИнтервалы колонок: {'; '.join(column_depths)}" if column_depths else ""
         if requested_order == COLUMN_ORDER_AUTO:
             order_text = (
                 f"Порядок: {self._column_order_label(effective_order)} (определено автоматически)"
@@ -488,18 +582,20 @@ class MainWindow(QMainWindow):
             visible_details = "\n".join(details[:4])
             suffix = f"\nЕщё интервалов: {len(details) - 4}" if len(details) > 4 else ""
             self.matching_preview_title.setText(
-                f"{columns_text}\n{order_text}\nНайдено интервалов: {len(details)}\n{visible_details}{suffix}"
+                f"{columns_text}{depth_text}\n{order_text}\nНайдено интервалов: {len(details)}\n"
+                f"{visible_details}{suffix}\nНаведите курсор на маску — появится краткое описание."
             )
             self._set_preview_pixmap(self.matching_preview, preview_path, "Не удалось открыть фото с масками.")
         else:
             self.matching_preview_title.setText(
-                f"{columns_text}\n{order_text}\nНа этом фото совпадающие интервалы пока не найдены."
+                f"{columns_text}{depth_text}\n{order_text}\nНа этом фото совпадающие интервалы пока не найдены."
             )
             self._set_preview_pixmap(self.matching_preview, photo_path, "Не удалось открыть исходную фотографию.")
 
     def _load_detected_column_orders(self) -> None:
         self.matching_column_orders.clear()
         self.matching_column_counts.clear()
+        self.matching_column_depths.clear()
         try:
             data = json.loads((self._project_dir() / "detected_columns.json").read_text(encoding="utf-8"))
         except (OSError, ValueError, RuntimeError):
@@ -514,6 +610,18 @@ class MainWindow(QMainWindow):
             boxes = value.get("boxes", [])
             if isinstance(boxes, list) and boxes:
                 self.matching_column_counts[self._photo_key(photo_path)] = len(boxes)
+            depth_ranges = value.get("depth_ranges", [])
+            if isinstance(depth_ranges, list):
+                labels = []
+                for index, interval in enumerate(depth_ranges, start=1):
+                    if not isinstance(interval, dict):
+                        continue
+                    top = as_float(interval.get("top"))
+                    base = as_float(interval.get("base"))
+                    if top is not None and base is not None:
+                        labels.append(f"{index}) {top:g}–{base:g} м")
+                if labels:
+                    self.matching_column_depths[self._photo_key(photo_path)] = labels
 
     @staticmethod
     def _column_order_label(value: str | None) -> str:

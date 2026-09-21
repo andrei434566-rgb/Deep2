@@ -67,7 +67,8 @@ def analyze_photos_to_excel(
             height, width = image.shape[:2]
             columns = sorted(detect_core_columns(image), key=lambda box: (box[0], box[1]))
             if not columns:
-                columns = [(0, 0, width, height)]
+                skipped_photos.append(record.path.name)
+                continue
             order = detect_column_order(image, columns)
             if order == COLUMN_ORDER_RIGHT_TO_LEFT:
                 columns.reverse()

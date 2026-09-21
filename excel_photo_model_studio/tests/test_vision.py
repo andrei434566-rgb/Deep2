@@ -13,7 +13,8 @@ from excel_photo_model_studio.models import (
     DescriptionRow, Match, PhotoRecord,
 )
 from excel_photo_model_studio.vision import (
-    detect_column_order, detect_core_columns, project_matches, read_image, render_previews,
+    calibrate_core_columns, detect_column_order, detect_core_columns, project_matches,
+    read_image, render_previews,
 )
 
 
@@ -81,6 +82,31 @@ class VisionTests(unittest.TestCase):
 
         self.assertEqual(3, len(boxes))
         self.assertTrue(all(right - left >= 80 for left, _, right, _ in boxes))
+
+    def test_calibrates_depth_inside_each_detected_column(self):
+        columns = [(10, 20, 50, 120), (70, 20, 110, 220), (130, 20, 170, 120)]
+
+        calibrated = calibrate_core_columns(columns, 100.0, 104.0)
+
+        self.assertEqual((100.0, 101.0), calibrated[0][1:])
+        self.assertEqual((101.0, 103.0), calibrated[1][1:])
+        self.assertEqual((103.0, 104.0), calibrated[2][1:])
+
+    def test_does_not_create_full_photo_mask_when_columns_are_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            photo_path = root / "W-1 100-102.jpg"
+            image = np.full((300, 300, 3), 255, dtype=np.uint8)
+            ok, encoded = cv2.imencode(".jpg", image)
+            self.assertTrue(ok)
+            photo_path.write_bytes(encoded.tobytes())
+            photo = PhotoRecord(photo_path, "W-1", 100.0, 102.0, "filename", True)
+            row = DescriptionRow("W-1", 100.0, 101.0, "Sand", "Data", 2)
+
+            annotations, columns, _orders = project_matches([Match(photo, row, 100.0, 101.0)])
+
+        self.assertEqual([], annotations)
+        self.assertEqual([], columns[photo_path])
 
     def test_render_preview_applies_visible_interval_mask(self):
         with tempfile.TemporaryDirectory() as directory:
