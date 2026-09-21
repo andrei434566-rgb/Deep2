@@ -56,12 +56,14 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Excel Photo Model Studio")
         self.resize(1180, 760)
+        self.current_project: Path | None = None
+        self.matching_preview_paths: dict[str, str] = {}
+        self.matching_preview_details: dict[str, list[str]] = {}
         self.tabs = QTabWidget(self)
         self.setCentralWidget(self.tabs)
         self._build_project_tab()
         self._build_review_tab()
         self._build_train_tab()
-        self.current_project: Path | None = None
         self.process: QProcess | None = None
 
     def _build_project_tab(self) -> None:
@@ -76,17 +78,11 @@ class MainWindow(QMainWindow):
         form.addRow("OCR:", self.ocr)
         layout.addLayout(form)
         row = QHBoxLayout()
-        create = QPushButton("Сопоставить Excel и фотографии")
+        create = QPushButton("Сопоставить и показать маски")
         create.clicked.connect(self._create_project)
-        refresh = QPushButton("Пересчитать текущий проект")
-        refresh.clicked.connect(self._refresh_project)
-        load_map = QPushButton("Загрузить интервалы фото")
-        load_map.clicked.connect(self._load_photo_map)
-        save_map = QPushButton("Сохранить интервалы и пересчитать")
+        save_map = QPushButton("Пересчитать после исправлений")
         save_map.clicked.connect(self._save_photo_map)
         row.addWidget(create)
-        row.addWidget(refresh)
-        row.addWidget(load_map)
         row.addWidget(save_map)
         row.addStretch(1)
         layout.addLayout(row)
@@ -94,10 +90,25 @@ class MainWindow(QMainWindow):
         self.photo_table.setHorizontalHeaderLabels(("OK", "Файл", "Скважина", "Начало", "Конец", "Источник"))
         self.photo_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.photo_table.setMaximumHeight(260)
-        layout.addWidget(self.photo_table)
+        self.photo_table.itemSelectionChanged.connect(self._show_matching_preview)
         self.project_log = QTextEdit()
         self.project_log.setReadOnly(True)
-        layout.addWidget(self.project_log, 1)
+        content = QHBoxLayout()
+        left = QVBoxLayout()
+        left.addWidget(self.photo_table)
+        left.addWidget(self.project_log, 1)
+        content.addLayout(left, 3)
+        right = QVBoxLayout()
+        self.matching_preview_title = QLabel("После сопоставления здесь появится фото с найденными интервалами.")
+        self.matching_preview_title.setWordWrap(True)
+        right.addWidget(self.matching_preview_title)
+        self.matching_preview = QLabel("Выберите фотографию в таблице.")
+        self.matching_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.matching_preview.setWordWrap(True)
+        self.matching_preview.setMinimumWidth(380)
+        right.addWidget(self.matching_preview, 1)
+        content.addLayout(right, 2)
+        layout.addLayout(content, 1)
         self.tabs.addTab(page, "1. Сопоставление")
 
     def _build_review_tab(self) -> None:
@@ -179,17 +190,10 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             return self._error(str(exc))
         self.current_project = project_dir
+        self.matching_preview_paths.clear()
+        self.matching_preview_details.clear()
         self.dataset_output.set_value(project_dir / "dataset")
         self.model_output.set_value(project_dir / "model_candidate")
-        self._show_report(result)
-        self._load_photo_map()
-        self._load_review()
-
-    def _refresh_project(self) -> None:
-        try:
-            result = refresh_project(self._project_dir())
-        except Exception as exc:
-            return self._error(str(exc))
         self._show_report(result)
         self._load_photo_map()
         self._load_review()
@@ -215,6 +219,8 @@ class MainWindow(QMainWindow):
                 if column in {1, 5}:
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self.photo_table.setItem(row, column, item)
+        if records:
+            self.photo_table.selectRow(0)
 
     def _save_photo_map(self) -> None:
         records = []
@@ -253,7 +259,7 @@ class MainWindow(QMainWindow):
         if report.get("issues"):
             lines.append("\nПроверить:")
             lines.extend(f"- {item['source']}: {item['message']}" for item in report["issues"])
-        lines.append("\nНеизвестные интервалы исправьте прямо в таблице выше, отметьте OK и нажмите «Сохранить интервалы и пересчитать».")
+        lines.append("\nНеизвестные интервалы исправьте прямо в таблице выше, отметьте OK и нажмите «Пересчитать после исправлений».")
         self.project_log.setPlainText("\n".join(lines))
 
     def _load_review(self) -> None:
@@ -261,6 +267,8 @@ class MainWindow(QMainWindow):
             rows = load_annotations(self._project_dir())
         except Exception as exc:
             return self._error(str(exc))
+        self.matching_preview_paths.clear()
+        self.matching_preview_details.clear()
         self.review_table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             approved = QTableWidgetItem()
@@ -278,8 +286,15 @@ class MainWindow(QMainWindow):
                 item = QTableWidgetItem(value)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self.review_table.setItem(row_index, column, item)
+            photo_key = self._photo_key(row["photo"])
+            if row.get("preview"):
+                self.matching_preview_paths[photo_key] = row["preview"]
+            self.matching_preview_details.setdefault(photo_key, []).append(
+                f"{row['depth_top']}–{row['depth_base']} м: {row['label']}"
+            )
         if rows:
             self.review_table.selectRow(0)
+        self._select_first_masked_photo()
 
     def _save_review(self) -> None:
         approvals = {}
@@ -296,14 +311,61 @@ class MainWindow(QMainWindow):
         if row < 0:
             return
         preview = self.review_table.item(row, 0).data(Qt.ItemDataRole.UserRole)
-        pixmap = QPixmap(preview)
-        if pixmap.isNull():
-            self.preview.setText("Предпросмотр не найден.")
+        self._set_preview_pixmap(self.preview, preview, "Предпросмотр не найден.")
+
+    def _show_matching_preview(self) -> None:
+        row = self.photo_table.currentRow()
+        if row < 0 or self.photo_table.item(row, 1) is None:
+            self.matching_preview_title.setText("После сопоставления здесь появится фото с найденными интервалами.")
+            self.matching_preview.setText("Выберите фотографию в таблице.")
             return
-        self.preview.setPixmap(pixmap.scaled(self.preview.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        photo_path = self.photo_table.item(row, 1).text()
+        photo_key = self._photo_key(photo_path)
+        preview_path = self.matching_preview_paths.get(photo_key)
+        details = self.matching_preview_details.get(photo_key, [])
+        if preview_path:
+            visible_details = "\n".join(details[:4])
+            suffix = f"\nЕщё интервалов: {len(details) - 4}" if len(details) > 4 else ""
+            self.matching_preview_title.setText(
+                f"Найдено интервалов: {len(details)}\n{visible_details}{suffix}"
+            )
+            self._set_preview_pixmap(self.matching_preview, preview_path, "Не удалось открыть фото с масками.")
+        else:
+            self.matching_preview_title.setText("На этом фото совпадающие интервалы пока не найдены.")
+            self._set_preview_pixmap(self.matching_preview, photo_path, "Не удалось открыть исходную фотографию.")
+
+    def _select_first_masked_photo(self) -> None:
+        for row in range(self.photo_table.rowCount()):
+            item = self.photo_table.item(row, 1)
+            if item is not None and self._photo_key(item.text()) in self.matching_preview_paths:
+                self.photo_table.selectRow(row)
+                self._show_matching_preview()
+                return
+        self._show_matching_preview()
+
+    @staticmethod
+    def _photo_key(path: str | Path) -> str:
+        return os.path.normcase(os.path.abspath(str(path)))
+
+    @staticmethod
+    def _set_preview_pixmap(label: QLabel, path: str | Path, error_text: str) -> None:
+        pixmap = QPixmap()
+        try:
+            loaded = pixmap.loadFromData(Path(path).read_bytes())
+        except OSError:
+            loaded = False
+        if not loaded or pixmap.isNull():
+            label.setText(error_text)
+            return
+        label.setPixmap(pixmap.scaled(
+            label.size(), Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        ))
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        if hasattr(self, "photo_table"):
+            self._show_matching_preview()
         if hasattr(self, "review_table"):
             self._show_preview()
 

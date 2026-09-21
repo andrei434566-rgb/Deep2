@@ -136,9 +136,13 @@ def render_previews(annotations: list[Annotation], destination: Path) -> dict[Pa
             points = np.array(item.polygon, dtype=np.int32)
             cv2.fillPoly(overlay, [points], color)
             cv2.polylines(image, [points], True, color, max(2, round(image.shape[1] / 700)))
-            anchor = tuple(points[0])
-            cv2.putText(image, item.label[:32], anchor, cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
-        image = cv2.addWeighted(overlay, 0.22, image, 0.78, 0)
+        image = cv2.addWeighted(overlay, 0.35, image, 0.65, 0)
+        for item in items:
+            color = _label_color(item.label)
+            points = np.array(item.polygon, dtype=np.int32)
+            anchor = (max(5, int(points[0][0]) + 4), max(22, int(points[0][1]) + 20))
+            interval = f"{item.depth_top:.2f}-{item.depth_base:.2f}m"
+            cv2.putText(image, interval, anchor, cv2.FONT_HERSHEY_SIMPLEX, 0.60, color, 2, cv2.LINE_AA)
         target = destination / f"{index:05d}_{photo_path.stem}.jpg"
         ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 90])
         if ok:
