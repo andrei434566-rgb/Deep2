@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .matching import match_photos, read_photo_map, suggest_missing_intervals, write_photo_map
-from .models import Annotation, Issue, PhotoRecord
+from .models import Annotation, ColumnMapping, DescriptionRow, Issue, PhotoRecord
 from .photos import discover_photos
 from .tabular import read_many_tables, save_mappings
 from .vision import project_matches, render_previews
@@ -46,6 +46,7 @@ def create_project(
     save_mappings(project_dir / "column_mapping.json", mappings)
     write_photo_map(project_dir / "photo_map.csv", photos)
     _write_json(project_dir / "excel_issues.json", [item.to_dict() for item in issues])
+    _write_table_cache(project_dir, rows, mappings, issues, excel_files)
     return refresh_project(project_dir)
 
 
@@ -55,20 +56,29 @@ def refresh_project(project_dir: Path) -> dict:
     excel_paths = [Path(value) for value in config.get("excel_paths", ())]
     if not excel_paths and config.get("excel_path"):
         excel_paths = [Path(config["excel_path"])]
-    rows, mappings, issues, excel_files = read_many_tables(excel_paths, project_dir / "column_mapping.json")
-    save_mappings(project_dir / "column_mapping.json", mappings)
+    cached = _load_table_cache(project_dir, excel_paths)
+    if cached is None:
+        rows, mappings, issues, excel_files = read_many_tables(excel_paths, project_dir / "column_mapping.json")
+        save_mappings(project_dir / "column_mapping.json", mappings)
+        _write_table_cache(project_dir, rows, mappings, issues, excel_files)
+    else:
+        rows, mappings, issues, excel_files = cached
     photos = read_photo_map(project_dir / "photo_map.csv")
     old_approvals = _existing_approvals(project_dir / "annotations.csv")
     confirmed = [photo for photo in photos if photo.mapping_confirmed]
     matches, unresolved_confirmed = match_photos(confirmed, rows)
     unconfirmed = [photo for photo in photos if not photo.mapping_confirmed]
-    annotations, columns = project_matches(matches)
+    annotations, columns, orders = project_matches(matches)
     annotations = [replace(item, approved=old_approvals.get(item.annotation_id, False)) for item in annotations]
     preview_paths = render_previews(annotations, project_dir / "previews")
     _write_matches(project_dir / "matches.csv", matches)
     _write_annotations(project_dir / "annotations.csv", annotations, preview_paths)
     _write_json(project_dir / "detected_columns.json", {
-        str(path): [list(box) for box in boxes] for path, boxes in columns.items()
+        str(path): {
+            "order": orders.get(path, "left_to_right"),
+            "boxes": [list(box) for box in boxes],
+        }
+        for path, boxes in columns.items()
     })
     all_issues = list(issues)
     all_issues.extend(Issue("warning", photo.path.name, "Подтвердите скважину и интервал в photo_map.csv.") for photo in unconfirmed)
@@ -153,12 +163,13 @@ def _write_annotations(path: Path, annotations: list[Annotation], previews: dict
             "source_sheet": item.source_sheet, "source_row": item.source_row,
             "source_file": item.source_file, "target_text": item.target_text,
             "association": item.association, "environment": item.environment,
+            "field_name": item.field_name,
             "approved": "1" if item.approved else "0",
         })
     _write_dict_rows(path, rows, fieldnames=(
         "annotation_id", "photo", "preview", "well", "photo_top", "photo_base",
         "depth_top", "depth_base", "label", "polygon_json", "image_width", "image_height",
-        "source_sheet", "source_row", "source_file", "target_text", "association", "environment", "approved",
+        "source_sheet", "source_row", "source_file", "target_text", "association", "environment", "field_name", "approved",
     ))
 
 
@@ -177,3 +188,54 @@ def _write_dict_rows(path: Path, rows: list[dict], fieldnames=None) -> None:
 
 def _write_json(path: Path, payload) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _table_source_signature(excel_paths: list[Path], mapping_path: Path) -> str:
+    import hashlib
+
+    values = []
+    for path in excel_paths:
+        resolved = Path(path).expanduser().resolve(strict=True)
+        stat = resolved.stat()
+        values.append((str(resolved), stat.st_size, stat.st_mtime_ns))
+    if mapping_path.is_file():
+        stat = mapping_path.stat()
+        values.append((str(mapping_path.resolve()), stat.st_size, stat.st_mtime_ns))
+    return hashlib.sha256(json.dumps(values, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _write_table_cache(project_dir: Path, rows, mappings, issues, excel_files) -> None:
+    mapping_path = project_dir / "column_mapping.json"
+    payload = {
+        "schema": "excel-photo-table-cache-v1",
+        "signature": _table_source_signature([Path(path) for path in excel_files], mapping_path),
+        "excel_files": [str(path) for path in excel_files],
+        "rows": [asdict(item) for item in rows],
+        "mappings": [item.to_dict() for item in mappings],
+        "issues": [item.to_dict() for item in issues],
+    }
+    path = project_dir / "table_cache.json"
+    temporary = path.with_suffix(".json.tmp")
+    _write_json(temporary, payload)
+    temporary.replace(path)
+
+
+def _load_table_cache(project_dir: Path, excel_paths: list[Path]):
+    path = project_dir / "table_cache.json"
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("schema") != "excel-photo-table-cache-v1":
+            return None
+        if payload.get("signature") != _table_source_signature(excel_paths, project_dir / "column_mapping.json"):
+            return None
+        rows = [DescriptionRow(**item) for item in payload.get("rows", [])]
+        mappings = [ColumnMapping.from_dict(item) for item in payload.get("mappings", [])]
+        issues = [Issue(**item) for item in payload.get("issues", [])]
+        files = [Path(item) for item in payload.get("excel_files", [])]
+        if not rows or not files:
+            return None
+        return rows, mappings, issues, files
+    except (OSError, ValueError, TypeError, KeyError):
+        return None

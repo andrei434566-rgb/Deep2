@@ -31,6 +31,7 @@ class DescriptionModelTests(unittest.TestCase):
                 (dataset / relative).write_bytes(encoded.tobytes())
                 rows.append({
                     "split": split, "crop": relative.as_posix(),
+                    "facies": "Tcr",
                     "target_text": "Песчаник серый, слоистый.",
                 })
             (dataset / "caption_dataset.jsonl").write_text(
@@ -44,6 +45,9 @@ class DescriptionModelTests(unittest.TestCase):
             checkpoint = torch.load(output / "description_best.pt", map_location="cpu", weights_only=False)
 
         self.assertEqual(22, checkpoint["target_column"])
+        self.assertEqual("excel-photo-description-v2", checkpoint["schema"])
+        self.assertEqual(["Tcr"], checkpoint["facies_names"])
+        self.assertEqual(["interval_image", "facies_class"], checkpoint["conditioning"])
         self.assertEqual(5, info["train_samples"])
         self.assertEqual(1, info["val_samples"])
 

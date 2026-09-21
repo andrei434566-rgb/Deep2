@@ -5,6 +5,31 @@ from pathlib import Path
 from typing import Any
 
 
+COLUMN_ORDER_AUTO = "auto"
+COLUMN_ORDER_LEFT_TO_RIGHT = "left_to_right"
+COLUMN_ORDER_RIGHT_TO_LEFT = "right_to_left"
+
+
+def normalize_column_order(value: str | None) -> str:
+    text = " ".join(str(value or "").strip().casefold().replace("ё", "е").split())
+    aliases = {
+        "": COLUMN_ORDER_AUTO,
+        "auto": COLUMN_ORDER_AUTO,
+        "авто": COLUMN_ORDER_AUTO,
+        "left_to_right": COLUMN_ORDER_LEFT_TO_RIGHT,
+        "ltr": COLUMN_ORDER_LEFT_TO_RIGHT,
+        "слева направо": COLUMN_ORDER_LEFT_TO_RIGHT,
+        "слева → направо": COLUMN_ORDER_LEFT_TO_RIGHT,
+        "right_to_left": COLUMN_ORDER_RIGHT_TO_LEFT,
+        "rtl": COLUMN_ORDER_RIGHT_TO_LEFT,
+        "справа налево": COLUMN_ORDER_RIGHT_TO_LEFT,
+        "справа → налево": COLUMN_ORDER_RIGHT_TO_LEFT,
+    }
+    if text not in aliases:
+        raise ValueError(f"Неизвестный порядок колонок: {value}")
+    return aliases[text]
+
+
 @dataclass(frozen=True)
 class ColumnMapping:
     """One sheet's semantic column mapping. Column numbers are one-based."""
@@ -68,6 +93,7 @@ class PhotoRecord:
     base: float | None = None
     source: str = "not_found"
     mapping_confirmed: bool = False
+    column_order: str = COLUMN_ORDER_AUTO
 
     @property
     def has_interval(self) -> bool:
@@ -105,6 +131,7 @@ class Annotation:
     target_text: str = ""
     association: str = ""
     environment: str = ""
+    field_name: str = ""
     approved: bool = False
 
 

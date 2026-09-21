@@ -11,22 +11,26 @@ from uuid import uuid4
 from PySide6.QtCore import Qt, QProcess
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
-    QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QSpinBox,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
+    QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSpinBox,
     QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from .dataset import build_dataset
+from .catalog import catalog_summary, default_catalog_path, register_project
 from .matching import read_photo_map, write_photo_map
-from .models import PhotoRecord
-from .project import create_project, load_annotations, refresh_project, set_annotation_approvals
+from .models import (
+    COLUMN_ORDER_AUTO, COLUMN_ORDER_LEFT_TO_RIGHT, COLUMN_ORDER_RIGHT_TO_LEFT,
+    PhotoRecord, normalize_column_order,
+)
+from .project import load_annotations, set_annotation_approvals
 from .tabular import as_float
 
 
 class PathField(QWidget):
-    def __init__(self, *, directory: bool = False, file_filter: str = "Все файлы (*)", parent=None):
+    def __init__(self, *, directory: bool = False, save: bool = False, file_filter: str = "Все файлы (*)", parent=None):
         super().__init__(parent)
         self.directory = directory
+        self.save = save
         self.file_filter = file_filter
         self.edit = QLineEdit(self)
         button = QPushButton("Выбрать…", self)
@@ -45,6 +49,8 @@ class PathField(QWidget):
     def _browse(self) -> None:
         if self.directory:
             value = QFileDialog.getExistingDirectory(self, "Выберите папку", self.edit.text())
+        elif self.save:
+            value, _ = QFileDialog.getSaveFileName(self, "Сохранить файл", self.edit.text(), self.file_filter)
         else:
             value, _ = QFileDialog.getOpenFileName(self, "Выберите файл", self.edit.text(), self.file_filter)
         if value:
@@ -59,12 +65,20 @@ class MainWindow(QMainWindow):
         self.current_project: Path | None = None
         self.matching_preview_paths: dict[str, str] = {}
         self.matching_preview_details: dict[str, list[str]] = {}
+        self.matching_column_orders: dict[str, str] = {}
+        self.matching_column_counts: dict[str, int] = {}
         self.tabs = QTabWidget(self)
         self.setCentralWidget(self.tabs)
         self._build_project_tab()
         self._build_review_tab()
         self._build_train_tab()
+        self._build_analyze_tab()
+        self.project_process: QProcess | None = None
+        self.dataset_process: QProcess | None = None
         self.process: QProcess | None = None
+        self.analysis_process: QProcess | None = None
+        self._pending_project_action = ""
+        self._ensure_training_output_paths()
 
     def _build_project_tab(self) -> None:
         page = QWidget(self)
@@ -78,18 +92,25 @@ class MainWindow(QMainWindow):
         form.addRow("OCR:", self.ocr)
         layout.addLayout(form)
         row = QHBoxLayout()
-        create = QPushButton("Сопоставить и показать маски")
-        create.clicked.connect(self._create_project)
-        save_map = QPushButton("Пересчитать после исправлений")
-        save_map.clicked.connect(self._save_photo_map)
-        row.addWidget(create)
-        row.addWidget(save_map)
+        self.create_button = QPushButton("Сопоставить и показать маски")
+        self.create_button.clicked.connect(self._create_project)
+        self.recalculate_button = QPushButton("Пересчитать после исправлений")
+        self.recalculate_button.clicked.connect(self._save_photo_map)
+        row.addWidget(self.create_button)
+        row.addWidget(self.recalculate_button)
         row.addStretch(1)
         layout.addLayout(row)
-        self.photo_table = QTableWidget(0, 6)
-        self.photo_table.setHorizontalHeaderLabels(("OK", "Файл", "Скважина", "Начало", "Конец", "Источник"))
+        self.project_progress = QProgressBar()
+        self.project_progress.setRange(0, 0)
+        self.project_progress.setVisible(False)
+        layout.addWidget(self.project_progress)
+        self.photo_table = QTableWidget(0, 7)
+        self.photo_table.setHorizontalHeaderLabels((
+            "OK", "Файл", "Скважина", "Начало", "Конец", "Порядок колонок", "Источник",
+        ))
         self.photo_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.photo_table.setMaximumHeight(260)
+        self.photo_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.photo_table.setMaximumHeight(280)
         self.photo_table.itemSelectionChanged.connect(self._show_matching_preview)
         self.project_log = QTextEdit()
         self.project_log.setReadOnly(True)
@@ -101,11 +122,13 @@ class MainWindow(QMainWindow):
         right = QVBoxLayout()
         self.matching_preview_title = QLabel("После сопоставления здесь появится фото с найденными интервалами.")
         self.matching_preview_title.setWordWrap(True)
+        self.matching_preview_title.setStyleSheet("font-size: 14px; font-weight: 600;")
         right.addWidget(self.matching_preview_title)
         self.matching_preview = QLabel("Выберите фотографию в таблице.")
         self.matching_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.matching_preview.setWordWrap(True)
         self.matching_preview.setMinimumWidth(380)
+        self.matching_preview.setStyleSheet("border: 3px solid #ff8c00; background: #202020; color: white;")
         right.addWidget(self.matching_preview, 1)
         content.addLayout(right, 2)
         layout.addLayout(content, 1)
@@ -143,8 +166,11 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         form = QFormLayout()
         self.dataset_output = PathField(directory=True)
-        self.base_model = PathField(file_filter="PyTorch weights (*.pt)")
         self.model_output = PathField(directory=True)
+        self.architecture = QComboBox()
+        self.architecture.addItem("YOLO11 nano segmentation — быстрее", "yolo11n-seg.yaml")
+        self.architecture.addItem("YOLO11 small segmentation", "yolo11s-seg.yaml")
+        self.architecture.addItem("YOLO11 medium segmentation — тяжелее", "yolo11m-seg.yaml")
         self.epochs = QSpinBox()
         self.epochs.setRange(1, 10000)
         self.epochs.setValue(50)
@@ -155,18 +181,21 @@ class MainWindow(QMainWindow):
         self.description_epochs.setRange(1, 10000)
         self.description_epochs.setValue(40)
         form.addRow("Новая папка датасета:", self.dataset_output)
-        form.addRow("Локальная базовая seg-модель .pt:", self.base_model)
         form.addRow("Новая папка результата:", self.model_output)
+        form.addRow("Архитектура со случайными весами:", self.architecture)
         form.addRow("Эпохи (верхний предел):", self.epochs)
         form.addRow("Early stopping patience:", self.patience)
         form.addRow("Эпохи модели текста №22:", self.description_epochs)
         layout.addLayout(form)
+        self.catalog_status = QLabel()
+        self.catalog_status.setWordWrap(True)
+        layout.addWidget(self.catalog_status)
         buttons = QHBoxLayout()
-        build = QPushButton("Собрать датасет")
-        build.clicked.connect(self._build_dataset)
-        train = QPushButton("Обучить комплект best.pt + текст №22")
+        self.dataset_button = QPushButton("Собрать датасет")
+        self.dataset_button.clicked.connect(self._build_dataset)
+        train = QPushButton("Обучить с нуля единый best.pt: слои + фации + столбец 22")
         train.clicked.connect(self._start_training)
-        buttons.addWidget(build)
+        buttons.addWidget(self.dataset_button)
         buttons.addWidget(train)
         buttons.addStretch(1)
         layout.addLayout(buttons)
@@ -174,6 +203,31 @@ class MainWindow(QMainWindow):
         self.train_log.setReadOnly(True)
         layout.addWidget(self.train_log, 1)
         self.tabs.addTab(page, "3. Датасет и best.pt")
+        self._update_catalog_status()
+
+    def _build_analyze_tab(self) -> None:
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        form = QFormLayout()
+        self.analysis_model = PathField(file_filter="Единая модель best.pt (*.pt)")
+        self.analysis_photos = PathField(directory=True)
+        self.analysis_output = PathField(save=True, file_filter="Excel (*.xlsx)")
+        self.analysis_confidence = QSpinBox()
+        self.analysis_confidence.setRange(1, 99)
+        self.analysis_confidence.setValue(25)
+        self.analysis_confidence.setSuffix(" %")
+        form.addRow("Созданный best.pt:", self.analysis_model)
+        form.addRow("Папка нового керна:", self.analysis_photos)
+        form.addRow("Итоговый Excel из 22 столбцов:", self.analysis_output)
+        form.addRow("Минимальная уверенность:", self.analysis_confidence)
+        layout.addLayout(form)
+        analyze = QPushButton("Распознать фации, сформировать столбец 22 и создать Excel")
+        analyze.clicked.connect(self._start_analysis)
+        layout.addWidget(analyze)
+        self.analysis_log = QTextEdit()
+        self.analysis_log.setReadOnly(True)
+        layout.addWidget(self.analysis_log, 1)
+        self.tabs.addTab(page, "4. Новый керн → Excel")
 
     def _create_project(self) -> None:
         try:
@@ -186,23 +240,23 @@ class MainWindow(QMainWindow):
             if not self.photos.edit.text().strip() or not photos_path.is_dir():
                 raise ValueError("Выберите существующую папку с фотографиями.")
             project_dir = self._automatic_project_dir(excel_path)
-            result = create_project(excel_path, photos_path, project_dir, use_ocr=self.ocr.isChecked())
         except Exception as exc:
             return self._error(str(exc))
-        self.current_project = project_dir
-        self.matching_preview_paths.clear()
-        self.matching_preview_details.clear()
-        self.dataset_output.set_value(project_dir / "dataset")
-        self.model_output.set_value(project_dir / "model_candidate")
-        self._show_report(result)
-        self._load_photo_map()
-        self._load_review()
+        command = [
+            "create", "--excel", str(excel_path), "--photos", str(photos_path),
+            "--project", str(project_dir),
+        ]
+        if self.ocr.isChecked():
+            command.append("--ocr")
+        self._start_project_process(command, project_dir, "create")
 
     def _load_photo_map(self) -> None:
         try:
             records = read_photo_map(self._project_dir() / "photo_map.csv")
         except Exception as exc:
             return self._error(str(exc))
+        self.photo_table.blockSignals(True)
+        self.photo_table.setUpdatesEnabled(False)
         self.photo_table.setRowCount(len(records))
         for row, record in enumerate(records):
             confirmed = QTableWidgetItem()
@@ -212,13 +266,26 @@ class MainWindow(QMainWindow):
             values = (
                 str(record.path), record.well,
                 "" if record.top is None else f"{record.top:g}",
-                "" if record.base is None else f"{record.base:g}", record.source,
+                "" if record.base is None else f"{record.base:g}",
             )
             for column, value in enumerate(values, start=1):
                 item = QTableWidgetItem(value)
-                if column in {1, 5}:
+                if column == 1:
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self.photo_table.setItem(row, column, item)
+            order = QComboBox(self.photo_table)
+            order.addItem("Авто (Верх/Низ/цифры)", COLUMN_ORDER_AUTO)
+            order.addItem("Слева → направо", COLUMN_ORDER_LEFT_TO_RIGHT)
+            order.addItem("Справа → налево", COLUMN_ORDER_RIGHT_TO_LEFT)
+            selected = order.findData(normalize_column_order(record.column_order))
+            order.setCurrentIndex(max(0, selected))
+            order.currentIndexChanged.connect(self._show_matching_preview)
+            self.photo_table.setCellWidget(row, 5, order)
+            source = QTableWidgetItem(record.source)
+            source.setFlags(source.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.photo_table.setItem(row, 6, source)
+        self.photo_table.setUpdatesEnabled(True)
+        self.photo_table.blockSignals(False)
         if records:
             self.photo_table.selectRow(0)
 
@@ -230,21 +297,76 @@ class MainWindow(QMainWindow):
             top = as_float(self.photo_table.item(row, 3).text())
             base = as_float(self.photo_table.item(row, 4).text())
             confirmed = self.photo_table.item(row, 0).checkState() == Qt.CheckState.Checked
+            order_widget = self.photo_table.cellWidget(row, 5)
+            column_order = order_widget.currentData() if isinstance(order_widget, QComboBox) else COLUMN_ORDER_AUTO
             if confirmed and (not well or top is None or base is None or base <= top):
                 return self._error(f"{path.name}: для подтверждения нужны скважина и корректный интервал.")
             records.append(PhotoRecord(
                 path=path, well=well, top=top, base=base,
-                source=self.photo_table.item(row, 5).text().strip() or "manual",
+                source=self.photo_table.item(row, 6).text().strip() or "manual",
                 mapping_confirmed=confirmed,
+                column_order=column_order,
             ))
         try:
             project_dir = self._project_dir()
             write_photo_map(project_dir / "photo_map.csv", records)
-            result = refresh_project(project_dir)
         except Exception as exc:
             return self._error(str(exc))
-        self._show_report(result)
+        self._start_project_process(["refresh", "--project", str(project_dir)], project_dir, "refresh")
+
+    def _start_project_process(self, command: list[str], project_dir: Path, action: str) -> None:
+        if self.project_process and self.project_process.state() != QProcess.ProcessState.NotRunning:
+            return self._error("Сопоставление этой скважины уже выполняется.")
+        self.current_project = project_dir
+        self._pending_project_action = action
+        self.create_button.setEnabled(False)
+        self.recalculate_button.setEnabled(False)
+        self.project_progress.setVisible(True)
+        self.project_log.setPlainText(
+            "Обработка выполняется в отдельном процессе. Окно остаётся доступным; "
+            "скорость зависит от количества и размера фотографий."
+        )
+        arguments = self._with_launcher(command)
+        self.project_process = QProcess(self)
+        self.project_process.setProgram(sys.executable)
+        self.project_process.setArguments(arguments)
+        self.project_process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.project_process.readyReadStandardOutput.connect(self._read_project_output)
+        self.project_process.finished.connect(self._project_finished)
+        self.project_process.start()
+
+    def _read_project_output(self) -> None:
+        if self.project_process:
+            text = bytes(self.project_process.readAllStandardOutput()).decode(errors="replace").strip()
+            if text:
+                self.project_log.append(text)
+
+    def _project_finished(self, code: int, _status) -> None:
+        self._read_project_output()
+        self.create_button.setEnabled(True)
+        self.recalculate_button.setEnabled(True)
+        self.project_progress.setVisible(False)
+        if code != 0:
+            return self._error("Обработка не завершена. Подробности показаны в журнале.")
+        try:
+            project_dir = self._project_dir()
+            report = json.loads((project_dir / "report.json").read_text(encoding="utf-8"))
+        except Exception as exc:
+            return self._error(str(exc))
+        if self._pending_project_action == "create":
+            self.matching_preview_paths.clear()
+            self.matching_preview_details.clear()
+            self.matching_column_orders.clear()
+            self.matching_column_counts.clear()
+            try:
+                register_project(project_dir)
+            except OSError as exc:
+                self.project_log.append(f"Не удалось обновить внутренний каталог: {exc}")
+            self._ensure_training_output_paths()
+        self._show_report(report)
+        self._load_photo_map()
         self._load_review()
+        self._update_catalog_status()
 
     def _show_report(self, report: dict) -> None:
         lines = [
@@ -260,6 +382,10 @@ class MainWindow(QMainWindow):
             lines.append("\nПроверить:")
             lines.extend(f"- {item['source']}: {item['message']}" for item in report["issues"])
         lines.append("\nНеизвестные интервалы исправьте прямо в таблице выше, отметьте OK и нажмите «Пересчитать после исправлений».")
+        lines.append(
+            "Порядок колонок определяется автоматически по отметкам «Верх/Низ» или крайним цифрам. "
+            "Если направление определено неверно, выберите его в таблице вручную и нажмите «Пересчитать»."
+        )
         self.project_log.setPlainText("\n".join(lines))
 
     def _load_review(self) -> None:
@@ -269,6 +395,9 @@ class MainWindow(QMainWindow):
             return self._error(str(exc))
         self.matching_preview_paths.clear()
         self.matching_preview_details.clear()
+        self._load_detected_column_orders()
+        self.review_table.blockSignals(True)
+        self.review_table.setUpdatesEnabled(False)
         self.review_table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             approved = QTableWidgetItem()
@@ -292,6 +421,8 @@ class MainWindow(QMainWindow):
             self.matching_preview_details.setdefault(photo_key, []).append(
                 f"{row['depth_top']}–{row['depth_base']} м: {row['label']}"
             )
+        self.review_table.setUpdatesEnabled(True)
+        self.review_table.blockSignals(False)
         if rows:
             self.review_table.selectRow(0)
         self._select_first_masked_photo()
@@ -305,6 +436,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             return self._error(str(exc))
         self.project_log.append(f"Сохранено подтверждений: {report['approved_annotations']}")
+        self._update_catalog_status()
 
     def _show_preview(self) -> None:
         row = self.review_table.currentRow()
@@ -323,16 +455,61 @@ class MainWindow(QMainWindow):
         photo_key = self._photo_key(photo_path)
         preview_path = self.matching_preview_paths.get(photo_key)
         details = self.matching_preview_details.get(photo_key, [])
+        order_widget = self.photo_table.cellWidget(row, 5)
+        requested_order = order_widget.currentData() if isinstance(order_widget, QComboBox) else COLUMN_ORDER_AUTO
+        effective_order = self.matching_column_orders.get(photo_key)
+        column_count = self.matching_column_counts.get(photo_key)
+        columns_text = f"Колонок керна найдено: {column_count}" if column_count else "Колонки керна ещё не определены"
+        if requested_order == COLUMN_ORDER_AUTO:
+            order_text = (
+                f"Порядок: {self._column_order_label(effective_order)} (определено автоматически)"
+                if effective_order else "Порядок: авто, результат появится после пересчёта"
+            )
+        elif effective_order and effective_order != requested_order:
+            order_text = (
+                f"Выбрано: {self._column_order_label(requested_order)} — "
+                "нажмите «Пересчитать», чтобы обновить маски"
+            )
+        else:
+            order_text = f"Порядок: {self._column_order_label(requested_order)} (задан вручную)"
         if preview_path:
             visible_details = "\n".join(details[:4])
             suffix = f"\nЕщё интервалов: {len(details) - 4}" if len(details) > 4 else ""
             self.matching_preview_title.setText(
-                f"Найдено интервалов: {len(details)}\n{visible_details}{suffix}"
+                f"{columns_text}\n{order_text}\nНайдено интервалов: {len(details)}\n{visible_details}{suffix}"
             )
             self._set_preview_pixmap(self.matching_preview, preview_path, "Не удалось открыть фото с масками.")
         else:
-            self.matching_preview_title.setText("На этом фото совпадающие интервалы пока не найдены.")
+            self.matching_preview_title.setText(
+                f"{columns_text}\n{order_text}\nНа этом фото совпадающие интервалы пока не найдены."
+            )
             self._set_preview_pixmap(self.matching_preview, photo_path, "Не удалось открыть исходную фотографию.")
+
+    def _load_detected_column_orders(self) -> None:
+        self.matching_column_orders.clear()
+        self.matching_column_counts.clear()
+        try:
+            data = json.loads((self._project_dir() / "detected_columns.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError, RuntimeError):
+            return
+        for photo_path, value in data.items():
+            if not isinstance(value, dict) or not value.get("order"):
+                continue
+            try:
+                self.matching_column_orders[self._photo_key(photo_path)] = normalize_column_order(value["order"])
+            except ValueError:
+                continue
+            boxes = value.get("boxes", [])
+            if isinstance(boxes, list) and boxes:
+                self.matching_column_counts[self._photo_key(photo_path)] = len(boxes)
+
+    @staticmethod
+    def _column_order_label(value: str | None) -> str:
+        return {
+            COLUMN_ORDER_LEFT_TO_RIGHT: "слева → направо",
+            COLUMN_ORDER_RIGHT_TO_LEFT: "справа → налево",
+            COLUMN_ORDER_AUTO: "авто",
+        }.get(value, "не определён")
 
     def _select_first_masked_photo(self) -> None:
         for row in range(self.photo_table.rowCount()):
@@ -370,28 +547,53 @@ class MainWindow(QMainWindow):
             self._show_preview()
 
     def _build_dataset(self) -> None:
+        if self.dataset_process and self.dataset_process.state() != QProcess.ProcessState.NotRunning:
+            return self._error("Сборка датасета уже выполняется.")
         try:
-            result = build_dataset(self._project_dir(), self.dataset_output.value())
+            destination = self.dataset_output.value()
+            if not self.dataset_output.edit.text().strip():
+                raise ValueError("Укажите новую папку датасета.")
+            if catalog_summary()["projects"] < 1:
+                raise ValueError("Сначала обработайте хотя бы одну скважину.")
         except Exception as exc:
             return self._error(str(exc))
-        self.train_log.setPlainText(json.dumps({key: value for key, value in result.items() if key != "samples"}, ensure_ascii=False, indent=2))
+        self.dataset_process = QProcess(self)
+        self.dataset_process.setProgram(sys.executable)
+        self.dataset_process.setArguments(self._with_launcher([
+            "dataset", "--catalog", str(default_catalog_path()), "--output", str(destination),
+        ]))
+        self.dataset_process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.dataset_process.readyReadStandardOutput.connect(self._read_dataset_output)
+        self.dataset_process.finished.connect(self._dataset_finished)
+        self.dataset_button.setEnabled(False)
+        self.train_log.setPlainText("Сборка датасета выполняется в отдельном процессе…")
+        self.dataset_process.start()
+
+    def _read_dataset_output(self) -> None:
+        if self.dataset_process:
+            text = bytes(self.dataset_process.readAllStandardOutput()).decode(errors="replace").strip()
+            if text:
+                self.train_log.append(text)
+
+    def _dataset_finished(self, code: int, _status) -> None:
+        self._read_dataset_output()
+        self.dataset_button.setEnabled(True)
+        self.train_log.append(f"\nСборка датасета завершена, код {code}.")
 
     def _start_training(self) -> None:
         if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
             return self._error("Обучение уже запущено.")
         command = [
             "train",
-            "--dataset", str(self.dataset_output.value()), "--base-model", str(self.base_model.value()),
+            "--dataset", str(self.dataset_output.value()),
             "--output", str(self.model_output.value()), "--epochs", str(self.epochs.value()),
             "--patience", str(self.patience.value()),
             "--description-epochs", str(self.description_epochs.value()),
+            "--architecture", str(self.architecture.currentData()),
         ]
-        if not getattr(sys, "frozen", False):
-            launcher = Path(__file__).resolve().parents[2] / "run.py"
-            command.insert(0, str(launcher))
         self.process = QProcess(self)
         self.process.setProgram(sys.executable)
-        self.process.setArguments(command)
+        self.process.setArguments(self._with_launcher(command))
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.process.readyReadStandardOutput.connect(self._read_training_output)
         self.process.finished.connect(self._training_finished)
@@ -404,12 +606,75 @@ class MainWindow(QMainWindow):
 
     def _training_finished(self, code: int, _status) -> None:
         self.train_log.append(f"\nПроцесс завершён, код {code}.")
+        if code == 0:
+            self.analysis_model.set_value(self.model_output.value() / "best.pt")
+
+    def _start_analysis(self) -> None:
+        if self.analysis_process and self.analysis_process.state() != QProcess.ProcessState.NotRunning:
+            return self._error("Анализ уже запущен.")
+        model = self.analysis_model.value()
+        photos = self.analysis_photos.value()
+        output = self.analysis_output.value()
+        if not self.analysis_model.edit.text().strip() or not model.is_file():
+            return self._error("Выберите существующий best.pt, созданный этой системой.")
+        if not self.analysis_photos.edit.text().strip() or not photos.is_dir():
+            return self._error("Выберите папку с фотографиями нового керна.")
+        if not self.analysis_output.edit.text().strip() or output.suffix.lower() != ".xlsx":
+            return self._error("Укажите новый итоговый файл с расширением .xlsx.")
+        command = [
+            "analyze", "--model", str(model), "--photos", str(photos),
+            "--output-excel", str(output),
+            "--confidence", f"{self.analysis_confidence.value() / 100:.2f}",
+        ]
+        self.analysis_process = QProcess(self)
+        self.analysis_process.setProgram(sys.executable)
+        self.analysis_process.setArguments(self._with_launcher(command))
+        self.analysis_process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.analysis_process.readyReadStandardOutput.connect(self._read_analysis_output)
+        self.analysis_process.finished.connect(self._analysis_finished)
+        self.analysis_log.clear()
+        self.analysis_process.start()
+
+    def _read_analysis_output(self) -> None:
+        if self.analysis_process:
+            self.analysis_log.append(bytes(self.analysis_process.readAllStandardOutput()).decode(errors="replace"))
+
+    def _analysis_finished(self, code: int, _status) -> None:
+        self.analysis_log.append(f"\nАнализ завершён, код {code}.")
+
+    @staticmethod
+    def _with_launcher(command: list[str]) -> list[str]:
+        if getattr(sys, "frozen", False):
+            return command
+        launcher = Path(__file__).resolve().parents[2] / "run.py"
+        return [str(launcher), *command]
 
     def _automatic_project_dir(self, excel_path: Path) -> Path:
         local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
         safe_stem = re.sub(r"[^0-9A-Za-zА-Яа-я_-]+", "_", excel_path.stem).strip("_") or "project"
         unique_name = f"{safe_stem}_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:6]}"
         return local_app_data / "ExcelPhotoModelStudio" / "projects" / unique_name
+
+    def _ensure_training_output_paths(self) -> None:
+        if self.dataset_output.edit.text().strip() and self.model_output.edit.text().strip():
+            return
+        local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        run = local_app_data / "ExcelPhotoModelStudio" / "training_runs" / f"run_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:6]}"
+        if not self.dataset_output.edit.text().strip():
+            self.dataset_output.set_value(run / "dataset")
+        if not self.model_output.edit.text().strip():
+            self.model_output.set_value(run / "model")
+
+    def _update_catalog_status(self) -> None:
+        if not hasattr(self, "catalog_status"):
+            return
+        summary = catalog_summary()
+        self.catalog_status.setText(
+            "Внутренняя обучающая база: "
+            f"скважин — {summary['projects']}, фото — {summary['photos']}, "
+            f"масок — {summary['annotations']}, подтверждено — {summary['approved_annotations']}. "
+            "Каждая скважина выбирается отдельно; общая папка не требуется."
+        )
 
     def _project_dir(self) -> Path:
         if self.current_project is None:

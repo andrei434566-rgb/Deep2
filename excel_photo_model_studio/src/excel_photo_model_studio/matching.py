@@ -4,7 +4,7 @@ import csv
 from dataclasses import replace
 from pathlib import Path
 
-from .models import DescriptionRow, Match, PhotoRecord
+from .models import DescriptionRow, Match, PhotoRecord, normalize_column_order
 from .tabular import as_float, well_key
 
 
@@ -25,7 +25,7 @@ def match_photos(records: list[PhotoRecord], rows: list[DescriptionRow]) -> tupl
                 continue
             overlap_top = max(float(photo.top), row.top)
             overlap_base = min(float(photo.base), row.base)
-            if overlap_base - overlap_top > 1e-5:
+            if overlap_base - overlap_top > 1e-9:
                 photo_matches.append(Match(photo, row, overlap_top, overlap_base))
         if photo_matches:
             matches.extend(photo_matches)
@@ -65,13 +65,18 @@ def suggest_missing_intervals(records: list[PhotoRecord], rows: list[Description
 
 def write_photo_map(path: Path, records: list[PhotoRecord]) -> None:
     with Path(path).open("w", encoding="utf-8-sig", newline="") as target:
-        writer = csv.DictWriter(target, fieldnames=("photo", "well", "top", "base", "source", "mapping_confirmed"), delimiter=";")
+        writer = csv.DictWriter(
+            target,
+            fieldnames=("photo", "well", "top", "base", "column_order", "source", "mapping_confirmed"),
+            delimiter=";",
+        )
         writer.writeheader()
         for record in records:
             writer.writerow({
                 "photo": str(record.path), "well": record.well,
                 "top": "" if record.top is None else f"{record.top:.6f}".rstrip("0").rstrip("."),
                 "base": "" if record.base is None else f"{record.base:.6f}".rstrip("0").rstrip("."),
+                "column_order": normalize_column_order(record.column_order),
                 "source": record.source, "mapping_confirmed": "1" if record.mapping_confirmed else "0",
             })
 
@@ -86,5 +91,6 @@ def read_photo_map(path: Path) -> list[PhotoRecord]:
             top=as_float(row.get("top")), base=as_float(row.get("base")),
             source=row.get("source", "manual").strip() or "manual",
             mapping_confirmed=row.get("mapping_confirmed", "").strip().casefold() in {"1", "true", "yes", "да"},
+            column_order=normalize_column_order(row.get("column_order")),
         ))
     return output

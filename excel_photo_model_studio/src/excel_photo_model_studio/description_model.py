@@ -26,11 +26,7 @@ def train_description_model(
     batch_size: int = 8,
     progress: Callable[[str], None] = print,
 ) -> dict:
-    """Train a compact image-to-text head directly on column 22.
-
-    The model is intentionally separate from Ultralytics `best.pt`: YOLO finds
-    intervals/facies, while this checkpoint decodes the free text for column 22.
-    """
+    """Train a compact image-and-facies-to-text head directly on column 22."""
     try:
         import torch
         from torch import nn
@@ -60,6 +56,8 @@ def train_description_model(
     tokens = list(SPECIAL_TOKENS) + characters
     token_to_id = {token: index for index, token in enumerate(tokens)}
     pad_id, bos_id, eos_id, unk_id = (token_to_id[token] for token in SPECIAL_TOKENS)
+    facies_names = sorted({str(row.get("facies", "")).strip() for row in train_rows if str(row.get("facies", "")).strip()})
+    facies_to_id = {name: index + 1 for index, name in enumerate(facies_names)}
 
     class CaptionDataset(Dataset):
         def __init__(self, items: list[dict]):
@@ -76,7 +74,8 @@ def train_description_model(
             sequence = np.full(max_text_length, pad_id, dtype=np.int64)
             sequence[: len(encoded)] = encoded
             image_tensor = torch.from_numpy(image.transpose(2, 0, 1)).float()
-            return image_tensor, torch.from_numpy(sequence)
+            facies_id = facies_to_id.get(str(item.get("facies", "")).strip(), 0)
+            return image_tensor, torch.tensor(facies_id, dtype=torch.long), torch.from_numpy(sequence)
 
     class DescriptionNet(nn.Module):
         def __init__(self):
@@ -86,12 +85,13 @@ def train_description_model(
                 _conv_block(nn, 64, 128), _conv_block(nn, 128, 256),
                 nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten(), nn.Linear(256, hidden_size), nn.Tanh(),
             )
+            self.facies_embedding = nn.Embedding(len(facies_names) + 1, hidden_size)
             self.embedding = nn.Embedding(len(tokens), hidden_size, padding_idx=pad_id)
             self.decoder = nn.GRU(hidden_size, hidden_size, batch_first=True)
             self.output = nn.Linear(hidden_size, len(tokens))
 
-        def forward(self, images, input_tokens):
-            image_state = self.encoder(images).unsqueeze(0)
+        def forward(self, images, facies_ids, input_tokens):
+            image_state = torch.tanh(self.encoder(images) + self.facies_embedding(facies_ids)).unsqueeze(0)
             decoded, _ = self.decoder(self.embedding(input_tokens), image_state)
             return self.output(decoded)
 
@@ -113,11 +113,13 @@ def train_description_model(
             best_epoch = epoch
             stale_epochs = 0
             torch.save({
-                "schema": "excel-photo-description-v1",
+                "schema": "excel-photo-description-v2",
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "model_state": model.state_dict(), "tokens": tokens,
                 "max_text_length": max_text_length, "image_size": image_size,
                 "hidden_size": hidden_size, "target_column": 22,
+                "facies_names": facies_names,
+                "conditioning": ["interval_image", "facies_class"],
                 "target_header": "Краткое описание", "best_epoch": best_epoch,
                 "best_val_loss": best_loss,
                 "train_samples": len(train_rows), "val_samples": len(val_rows),
@@ -135,6 +137,7 @@ def train_description_model(
         "train_samples": len(train_rows), "val_samples": len(val_rows),
         "best_epoch": best_epoch, "best_val_loss": best_loss,
         "device": str(device), "max_text_length": max_text_length,
+        "facies_classes": facies_names,
         "warning": "Модель формирует текст только по визуально различимым признакам; факты, не видимые на фото, требуют проверки геолога.",
     }
     (output_dir / "description_training_info.json").write_text(
@@ -143,7 +146,7 @@ def train_description_model(
     return info
 
 
-def generate_description(model_path: Path, image_path: Path) -> str:
+def generate_description(model_path: Path, image_path: Path, facies: str = "") -> str:
     """Generate a column-22 draft from one already segmented interval crop."""
     try:
         import torch
@@ -151,13 +154,16 @@ def generate_description(model_path: Path, image_path: Path) -> str:
     except ImportError as exc:
         raise RuntimeError("Для применения модели установите PyTorch.") from exc
     checkpoint = torch.load(Path(model_path), map_location="cpu", weights_only=False)
-    if checkpoint.get("schema") != "excel-photo-description-v1":
+    schema = checkpoint.get("schema")
+    if schema not in {"excel-photo-description-v1", "excel-photo-description-v2"}:
         raise ValueError("Неизвестный формат модели описания.")
     tokens = checkpoint["tokens"]
     token_to_id = {token: index for index, token in enumerate(tokens)}
     pad_id, bos_id, eos_id = (token_to_id[token] for token in SPECIAL_TOKENS[:3])
     hidden_size = int(checkpoint["hidden_size"])
     image_size = int(checkpoint["image_size"])
+    facies_names = list(checkpoint.get("facies_names", []))
+    facies_to_id = {name: index + 1 for index, name in enumerate(facies_names)}
 
     class DescriptionNet(nn.Module):
         def __init__(self):
@@ -167,6 +173,8 @@ def generate_description(model_path: Path, image_path: Path) -> str:
                 _conv_block(nn, 64, 128), _conv_block(nn, 128, 256),
                 nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten(), nn.Linear(256, hidden_size), nn.Tanh(),
             )
+            if schema == "excel-photo-description-v2":
+                self.facies_embedding = nn.Embedding(len(facies_names) + 1, hidden_size)
             self.embedding = nn.Embedding(len(tokens), hidden_size, padding_idx=pad_id)
             self.decoder = nn.GRU(hidden_size, hidden_size, batch_first=True)
             self.output = nn.Linear(hidden_size, len(tokens))
@@ -176,7 +184,11 @@ def generate_description(model_path: Path, image_path: Path) -> str:
     model.eval()
     image = torch.from_numpy(_read_crop(Path(image_path), image_size).transpose(2, 0, 1)).float().unsqueeze(0)
     with torch.no_grad():
-        state = model.encoder(image).unsqueeze(0)
+        image_state = model.encoder(image)
+        if schema == "excel-photo-description-v2":
+            facies_id = torch.tensor([facies_to_id.get(str(facies).strip(), 0)], dtype=torch.long)
+            image_state = torch.tanh(image_state + model.facies_embedding(facies_id))
+        state = image_state.unsqueeze(0)
         current = torch.tensor([[bos_id]], dtype=torch.long)
         output = []
         for _ in range(int(checkpoint["max_text_length"]) - 1):
@@ -206,11 +218,13 @@ def _run_epoch(torch, model, loader, criterion, device, optimizer):
     total_items = 0
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
-        for images, sequence in loader:
-            images, sequence = images.to(device), sequence.to(device)
+        for images, facies_ids, sequence in loader:
+            images = images.to(device)
+            facies_ids = facies_ids.to(device)
+            sequence = sequence.to(device)
             if training:
                 optimizer.zero_grad(set_to_none=True)
-            logits = model(images, sequence[:, :-1])
+            logits = model(images, facies_ids, sequence[:, :-1])
             loss = criterion(logits.reshape(-1, logits.shape[-1]), sequence[:, 1:].reshape(-1))
             if training:
                 loss.backward()

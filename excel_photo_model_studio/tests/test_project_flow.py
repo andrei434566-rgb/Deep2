@@ -4,13 +4,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
 from openpyxl import Workbook
 
 from excel_photo_model_studio.dataset import build_dataset
-from excel_photo_model_studio.project import create_project, load_annotations, set_annotation_approvals
+from excel_photo_model_studio.project import create_project, load_annotations, refresh_project, set_annotation_approvals
 
 
 class ProjectFlowTests(unittest.TestCase):
@@ -34,6 +35,12 @@ class ProjectFlowTests(unittest.TestCase):
                 (photos / f"{well} 100-102.jpg").write_bytes(encoded.tobytes())
 
             report = create_project(excel, photos, root / "project")
+            self.assertTrue((root / "project" / "table_cache.json").is_file())
+            with patch(
+                "excel_photo_model_studio.project.read_many_tables",
+                side_effect=AssertionError("unchanged Excel must be loaded from the project cache"),
+            ):
+                refresh_project(root / "project")
             annotations = load_annotations(root / "project")
             self.assertEqual(2, report["confirmed_photos"])
             self.assertGreaterEqual(len(annotations), 2)

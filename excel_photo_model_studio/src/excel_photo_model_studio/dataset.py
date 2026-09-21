@@ -3,21 +3,34 @@ from __future__ import annotations
 import hashlib
 import csv
 import json
-import shutil
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
+from typing import Iterable
 
 import cv2
 import numpy as np
 
-def build_dataset(project_dir: Path, destination: Path) -> dict:
-    project_dir = Path(project_dir).expanduser().resolve(strict=True)
+def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict:
+    raw_projects = [project_dir] if isinstance(project_dir, (str, Path)) else list(project_dir)
+    project_dirs = [Path(value).expanduser().resolve(strict=True) for value in raw_projects]
+    if not project_dirs:
+        raise ValueError("В обучающем каталоге пока нет обработанных скважин.")
     destination = Path(destination).expanduser().absolute()
     if destination.exists():
         raise FileExistsError(f"Папка датасета уже существует: {destination}")
-    with (project_dir / "annotations.csv").open("r", encoding="utf-8-sig", newline="") as source:
-        rows = [row for row in csv.DictReader(source, delimiter=";") if row.get("approved") == "1"]
+    rows = []
+    seen_annotations = set()
+    for current_project in project_dirs:
+        with (current_project / "annotations.csv").open("r", encoding="utf-8-sig", newline="") as source:
+            for row in csv.DictReader(source, delimiter=";"):
+                if row.get("approved") != "1":
+                    continue
+                key = (row.get("photo", ""), row.get("annotation_id", ""))
+                if key in seen_annotations:
+                    continue
+                seen_annotations.add(key)
+                rows.append(row)
     if not rows:
         raise ValueError("Нет подтверждённых масок. Проверьте previews и подтвердите строки в приложении.")
     by_photo: dict[str, list[dict[str, str]]] = defaultdict(list)
@@ -40,12 +53,13 @@ def build_dataset(project_dir: Path, destination: Path) -> dict:
     for photo_index, (photo_name, annotations) in enumerate(sorted(by_photo.items()), start=1):
         photo = Path(photo_name).resolve(strict=True)
         split = split_by_photo[photo_name]
-        digest = hashlib.sha256(photo.read_bytes()).hexdigest()
+        photo_bytes = photo.read_bytes()
+        digest = hashlib.sha256(photo_bytes).hexdigest()
         stem = f"sample_{photo_index:06d}_{digest[:10]}"
         target_image = destination / "images" / split / f"{stem}{photo.suffix.lower()}"
-        shutil.copy2(photo, target_image)
+        target_image.write_bytes(photo_bytes)
         lines = []
-        source_image = cv2.imdecode(np.frombuffer(photo.read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
+        source_image = cv2.imdecode(np.frombuffer(photo_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
         if source_image is None:
             raise ValueError(f"Не удалось декодировать подтверждённое фото: {photo}")
         for annotation_index, row in enumerate(annotations, start=1):
@@ -77,6 +91,7 @@ def build_dataset(project_dir: Path, destination: Path) -> dict:
                     "well": row.get("well", ""), "depth_top": float(row["depth_top"]),
                     "depth_base": float(row["depth_base"]), "facies": row["label"],
                     "association": row.get("association", ""), "environment": row.get("environment", ""),
+                    "field_name": row.get("field_name", ""),
                     "target_text": target_text, "source_file": row.get("source_file", ""),
                     "source_sheet": row.get("source_sheet", ""), "source_row": row.get("source_row", ""),
                 })
@@ -100,7 +115,9 @@ def build_dataset(project_dir: Path, destination: Path) -> dict:
     )), encoding="utf-8")
     manifest = {
         "schema": "excel-photo-yolo-seg-v1", "created_at": datetime.now().isoformat(timespec="seconds"),
-        "project": str(project_dir), "data_yaml": str(yaml_path), "class_names": labels,
+        "project": str(project_dirs[0]) if len(project_dirs) == 1 else "",
+        "projects": [str(path) for path in project_dirs], "project_count": len(project_dirs),
+        "data_yaml": str(yaml_path), "class_names": labels,
         "photo_count": len(by_photo), "annotation_count": len(rows), "split_strategy": strategy,
         "caption_count": len(caption_samples),
         "train_caption_count": sum(item["split"] == "train" for item in caption_samples),

@@ -10,12 +10,27 @@ import cv2
 import numpy as np
 
 from excel_photo_model_studio.dataset import build_dataset
-from excel_photo_model_studio.matching import match_photos
-from excel_photo_model_studio.models import DescriptionRow, PhotoRecord
+from excel_photo_model_studio.matching import match_photos, read_photo_map, write_photo_map
+from excel_photo_model_studio.models import (
+    COLUMN_ORDER_RIGHT_TO_LEFT, DescriptionRow, PhotoRecord,
+)
 from excel_photo_model_studio.photos import parse_filename
 
 
 class MatchingTests(unittest.TestCase):
+    def test_photo_map_preserves_column_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "photo_map.csv"
+            record = PhotoRecord(
+                Path(directory) / "photo.jpg", "W-1", 100.0, 101.0,
+                "manual", True, COLUMN_ORDER_RIGHT_TO_LEFT,
+            )
+            write_photo_map(path, [record])
+
+            loaded = read_photo_map(path)
+
+        self.assertEqual(COLUMN_ORDER_RIGHT_TO_LEFT, loaded[0].column_order)
+
     def test_filename_and_overlap_matching(self):
         photo = parse_filename(Path("Р-31 3002,00–3004,96 (1).jpg"))
         rows = [

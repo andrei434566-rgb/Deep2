@@ -263,22 +263,30 @@ def _read_sheets(path: Path) -> list[tuple[str, list[list[Any]]]]:
         from openpyxl import load_workbook
     except ImportError as exc:
         raise RuntimeError("Для Excel установите openpyxl>=3.1.") from exc
-    book = load_workbook(path, read_only=False, data_only=True)
+    book = load_workbook(path, read_only=False, data_only=True, keep_links=False)
     result: list[tuple[str, list[list[Any]]]] = []
-    for sheet in book.worksheets:
-        rows: list[list[Any]] = []
-        for row_index in range(1, sheet.max_row + 1):
-            values: list[Any] = []
-            for column in range(1, sheet.max_column + 1):
-                value = sheet.cell(row_index, column).value
-                if value is None:
-                    for merged in sheet.merged_cells.ranges:
-                        if merged.min_row <= row_index <= merged.max_row and merged.min_col <= column <= merged.max_col:
-                            value = sheet.cell(merged.min_row, merged.min_col).value
-                            break
-                values.append(value)
-            rows.append(values)
-        result.append((sheet.title, rows))
+    try:
+        for sheet in book.worksheets:
+            merged_values: dict[tuple[int, int], Any] = {}
+            for merged in sheet.merged_cells.ranges:
+                value = sheet.cell(merged.min_row, merged.min_col).value
+                for row_index in range(merged.min_row, merged.max_row + 1):
+                    for column_index in range(merged.min_col, merged.max_col + 1):
+                        merged_values[(row_index, column_index)] = value
+            rows: list[list[Any]] = []
+            for row_index, source_row in enumerate(sheet.iter_rows(values_only=True), start=1):
+                values = [
+                    value if value is not None else merged_values.get((row_index, column_index))
+                    for column_index, value in enumerate(source_row, start=1)
+                ]
+                while values and values[-1] is None:
+                    values.pop()
+                rows.append(values)
+            while rows and not any(value is not None for value in rows[-1]):
+                rows.pop()
+            result.append((sheet.title, rows))
+    finally:
+        book.close()
     return result
 
 

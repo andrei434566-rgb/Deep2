@@ -49,6 +49,10 @@ class GuiPreviewTests(unittest.TestCase):
             self.application.processEvents()
 
             self.assertEqual(1, window.photo_table.rowCount())
+            self.assertEqual("yolo11n-seg.yaml", window.architecture.currentData())
+            self.assertEqual("auto", window.photo_table.cellWidget(0, 5).currentData())
+            self.assertIn("Колонок керна найдено: 1", window.matching_preview_title.text())
+            self.assertIn("Порядок:", window.matching_preview_title.text())
             self.assertIn("Найдено интервалов", window.matching_preview_title.text())
             self.assertIsNotNone(window.matching_preview.pixmap())
             self.assertFalse(window.matching_preview.pixmap().isNull())
