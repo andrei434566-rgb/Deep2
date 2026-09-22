@@ -49,34 +49,80 @@ def detect_core_columns(image: np.ndarray) -> list[tuple[int, int, int, int]]:
             )
             for left, top, right, bottom in reduced_boxes
         ]
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    candidate = (hsv[:, :, 1] < 70) & (hsv[:, :, 2] < 235)
+    candidate = _core_candidate_mask(image)
 
+    # Projection must be attempted before connected components. Horizontal
+    # depth lines often connect every real core column into one very wide
+    # component, while the narrow ruler remains separate and used to be
+    # returned as the only "core" object.
+    projection_boxes = _projection_core_boxes(candidate)
     component_boxes = _core_component_boxes(candidate)
-    if component_boxes:
-        return _filter_width_outliers(_deduplicate(component_boxes))
+    combined_boxes = list(projection_boxes)
+    for component_box in component_boxes:
+        if any(_same_horizontal_lane(component_box, projected) for projected in projection_boxes):
+            continue
+        combined_boxes.append(component_box)
+    selected = _select_core_boxes(combined_boxes, candidate)
+    if selected:
+        return selected
 
-    column_score = _smooth(candidate.mean(axis=0).astype(np.float32), 7)
-    active_columns = column_score >= 0.48
-    min_width = max(10, int(width * 0.018))
+    fallback_boxes = _fallback_component_boxes(candidate.astype(np.uint8) * 255)
+    return _select_core_boxes(fallback_boxes, candidate)
+
+
+def _core_candidate_mask(image: np.ndarray) -> np.ndarray:
+    """Separate core material from a pale document page or a coloured tray."""
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    pale_page_fraction = float(((saturation < 45) & (value > 235)).mean())
+    if pale_page_fraction >= 0.20:
+        # Scanned reports can contain almost-white sandstone (V=240..250).
+        # A fixed V<235 threshold discarded it and left only the black ruler.
+        page_level = float(np.quantile(value, 0.90))
+        value_limit = int(np.clip(round(page_level - 3.0), 232, 252))
+        return value < value_limit
+    return (saturation < 95) & (value < 238)
+
+
+def _projection_core_boxes(candidate: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Find filled vertical lanes, including one short or partial core lane."""
+    height, width = candidate.shape
+    vertical_start = max(0, int(height * 0.035))
+    vertical_end = min(height, max(vertical_start + 1, int(height * 0.92)))
+    work = candidate[vertical_start:vertical_end]
+    column_score = _smooth(work.mean(axis=0).astype(np.float32), 7)
+    background = float(np.quantile(column_score, 0.35))
+    high = float(np.quantile(column_score, 0.95))
+    threshold = float(np.clip(background + (high - background) * 0.34, 0.16, 0.46))
+    active_columns = column_score >= threshold
+    min_width = max(12, int(width * 0.026))
     boxes: list[tuple[int, int, int, int]] = []
     for left, right in _runs(active_columns):
-        if right - left < min_width or right - left > width * 0.30:
+        # A cropped photograph may contain only one core lane occupying much of
+        # the frame; page-style reports still produce separate narrow x-runs.
+        if right - left < min_width or right - left > width * 0.72:
             continue
         row_score = _smooth(candidate[:, left:right].mean(axis=1).astype(np.float32), 15)
-        row_runs = _runs(row_score >= 0.24)
+        active_rows = (row_score >= 0.20).astype(np.uint8)
+        # Join modest blank breaks inside a physical column without stretching
+        # the result over captions above and below the photographed core.
+        join_gap = max(5, int(height * 0.025))
+        active_rows = cv2.morphologyEx(
+            active_rows.reshape(-1, 1), cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (1, join_gap)),
+        ).reshape(-1).astype(bool)
+        row_runs = _runs(active_rows)
         if not row_runs:
             continue
         top, bottom = max(row_runs, key=lambda run: run[1] - run[0])
-        if bottom - top < height * 0.25:
+        if bottom - top < max(35, height * 0.10):
             continue
         boxes.append((
             max(0, left - 1), max(0, top - 1),
             min(width, right + 1), min(height, bottom + 1),
         ))
-    if boxes:
-        return _filter_width_outliers(_deduplicate(boxes))
-    return _filter_width_outliers(_deduplicate(_fallback_component_boxes(candidate.astype(np.uint8) * 255)))
+    return boxes
 
 
 def _core_component_boxes(candidate: np.ndarray) -> list[tuple[int, int, int, int]]:
@@ -96,12 +142,12 @@ def _core_component_boxes(candidate: np.ndarray) -> list[tuple[int, int, int, in
         center_x = left + box_width / 2
         filled_fraction = area / max(1, box_width * box_height)
         if (
-            box_width >= max(10, int(width * 0.018))
+            box_width >= max(12, int(width * 0.026))
             and box_width <= width * 0.30
-            and box_height >= max(50, int(height * 0.012))
-            and 0.70 <= aspect <= 35.0
+            and box_height >= max(40, int(height * 0.08))
+            and 1.00 <= aspect <= 35.0
             and filled_fraction >= 0.15
-            and width * 0.08 < center_x < width * 0.92
+            and width * 0.06 < center_x < width * 0.94
             and top < height * 0.75
         ):
             boxes.append((left, top, left + box_width, top + box_height))
@@ -122,10 +168,10 @@ def _fallback_component_boxes(candidate: np.ndarray) -> list[tuple[int, int, int
         left, top, box_width, box_height, area = (int(value) for value in stats[component])
         aspect = box_height / max(box_width, 1)
         if (
-            box_width >= max(10, int(width * 0.018))
+            box_width >= max(12, int(width * 0.026))
             and box_width <= width * 0.30
-            and box_height >= height * 0.25
-            and 2.0 <= aspect <= 35.0
+            and box_height >= height * 0.10
+            and 1.0 <= aspect <= 35.0
             and area >= box_width * box_height * 0.20
         ):
             boxes.append((left, top, left + box_width, top + box_height))
@@ -413,6 +459,47 @@ def _deduplicate(boxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int,
             continue
         result.append(box)
     return sorted(result, key=lambda item: (item[0], item[1]))
+
+
+def _same_horizontal_lane(
+    first: tuple[int, int, int, int], second: tuple[int, int, int, int],
+) -> bool:
+    overlap = min(first[2], second[2]) - max(first[0], second[0])
+    return overlap >= min(first[2] - first[0], second[2] - second[0]) * 0.58
+
+
+def _select_core_boxes(
+    boxes: list[tuple[int, int, int, int]], candidate: np.ndarray,
+) -> list[tuple[int, int, int, int]]:
+    """Reject rulers and captions without requiring several core columns."""
+    height, width = candidate.shape
+    plausible: list[tuple[int, int, int, int]] = []
+    for box in _deduplicate(boxes):
+        left, top, right, bottom = box
+        box_width, box_height = right - left, bottom - top
+        if box_width < max(12, int(width * 0.026)) or box_height < max(35, int(height * 0.10)):
+            continue
+        center_x = (left + right) / 2.0
+        if not width * 0.04 < center_x < width * 0.96:
+            continue
+        region = candidate[max(0, top):min(height, bottom), max(0, left):min(width, right)]
+        if region.size == 0:
+            continue
+        fill = float(region.mean())
+        dense_rows = float((region.mean(axis=1) >= 0.35).mean())
+        dense_columns = float((region.mean(axis=0) >= 0.22).mean())
+        if fill < 0.12 or dense_rows < 0.16 or dense_columns < 0.22:
+            continue
+
+        narrow = box_width < width * 0.075
+        near_page_edge = center_x < width * 0.20 or center_x > width * 0.93
+        sparse_scale = fill < 0.48 or dense_rows < 0.45 or dense_columns < 0.55
+        if narrow and near_page_edge and sparse_scale:
+            continue
+        if box_width < width * 0.045 and fill < 0.45:
+            continue
+        plausible.append(box)
+    return _filter_width_outliers(plausible)
 
 
 def _filter_width_outliers(boxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:

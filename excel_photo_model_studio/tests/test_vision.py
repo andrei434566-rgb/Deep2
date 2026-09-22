@@ -83,6 +83,53 @@ class VisionTests(unittest.TestCase):
         self.assertEqual(3, len(boxes))
         self.assertTrue(all(right - left >= 80 for left, _, right, _ in boxes))
 
+    def test_detects_pale_report_columns_instead_of_left_depth_ruler(self):
+        image = np.full((1200, 1000, 3), 255, dtype=np.uint8)
+        cv2.line(image, (105, 110), (105, 1030), (40, 40, 40), 3)
+        for y in range(120, 1030, 18):
+            cv2.line(image, (105, y), (138 if y % 90 else 160, y), (50, 50, 50), 2)
+        expected_lefts = (270, 420, 570, 720)
+        for index, left in enumerate(expected_lefts):
+            cv2.rectangle(image, (left, 150), (left + 92, 1040), (247, 247, 247), -1)
+            for y in range(185 + index * 7, 1020, 73):
+                cv2.line(image, (left, y), (left + 91, y + 12), (185, 185, 185), 2)
+        # Printed depth grid lines connect the physical columns in a component
+        # image, which is the layout that previously left only the ruler.
+        for y in range(250, 1000, 180):
+            cv2.line(image, (145, y), (900, y), (80, 80, 80), 2)
+
+        boxes = detect_core_columns(image)
+
+        self.assertEqual(4, len(boxes))
+        self.assertTrue(all(left > 230 for left, _, _, _ in boxes))
+        self.assertTrue(all(right - left >= 80 for left, _, right, _ in boxes))
+
+    def test_detects_one_short_partial_core_but_not_the_ruler(self):
+        image = np.full((900, 700, 3), 255, dtype=np.uint8)
+        cv2.line(image, (75, 90), (75, 800), (30, 30, 30), 3)
+        for y in range(100, 800, 16):
+            cv2.line(image, (75, y), (112, y), (60, 60, 60), 2)
+        cv2.rectangle(image, (315, 390), (440, 690), (246, 246, 246), -1)
+        for y in range(410, 680, 35):
+            cv2.line(image, (315, y), (440, y + 8), (175, 175, 175), 2)
+
+        boxes = detect_core_columns(image)
+
+        self.assertEqual(1, len(boxes))
+        left, top, right, bottom = boxes[0]
+        self.assertGreater(left, 280)
+        self.assertLess(top, 420)
+        self.assertGreater(right, 420)
+        self.assertGreater(bottom - top, 250)
+
+    def test_does_not_treat_a_depth_ruler_as_a_single_core(self):
+        image = np.full((900, 700, 3), 255, dtype=np.uint8)
+        cv2.line(image, (75, 90), (75, 800), (30, 30, 30), 3)
+        for y in range(100, 800, 16):
+            cv2.line(image, (75, y), (112, y), (60, 60, 60), 2)
+
+        self.assertEqual([], detect_core_columns(image))
+
     def test_calibrates_depth_inside_each_detected_column(self):
         columns = [(10, 20, 50, 120), (70, 20, 110, 220), (130, 20, 170, 120)]
 
