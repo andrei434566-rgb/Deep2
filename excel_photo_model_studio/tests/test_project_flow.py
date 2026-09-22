@@ -23,9 +23,9 @@ class ProjectFlowTests(unittest.TestCase):
             photos.mkdir()
             workbook = Workbook()
             sheet = workbook.active
-            sheet.append(["Скважина", "Кровля", "Подошва", "Класс"])
-            sheet.append(["W-1", 100.0, 102.0, "Sand"])
-            sheet.append(["W-2", 100.0, 102.0, "Sand"])
+            sheet.append(["Скважина", "Кровля", "Подошва", "Класс", "Краткое описание"])
+            sheet.append(["W-1", 100.0, 102.0, "Sand", "Описание песчаника."])
+            sheet.append(["W-2", 100.0, 102.0, "Sand", "Описание песчаника."])
             workbook.save(excel)
             for well in ("W-1", "W-2"):
                 image = np.full((240, 160, 3), (20, 80, 150), dtype=np.uint8)
@@ -45,6 +45,10 @@ class ProjectFlowTests(unittest.TestCase):
                 refresh_project(root / "project")
             annotations = load_annotations(root / "project")
             self.assertEqual(2, report["confirmed_photos"])
+            self.assertEqual(0, report["photos_without_intervals"])
+            self.assertEqual(0, report["photos_without_core_columns"])
+            self.assertEqual(0, report["uncovered_facies_intervals"])
+            self.assertEqual(0, report["uncovered_description_intervals"])
             self.assertGreaterEqual(len(annotations), 2)
             set_annotation_approvals(
                 root / "project", {row["annotation_id"]: True for row in annotations}

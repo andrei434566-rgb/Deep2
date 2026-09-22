@@ -25,11 +25,11 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
         report_path = current_project / "report.json"
         if report_path.is_file():
             report = json.loads(report_path.read_text(encoding="utf-8"))
-            uncovered = int(report.get("uncovered_facies_intervals", 0) or 0)
-            if uncovered:
+            blockers = _report_blockers(report)
+            if blockers:
                 raise ValueError(
-                    f"{current_project.name}: найдено непокрытых фациями участков — {uncovered}. "
-                    "Исправьте последовательность фото/интервалы и пересчитайте проект до сборки датасета."
+                    f"{current_project.name}: датасет заблокирован: " + "; ".join(blockers)
+                    + ". Исправьте сопоставление и пересчитайте проект."
                 )
         with (current_project / "annotations.csv").open("r", encoding="utf-8-sig", newline="") as source:
             for row in csv.DictReader(source, delimiter=";"):
@@ -148,8 +148,61 @@ def _validate_annotation(row: dict[str, str]) -> None:
         raise ValueError(f"Повреждена маска {row.get('annotation_id', '')}.") from exc
     if not row.get("label", "").strip() or len(polygon) < 3 or width < 2 or height < 2:
         raise ValueError(f"Некорректная подтверждённая маска {row.get('annotation_id', '')}.")
+    if not row.get("target_text", "").strip():
+        raise ValueError(
+            f"У подтверждённой маски {row.get('annotation_id', '')} нет обязательного краткого описания."
+        )
     if any(len(point) != 2 or not (0 <= float(point[0]) <= width and 0 <= float(point[1]) <= height) for point in polygon):
         raise ValueError(f"Маска выходит за границы фото: {row.get('annotation_id', '')}.")
+
+
+def _report_blockers(report: dict) -> list[str]:
+    values = (
+        (
+            "photos_without_intervals",
+            int(report.get("photos_without_intervals", report.get("unconfirmed_photos", 0)) or 0),
+            "фото без обязательного интервала",
+        ),
+        (
+            "photos_without_core_columns",
+            int(report.get("photos_without_core_columns", 0) or 0),
+            "фото без распознанного керна",
+        ),
+        (
+            "uncovered_facies_intervals",
+            int(report.get("uncovered_facies_intervals", 0) or 0),
+            "участков керна без фации",
+        ),
+        (
+            "uncovered_description_intervals",
+            int(report.get("uncovered_description_intervals", 0) or 0),
+            "участков керна без краткого описания",
+        ),
+        (
+            "uncovered_excel_core_intervals",
+            int(report.get("uncovered_excel_core_intervals", 0) or 0),
+            "интервалов керна Excel без фотографии",
+        ),
+        (
+            "facies_rows_without_description",
+            int(report.get("facies_rows_without_description", 0) or 0),
+            "строк фаций без краткого описания",
+        ),
+        (
+            "invalid_thickness_rows",
+            int(report.get("invalid_thickness_rows", 0) or 0),
+            "строк с ошибкой толщины фации",
+        ),
+    )
+    blockers = [f"{label}: {count}" for _key, count, label in values if count]
+    annotations = int(report.get("annotations", 0) or 0)
+    approved = int(report.get("approved_annotations", 0) or 0)
+    if annotations and approved < annotations:
+        blockers.append(f"неподтверждённых масок: {annotations - approved}")
+    blocking_errors = int(report.get("blocking_errors", 0) or 0)
+    if blocking_errors and not blockers:
+        blockers.append(f"других критических ошибок проекта: {blocking_errors}")
+    return blockers
 
 
 def _split_sources(by_photo: dict[str, list[dict[str, str]]]) -> tuple[dict[str, str], str]:

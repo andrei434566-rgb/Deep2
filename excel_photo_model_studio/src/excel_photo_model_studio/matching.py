@@ -10,6 +10,12 @@ from .models import DescriptionRow, Match, PhotoRecord, normalize_column_order
 from .tabular import as_float, well_key
 
 
+_AUTOMATIC_SEQUENCE_SOURCES = {
+    "not_found", "ocr", "ocr_not_found", "ocr_unavailable", "ocr_verified",
+    "ocr_sequenced", "ocr_columns_not_found", "excel_suggestion", "excel_sequenced",
+}
+
+
 def match_photos(records: list[PhotoRecord], rows: list[DescriptionRow]) -> tuple[list[Match], list[PhotoRecord]]:
     wells = {well_key(row.well) for row in rows if well_key(row.well)}
     matches: list[Match] = []
@@ -56,6 +62,13 @@ def suggest_missing_intervals(records: list[PhotoRecord], rows: list[Description
         well = _resolve_well(record, canonical_wells, single_well)
         updated = replace(record, well=well) if well != record.well else record
         result.append(updated)
+
+    # A failed caption OCR must not remove an otherwise valid page from the
+    # well. When the selected folder contains the complete photographed core,
+    # pack every page into the ordered core-sampling ranges from Excel. OCR
+    # pages and already sequenced pages are used as anchors, while missing
+    # pages before, between and after them inherit exact centimetre depths.
+    result = _sequence_complete_wells(result, rows)
 
     # OCR intentionally reads the full core-sampling interval from the caption.
     # Several consecutive report pages therefore carry the same range. Split
@@ -119,6 +132,116 @@ def suggest_missing_intervals(records: list[PhotoRecord], rows: list[Description
         for index, item in zip(unresolved, available):
             result[index] = replace(result[index], well=item[0], top=item[1], base=item[2], source="excel_suggestion")
     return sort_photo_records(result)
+
+
+def _sequence_complete_wells(
+    records: list[PhotoRecord], rows: list[DescriptionRow],
+) -> list[PhotoRecord]:
+    result = list(records)
+    record_groups: dict[str, list[int]] = {}
+    for index, record in enumerate(result):
+        key = well_key(record.well)
+        if key:
+            record_groups.setdefault(key, []).append(index)
+
+    for key, indices in record_groups.items():
+        ordered_indices = sorted(indices, key=lambda index: _natural_name_key(result[index].path.name))
+        ordered_records = [result[index] for index in ordered_indices]
+        if not ordered_records or any(
+            record.source not in _AUTOMATIC_SEQUENCE_SOURCES for record in ordered_records
+        ):
+            # Filename and manually entered intervals are authoritative and
+            # must never be silently replaced by the full-well sequencer.
+            continue
+        core_intervals = _core_intervals_for_well(rows, key)
+        if not core_intervals:
+            continue
+        capacities = [_photo_core_capacity_cm(record.path) for record in ordered_records]
+        if any(capacity <= 0 for capacity in capacities):
+            continue
+        plan = _pack_complete_core_intervals(capacities, core_intervals)
+        if plan is None or not _sequence_matches_anchors(ordered_records, rows, plan):
+            continue
+        for result_index, record, (top_cm, base_cm, _core_index) in zip(
+            ordered_indices, ordered_records, plan,
+        ):
+            result[result_index] = replace(
+                record,
+                top=centimeters_to_meters(top_cm),
+                base=centimeters_to_meters(base_cm),
+                source="excel_sequenced",
+                mapping_confirmed=True,
+            )
+    return result
+
+
+def _core_intervals_for_well(
+    rows: list[DescriptionRow], target_well: str,
+) -> list[tuple[int, int]]:
+    intervals = {
+        (meters_to_centimeters(row.core_top), meters_to_centimeters(row.core_base))
+        for row in rows
+        if well_key(row.well) == target_well
+        and row.core_top is not None
+        and row.core_base is not None
+        and row.core_base > row.core_top
+    }
+    return sorted(intervals)
+
+
+def _pack_complete_core_intervals(
+    capacities: list[int], core_intervals: list[tuple[int, int]],
+) -> list[tuple[int, int, int]] | None:
+    """Pack one natural photo sequence over every Excel core range.
+
+    A page never stretches across a no-core gap between two sampling ranges.
+    The last page of a range may therefore be shorter than its detected full
+    capacity. The plan is accepted only when all photos and all Excel core
+    ranges are consumed, which prevents a partial folder from being assigned
+    confidently but incorrectly.
+    """
+    if not capacities or not core_intervals:
+        return None
+    plan: list[tuple[int, int, int]] = []
+    core_index = 0
+    cursor_cm = core_intervals[0][0]
+    for capacity_cm in capacities:
+        if core_index >= len(core_intervals):
+            return None
+        core_top_cm, core_base_cm = core_intervals[core_index]
+        cursor_cm = max(cursor_cm, core_top_cm)
+        page_base_cm = min(core_base_cm, cursor_cm + capacity_cm)
+        if page_base_cm <= cursor_cm:
+            return None
+        plan.append((cursor_cm, page_base_cm, core_index))
+        if page_base_cm >= core_base_cm:
+            core_index += 1
+            if core_index < len(core_intervals):
+                cursor_cm = core_intervals[core_index][0]
+        else:
+            cursor_cm = page_base_cm
+    if core_index != len(core_intervals):
+        return None
+    return plan
+
+
+def _sequence_matches_anchors(
+    records: list[PhotoRecord], rows: list[DescriptionRow],
+    plan: list[tuple[int, int, int]],
+) -> bool:
+    """Reject a full-well plan if it contradicts a trustworthy OCR anchor."""
+    core_intervals = _core_intervals_for_well(rows, well_key(records[0].well))
+    for record, (top_cm, base_cm, core_index) in zip(records, plan):
+        if record.source in {"ocr", "ocr_verified"} and record.has_interval:
+            canonical = _matching_core_interval(record, rows)
+            if canonical is not None and canonical != core_intervals[core_index]:
+                return False
+        if record.source == "ocr_sequenced" and record.has_interval:
+            old_top_cm = meters_to_centimeters(record.top)
+            old_base_cm = meters_to_centimeters(record.base)
+            if abs(old_top_cm - top_cm) > 2 or abs(old_base_cm - base_cm) > 2:
+                return False
+    return True
 
 
 def _resolve_well(record: PhotoRecord, canonical_wells: dict[str, str], single_well: str) -> str:
@@ -188,6 +311,22 @@ def _natural_name_key(value: str) -> tuple[tuple[int, object], ...]:
 
 def uncovered_photo_intervals(photo: PhotoRecord, matches: list[Match]) -> list[tuple[float, float]]:
     """Return centimetre-exact gaps not covered by a valid Excel facies row."""
+    return _uncovered_photo_intervals(photo, matches)
+
+
+def uncovered_photo_description_intervals(
+    photo: PhotoRecord, matches: list[Match],
+) -> list[tuple[float, float]]:
+    """Return core gaps not covered by a facies with a short description."""
+    return _uncovered_photo_intervals(
+        photo,
+        [item for item in matches if item.description.target_text.strip()],
+    )
+
+
+def _uncovered_photo_intervals(
+    photo: PhotoRecord, matches: list[Match],
+) -> list[tuple[float, float]]:
     if not photo.has_interval:
         return []
     photo_top_cm = meters_to_centimeters(photo.top)

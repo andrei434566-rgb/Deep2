@@ -12,8 +12,8 @@ import numpy as np
 
 from excel_photo_model_studio.dataset import build_dataset
 from excel_photo_model_studio.matching import (
-    match_photos, read_photo_map, suggest_missing_intervals, uncovered_photo_intervals,
-    write_photo_map,
+    match_photos, read_photo_map, suggest_missing_intervals,
+    uncovered_photo_description_intervals, uncovered_photo_intervals, write_photo_map,
 )
 from excel_photo_model_studio.models import (
     COLUMN_ORDER_RIGHT_TO_LEFT, DescriptionRow, PhotoRecord,
@@ -73,6 +73,59 @@ class MatchingTests(unittest.TestCase):
             for item in matches
         ))
 
+    def test_sequences_every_photo_when_ocr_misses_first_and_last_pages(self):
+        rows = [
+            DescriptionRow(
+                well="W-1", top=100.0, base=112.0, label="A", sheet="Data", row=2,
+                core_top=100.0, core_base=112.0, target_text="Первая фация.",
+            ),
+            DescriptionRow(
+                well="W-1", top=113.0, base=130.94, label="B", sheet="Data", row=3,
+                core_top=113.0, core_base=130.94, target_text="Вторая фация.",
+            ),
+            DescriptionRow(
+                well="W-1", top=131.0, base=145.0, label="C", sheet="Data", row=4,
+                core_top=131.0, core_base=145.0, target_text="Третья фация.",
+            ),
+        ]
+        capacities = {
+            "core-0001": 500, "core-0003": 500, "core-0005": 200,
+            "core-0007": 500, "core-0009": 500, "core-0011": 500, "core-0013": 294,
+            "core-0015": 500, "core-0017": 500, "core-0019": 400,
+        }
+        records = []
+        known_intervals = {
+            7: (113.0, 118.0), 9: (118.0, 123.0),
+            11: (123.0, 128.0), 13: (128.0, 130.94),
+            15: (131.0, 136.0), 17: (136.0, 141.0),
+        }
+        for suffix in range(1, 20, 2):
+            path = Path(f"core-{suffix:04d}.jpg")
+            if suffix in known_intervals:
+                top, base = known_intervals[suffix]
+                records.append(PhotoRecord(path, "W-1", top, base, "ocr_sequenced", True))
+            else:
+                records.append(PhotoRecord(path, "W-1", source="ocr_not_found"))
+
+        with patch(
+            "excel_photo_model_studio.matching._photo_core_capacity_cm",
+            side_effect=lambda path: capacities[path.stem],
+        ):
+            sequenced = suggest_missing_intervals(records, rows)
+        matches, unresolved = match_photos(sequenced, rows)
+
+        self.assertEqual(10, len(sequenced))
+        self.assertTrue(all(item.mapping_confirmed for item in sequenced))
+        self.assertTrue(all(item.source == "excel_sequenced" for item in sequenced))
+        self.assertEqual((100.0, 105.0), (sequenced[0].top, sequenced[0].base))
+        self.assertEqual((110.0, 112.0), (sequenced[2].top, sequenced[2].base))
+        self.assertEqual((113.0, 118.0), (sequenced[3].top, sequenced[3].base))
+        self.assertEqual((128.0, 130.94), (sequenced[6].top, sequenced[6].base))
+        self.assertEqual((141.0, 145.0), (sequenced[9].top, sequenced[9].base))
+        self.assertEqual([], unresolved)
+        self.assertEqual(10, len(matches))
+        self.assertTrue(all(not uncovered_photo_intervals(photo, matches) for photo in sequenced))
+
     def test_reports_any_centimetre_not_covered_by_a_facies(self):
         photo = PhotoRecord(Path("W-1 100-103.jpg"), "W-1", 100.0, 103.0, "filename", True)
         rows = [
@@ -83,6 +136,38 @@ class MatchingTests(unittest.TestCase):
         matches, _ = match_photos([photo], rows)
 
         self.assertEqual([(101.5, 101.51)], uncovered_photo_intervals(photo, matches))
+
+    def test_reports_core_part_whose_facies_has_no_short_description(self):
+        photo = PhotoRecord(Path("W-1 100-102.jpg"), "W-1", 100.0, 102.0, "filename", True)
+        rows = [
+            DescriptionRow(
+                "W-1", 100.0, 101.0, "A", "Data", 2,
+                target_text="Обязательное описание первой фации.",
+            ),
+            DescriptionRow("W-1", 101.0, 102.0, "B", "Data", 3),
+        ]
+
+        matches, _ = match_photos([photo], rows)
+
+        self.assertEqual([], uncovered_photo_intervals(photo, matches))
+        self.assertEqual(
+            [(101.0, 102.0)],
+            uncovered_photo_description_intervals(photo, matches),
+        )
+
+    def test_dataset_is_blocked_when_any_photo_has_no_interval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            (project / "report.json").write_text(json.dumps({
+                "photos": 10,
+                "confirmed_photos": 9,
+                "photos_without_intervals": 1,
+            }), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "фото без обязательного интервала: 1"):
+                build_dataset(project, root / "dataset")
 
     def test_photo_map_preserves_column_order(self):
         with tempfile.TemporaryDirectory() as directory:

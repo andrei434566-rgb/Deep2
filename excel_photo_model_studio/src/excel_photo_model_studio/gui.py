@@ -459,13 +459,23 @@ class MainWindow(QMainWindow):
             f"Excel/CSV-файлов: {report.get('excel_files', 1)}", f"Строк Excel: {report['excel_rows']}", f"Фото: {report['photos']}",
             f"Подтверждены интервалы фото: {report['confirmed_photos']}",
             f"Нужно подтвердить интервалы: {report['unconfirmed_photos']}",
-            f"Автоматически подтверждено OCR: {report.get('ocr_verified_photos', 0)}",
+            f"Фото без обязательного интервала: {report.get('photos_without_intervals', 0)}",
+            f"Фото без распознанного керна: {report.get('photos_without_core_columns', 0)}",
+            f"Автоматически восстановлено интервалов фото: "
+            f"{report.get('auto_sequenced_photos', report.get('ocr_verified_photos', 0))}",
             f"Спроецировано масок: {report['annotations']}",
             f"Непокрытых фациями участков: {report.get('uncovered_facies_intervals', 0)}",
+            f"Участков без «Краткого описания»: "
+            f"{report.get('uncovered_description_intervals', 0)}",
+            f"Интервалов керна Excel без фото: "
+            f"{report.get('uncovered_excel_core_intervals', 0)}",
             f"Строк с ошибкой толщины фации: {report.get('invalid_thickness_rows', 0)}",
             f"Строк Excel с «Кратким описанием»: {report.get('excel_text_targets', 0)}",
+            f"Строк фаций без «Краткого описания»: "
+            f"{report.get('facies_rows_without_description', 0)}",
             f"Масок с «Кратким описанием»: {report.get('text_targets', 0)}",
             f"Подтверждено масок: {report['approved_annotations']}",
+            f"Блокирующих ошибок: {report.get('blocking_errors', 0)}",
         ]
         mappings = report.get("column_mappings", [])
         if mappings:

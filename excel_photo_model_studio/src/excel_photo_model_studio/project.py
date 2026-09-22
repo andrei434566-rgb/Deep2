@@ -6,16 +6,17 @@ from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 
-from .depth import format_depth, meters_to_centimeters
+from .depth import centimeters_to_meters, format_depth, meters_to_centimeters
 from .matching import (
-    match_photos, read_photo_map, suggest_missing_intervals, uncovered_photo_intervals,
-    write_photo_map,
+    match_photos, read_photo_map, suggest_missing_intervals,
+    uncovered_photo_description_intervals, uncovered_photo_intervals, write_photo_map,
 )
 from .models import Annotation, ColumnMapping, DescriptionRow, Issue, PhotoRecord
 from .photos import discover_photos
-from .tabular import read_many_tables, save_mappings
+from .tabular import read_many_tables, save_mappings, well_key
 from .vision import (
-    calibrate_core_columns, core_photo_capacity_centimeters, project_matches, render_previews,
+    calibrate_core_columns, core_photo_capacity_centimeters, detect_core_columns_from_path,
+    project_matches, render_previews,
 )
 
 
@@ -85,6 +86,17 @@ def refresh_project(project_dir: Path) -> dict:
     matches, unresolved_confirmed = match_photos(confirmed, rows)
     unconfirmed = [photo for photo in photos if not photo.mapping_confirmed]
     annotations, columns, orders = project_matches(matches)
+    # Every selected image is required to be a core photo. Detect columns even
+    # when its depth or Excel match is missing, so it cannot disappear silently
+    # before validation and dataset creation.
+    for photo in photos:
+        if photo.path in columns:
+            continue
+        try:
+            columns[photo.path] = detect_core_columns_from_path(photo.path)
+        except (OSError, ValueError):
+            columns[photo.path] = []
+        orders.setdefault(photo.path, photo.column_order)
     annotations = [replace(item, approved=old_approvals.get(item.annotation_id, False)) for item in annotations]
     preview_paths = render_previews(annotations, project_dir / "previews")
     _write_matches(project_dir / "matches.csv", matches)
@@ -108,22 +120,26 @@ def refresh_project(project_dir: Path) -> dict:
     all_issues = list(issues)
     all_issues.extend(
         Issue(
-            "warning", photo.path.name,
-            "Tesseract не найден; интервал нельзя прочитать из подписи фото."
+            "error", photo.path.name,
+            "Tesseract не найден, поэтому обязательный интервал фото не определён."
             if photo.source == "ocr_unavailable"
-            else "Интервал не найден в имени или подписи фото; укажите его в таблице и отметьте OK.",
+            else "Фото содержит керн, но обязательный интервал глубины не восстановлен; "
+            "укажите его в таблице и отметьте OK.",
         )
         for photo in unconfirmed
     )
-    all_issues.extend(Issue("warning", photo.path.name, "Для подтверждённого фото не найдено пересекающихся строк Excel.") for photo in unresolved_confirmed)
-    matched_paths = {item.photo.path for item in matches}
+    all_issues.extend(Issue(
+        "error", photo.path.name,
+        "Для подтверждённого интервала фото не найдено ни одной фации Excel.",
+    ) for photo in unresolved_confirmed)
+    photos_without_core = [photo for photo in photos if not columns.get(photo.path)]
     all_issues.extend(
         Issue(
-            "error", path.name,
-            "Столбики керна не распознаны; маски не созданы. Проверьте исходное фото и границы колонок.",
+            "error", photo.path.name,
+            "На выбранном фото не распознан керн. Фото нельзя пропустить: "
+            "должны быть найдены физические колонки и их интервал.",
         )
-        for path in sorted(matched_paths, key=lambda item: item.name.casefold())
-        if not columns.get(path)
+        for photo in sorted(photos_without_core, key=lambda item: item.path.name.casefold())
     )
     uncovered = {
         photo.path: uncovered_photo_intervals(photo, matches)
@@ -138,6 +154,33 @@ def refresh_project(project_dir: Path) -> dict:
             + ". Проверьте последовательность фото и интервалы фаций по бурению.",
         )
         for path, gaps in sorted(uncovered.items(), key=lambda item: item[0].name.casefold())
+    )
+    uncovered_descriptions = {
+        photo.path: uncovered_photo_description_intervals(photo, matches)
+        for photo in confirmed
+    }
+    uncovered_descriptions = {
+        path: gaps for path, gaps in uncovered_descriptions.items() if gaps
+    }
+    all_issues.extend(
+        Issue(
+            "error", path.name,
+            "Интервал керна не полностью закрыт фациями с «Кратким описанием»: "
+            + "; ".join(f"{format_depth(top)}–{format_depth(base)} м" for top, base in gaps)
+            + ". Для каждого сантиметра керна обязательны и фация, и краткое описание.",
+        )
+        for path, gaps in sorted(
+            uncovered_descriptions.items(), key=lambda item: item[0].name.casefold()
+        )
+    )
+    uncovered_excel_core = _uncovered_excel_core_intervals(rows, confirmed)
+    all_issues.extend(
+        Issue(
+            "error", well or "Excel",
+            f"Интервал отбора керна Excel {format_depth(top)}–{format_depth(base)} м "
+            "не закрыт фотографиями с подтверждённой глубиной.",
+        )
+        for well, top, base in uncovered_excel_core
     )
     all_issues.extend(
         Issue(
@@ -163,14 +206,28 @@ def refresh_project(project_dir: Path) -> dict:
         "photos": len(photos),
         "confirmed_photos": len(confirmed),
         "unconfirmed_photos": len(unconfirmed),
+        "photos_without_intervals": sum(
+            not photo.mapping_confirmed or not photo.has_interval for photo in photos
+        ),
+        "photos_without_core_columns": len(photos_without_core),
         "matches": len(matches),
         "annotations": len(annotations),
         "approved_annotations": sum(item.approved for item in annotations),
         "excel_text_targets": sum(bool(item.target_text.strip()) for item in rows),
+        "facies_rows_without_description": sum(not item.target_text.strip() for item in rows),
         "invalid_thickness_rows": sum(not item.thickness_valid for item in rows),
         "text_targets": sum(bool(item.target_text.strip()) for item in annotations),
-        "ocr_verified_photos": sum(item.source in {"ocr_verified", "ocr_sequenced"} for item in photos),
+        "auto_sequenced_photos": sum(
+            item.source in {"ocr_verified", "ocr_sequenced", "excel_sequenced"} for item in photos
+        ),
+        "ocr_verified_photos": sum(
+            item.source in {"ocr_verified", "ocr_sequenced", "excel_sequenced"} for item in photos
+        ),
         "uncovered_facies_intervals": sum(len(gaps) for gaps in uncovered.values()),
+        "uncovered_description_intervals": sum(
+            len(gaps) for gaps in uncovered_descriptions.values()
+        ),
+        "uncovered_excel_core_intervals": len(uncovered_excel_core),
         "column_mappings": [
             {
                 "sheet": item.sheet, "facies_top": item.top, "facies_base": item.base,
@@ -180,11 +237,59 @@ def refresh_project(project_dir: Path) -> dict:
             if item.top or item.base or item.target_text
         ],
         "classes": sorted({item.label for item in annotations}, key=str.casefold),
+        "blocking_errors": sum(item.severity == "error" for item in all_issues),
         "issues": [item.to_dict() for item in all_issues],
         "project_dir": str(project_dir),
     }
     _write_json(project_dir / "report.json", report)
     return report
+
+
+def _uncovered_excel_core_intervals(
+    rows: list[DescriptionRow], photos: list[PhotoRecord],
+) -> list[tuple[str, float, float]]:
+    """Return centimetre-exact Excel core ranges missing from confirmed photos."""
+    core_ranges: dict[tuple[str, int, int], str] = {}
+    for row in rows:
+        if row.core_top is None or row.core_base is None or row.core_base <= row.core_top:
+            continue
+        key = (
+            well_key(row.well),
+            meters_to_centimeters(row.core_top),
+            meters_to_centimeters(row.core_base),
+        )
+        core_ranges.setdefault(key, row.well)
+    photo_spans: dict[str, list[tuple[int, int]]] = {}
+    for photo in photos:
+        if not photo.mapping_confirmed or not photo.has_interval:
+            continue
+        photo_spans.setdefault(well_key(photo.well), []).append((
+            meters_to_centimeters(photo.top), meters_to_centimeters(photo.base),
+        ))
+
+    missing: list[tuple[str, float, float]] = []
+    for (key, core_top_cm, core_base_cm), well in sorted(core_ranges.items()):
+        spans = sorted(
+            (max(core_top_cm, top_cm), min(core_base_cm, base_cm))
+            for top_cm, base_cm in photo_spans.get(key, ())
+            if min(core_base_cm, base_cm) > max(core_top_cm, top_cm)
+        )
+        cursor_cm = core_top_cm
+        for top_cm, base_cm in spans:
+            if top_cm > cursor_cm:
+                missing.append((
+                    well,
+                    centimeters_to_meters(cursor_cm),
+                    centimeters_to_meters(top_cm),
+                ))
+            cursor_cm = max(cursor_cm, base_cm)
+        if cursor_cm < core_base_cm:
+            missing.append((
+                well,
+                centimeters_to_meters(cursor_cm),
+                centimeters_to_meters(core_base_cm),
+            ))
+    return missing
 
 
 def set_annotation_approvals(project_dir: Path, approvals: dict[str, bool]) -> dict:
