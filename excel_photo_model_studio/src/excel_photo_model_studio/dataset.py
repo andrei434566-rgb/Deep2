@@ -22,6 +22,15 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
     rows = []
     seen_annotations = set()
     for current_project in project_dirs:
+        report_path = current_project / "report.json"
+        if report_path.is_file():
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            uncovered = int(report.get("uncovered_facies_intervals", 0) or 0)
+            if uncovered:
+                raise ValueError(
+                    f"{current_project.name}: найдено непокрытых фациями участков — {uncovered}. "
+                    "Исправьте последовательность фото/интервалы и пересчитайте проект до сборки датасета."
+                )
         with (current_project / "annotations.csv").open("r", encoding="utf-8-sig", newline="") as source:
             for row in csv.DictReader(source, delimiter=";"):
                 if row.get("approved") != "1":

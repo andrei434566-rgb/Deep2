@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from .catalog import catalog_summary, default_catalog_path, register_project
+from .depth import format_depth
 from .matching import read_photo_map, write_photo_map
 from .models import (
     COLUMN_ORDER_AUTO, COLUMN_ORDER_LEFT_TO_RIGHT, COLUMN_ORDER_RIGHT_TO_LEFT,
@@ -86,8 +87,22 @@ class MaskPreviewLabel(QLabel):
         region = min(candidates, key=lambda item: item[0])[1]
         description = str(region.get("target_text", "")).strip() or "Описание отсутствует"
         label = str(region.get("label", "")).strip()
-        interval = f"{region.get('depth_top', '')}–{region.get('depth_base', '')} м"
+        try:
+            interval = (
+                f"Участок на фото: {format_depth(region.get('depth_top'))}–"
+                f"{format_depth(region.get('depth_base'))} м"
+            )
+        except ValueError:
+            interval = f"Участок на фото: {region.get('depth_top', '')}–{region.get('depth_base', '')} м"
         parts = [interval]
+        if region.get("facies_top") not in {None, ""} and region.get("facies_base") not in {None, ""}:
+            try:
+                parts.append(
+                    f"Полный интервал фации: {format_depth(region['facies_top'])}–"
+                    f"{format_depth(region['facies_base'])} м"
+                )
+            except ValueError:
+                pass
         if label:
             parts.append(f"Фация: {label}")
         parts.append(f"Краткое описание: {description}")
@@ -333,8 +348,8 @@ class MainWindow(QMainWindow):
             self.photo_table.setItem(row, 0, confirmed)
             values = (
                 str(record.path), record.well,
-                "" if record.top is None else f"{record.top:g}",
-                "" if record.base is None else f"{record.base:g}",
+                "" if record.top is None else format_depth(record.top),
+                "" if record.base is None else format_depth(record.base),
             )
             for column, value in enumerate(values, start=1):
                 item = QTableWidgetItem(value)
@@ -446,6 +461,7 @@ class MainWindow(QMainWindow):
             f"Нужно подтвердить интервалы: {report['unconfirmed_photos']}",
             f"Автоматически подтверждено OCR: {report.get('ocr_verified_photos', 0)}",
             f"Спроецировано масок: {report['annotations']}",
+            f"Непокрытых фациями участков: {report.get('uncovered_facies_intervals', 0)}",
             f"Строк с ошибкой толщины фации: {report.get('invalid_thickness_rows', 0)}",
             f"Строк Excel с «Кратким описанием»: {report.get('excel_text_targets', 0)}",
             f"Масок с «Кратким описанием»: {report.get('text_targets', 0)}",
@@ -516,6 +532,8 @@ class MainWindow(QMainWindow):
                     "image_height": as_float(row.get("image_height")) or 0,
                     "depth_top": row.get("depth_top", ""),
                     "depth_base": row.get("depth_base", ""),
+                    "facies_top": row.get("facies_top", ""),
+                    "facies_base": row.get("facies_base", ""),
                     "label": row.get("label", ""),
                     "target_text": row.get("target_text", ""),
                 })
@@ -619,7 +637,7 @@ class MainWindow(QMainWindow):
                     top = as_float(interval.get("top"))
                     base = as_float(interval.get("base"))
                     if top is not None and base is not None:
-                        labels.append(f"{index}) {top:g}–{base:g} м")
+                        labels.append(f"{index}) {format_depth(top)}–{format_depth(base)} м")
                 if labels:
                     self.matching_column_depths[self._photo_key(photo_path)] = labels
 

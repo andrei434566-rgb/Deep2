@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from functools import lru_cache
 from pathlib import Path
 
 import cv2
 import numpy as np
 
+from .depth import centimeters_to_meters, meters_to_centimeters
 from .models import (
     Annotation, COLUMN_ORDER_AUTO, COLUMN_ORDER_LEFT_TO_RIGHT,
     COLUMN_ORDER_RIGHT_TO_LEFT, Match, normalize_column_order,
@@ -22,6 +24,20 @@ def read_image(path: Path) -> np.ndarray:
     if image is None:
         raise ValueError(f"Не удалось открыть изображение: {Path(path).name}")
     return image
+
+
+def detect_core_columns_from_path(path: Path) -> list[tuple[int, int, int, int]]:
+    """Detect columns once per unchanged source file during project creation."""
+    resolved = Path(path).expanduser().resolve(strict=True)
+    stat = resolved.stat()
+    return list(_cached_core_columns(str(resolved), stat.st_size, stat.st_mtime_ns))
+
+
+@lru_cache(maxsize=512)
+def _cached_core_columns(
+    path: str, _size: int, _mtime_ns: int,
+) -> tuple[tuple[int, int, int, int], ...]:
+    return tuple(detect_core_columns(read_image(Path(path))))
 
 
 def detect_core_columns(image: np.ndarray) -> list[tuple[int, int, int, int]]:
@@ -107,7 +123,11 @@ def _projection_core_boxes(candidate: np.ndarray) -> list[tuple[int, int, int, i
         active_rows = (row_score >= 0.20).astype(np.uint8)
         # Join modest blank breaks inside a physical column without stretching
         # the result over captions above and below the photographed core.
-        join_gap = max(5, int(height * 0.025))
+        # Keep fractures inside the photographed core connected, but never
+        # bridge the whitespace between the core and printed depth numbers.
+        # The previous 2.5% kernel could pull a header such as "4130.00" into
+        # the column box, making the depth count start above the actual core.
+        join_gap = max(3, int(height * 0.008))
         active_rows = cv2.morphologyEx(
             active_rows.reshape(-1, 1), cv2.MORPH_CLOSE,
             cv2.getStructuringElement(cv2.MORPH_RECT, (1, join_gap)),
@@ -181,22 +201,67 @@ def _fallback_component_boxes(candidate: np.ndarray) -> list[tuple[int, int, int
 def calibrate_core_columns(
     columns: list[tuple[int, int, int, int]], photo_top: float, photo_base: float,
 ) -> list[tuple[tuple[int, int, int, int], float, float]]:
-    """Fill each ordered physical column with its continuous depth interval."""
+    """Assign consecutive centimetres to ordered one-metre physical columns."""
     if not columns or photo_base <= photo_top:
         return []
-    visual_length = sum(max(1, bottom - top) for _, top, _, bottom in columns)
-    cursor = float(photo_top)
+    photo_top_cm = meters_to_centimeters(photo_top)
+    photo_base_cm = meters_to_centimeters(photo_base)
+    total_cm = photo_base_cm - photo_top_cm
+    capacities = _core_column_capacities_cm(columns)
+    capacity_sum = sum(capacities)
+    cursor_cm = photo_top_cm
     calibrated: list[tuple[tuple[int, int, int, int], float, float]] = []
-    for index, box in enumerate(columns):
-        _, pixel_top, _, pixel_bottom = box
+    if total_cm <= capacity_sum + 2:
+        # Normal report: each complete lane is exactly one metre; the last
+        # lane may contain only the remaining centimetres.
+        for index, (box, capacity_cm) in enumerate(zip(columns, capacities)):
+            remaining_cm = photo_base_cm - cursor_cm
+            if remaining_cm <= 0:
+                break
+            if index == len(columns) - 1:
+                column_base_cm = photo_base_cm
+            else:
+                column_base_cm = cursor_cm + min(capacity_cm, remaining_cm)
+            calibrated.append((
+                box,
+                centimeters_to_meters(cursor_cm),
+                centimeters_to_meters(column_base_cm),
+            ))
+            cursor_cm = column_base_cm
+        return calibrated
+
+    # A manually entered/cropped photo can legitimately use a different scale.
+    # Preserve complete coverage, but keep centimetre boundaries exact.
+    heights = [max(1, bottom - top) for _, top, _, bottom in columns]
+    visual_length = sum(heights)
+    consumed_pixels = 0
+    for index, (box, height_pixels) in enumerate(zip(columns, heights)):
         if index == len(columns) - 1:
-            column_base = float(photo_base)
+            column_base_cm = photo_base_cm
         else:
-            span = (float(photo_base) - float(photo_top)) * max(1, pixel_bottom - pixel_top) / visual_length
-            column_base = cursor + span
-        calibrated.append((box, cursor, column_base))
-        cursor = column_base
+            consumed_pixels += height_pixels
+            column_base_cm = photo_top_cm + round(total_cm * consumed_pixels / max(visual_length, 1))
+        calibrated.append((
+            box,
+            centimeters_to_meters(cursor_cm),
+            centimeters_to_meters(column_base_cm),
+        ))
+        cursor_cm = column_base_cm
     return calibrated
+
+
+def core_photo_capacity_centimeters(columns: list[tuple[int, int, int, int]]) -> int:
+    return sum(_core_column_capacities_cm(columns))
+
+
+def _core_column_capacities_cm(columns: list[tuple[int, int, int, int]]) -> list[int]:
+    if not columns:
+        return []
+    heights = [max(1, bottom - top) for _, top, _, bottom in columns]
+    # The upper median keeps a half-height final lane at 50 cm even when a
+    # photograph contains only one full and one partial lane.
+    reference_height = max(1, sorted(heights)[len(heights) // 2])
+    return [max(1, min(100, round(height * 100 / reference_height))) for height in heights]
 
 
 def project_matches(matches: list[Match]) -> tuple[
@@ -214,7 +279,12 @@ def project_matches(matches: list[Match]) -> tuple[
     for photo_path, photo_matches in grouped.items():
         image = read_image(photo_path)
         height, width = image.shape[:2]
-        columns = detect_core_columns(image)
+        photo = photo_matches[0].photo
+        columns = (
+            detect_core_columns_from_path(photo_path)
+            if photo.source.startswith("ocr_")
+            else detect_core_columns(image)
+        )
         if not columns:
             columns_by_photo[photo_path] = []
             requested_order = normalize_column_order(photo_matches[0].photo.column_order)
@@ -229,17 +299,22 @@ def project_matches(matches: list[Match]) -> tuple[
             columns.reverse()
         columns_by_photo[photo_path] = columns
         orders_by_photo[photo_path] = effective_order
-        photo = photo_matches[0].photo
         if not photo.has_interval:
             continue
         calibrated = calibrate_core_columns(columns, float(photo.top), float(photo.base))
         for column_index, (box, column_top, column_base) in enumerate(calibrated):
             left, pixel_top, right, pixel_bottom = box
             for match in photo_matches:
-                overlap_top = max(match.description.top, column_top)
-                overlap_base = min(match.description.base, column_base)
-                if overlap_base - overlap_top <= 1e-9:
+                overlap_top_cm = max(
+                    meters_to_centimeters(match.description.top), meters_to_centimeters(column_top),
+                )
+                overlap_base_cm = min(
+                    meters_to_centimeters(match.description.base), meters_to_centimeters(column_base),
+                )
+                if overlap_base_cm <= overlap_top_cm:
                     continue
+                overlap_top = centimeters_to_meters(overlap_top_cm)
+                overlap_base = centimeters_to_meters(overlap_base_cm)
                 y0 = pixel_top + (overlap_top - column_top) / (column_base - column_top) * (pixel_bottom - pixel_top)
                 y1 = pixel_top + (overlap_base - column_top) / (column_base - column_top) * (pixel_bottom - pixel_top)
                 y0, y1 = _minimum_vertical_span(y0, y1, pixel_top, pixel_bottom)
@@ -258,6 +333,7 @@ def project_matches(matches: list[Match]) -> tuple[
                     depth_top=overlap_top, depth_base=overlap_base, label=match.description.label,
                     polygon=polygon, image_width=width, image_height=height,
                     source_sheet=match.description.sheet, source_row=match.description.row,
+                    facies_top=match.description.top, facies_base=match.description.base,
                     source_file=match.description.source_file,
                     target_text=match.description.target_text,
                     association=match.description.association,
@@ -367,14 +443,16 @@ def render_previews(annotations: list[Annotation], destination: Path) -> dict[Pa
             color = _label_color(item.label)
             points = _preview_points(item.polygon, scale, image.shape[0])
             cv2.fillPoly(overlay, [points], color)
-        image = cv2.addWeighted(overlay, 0.62, image, 0.38, 0)
+        image = cv2.addWeighted(overlay, 0.72, image, 0.28, 0)
         for item in items:
             color = _label_color(item.label)
             points = _preview_points(item.polygon, scale, image.shape[0])
             stroke = max(5, round(image.shape[1] / 300))
             cv2.polylines(image, [points], True, (255, 255, 255), stroke + 5, cv2.LINE_AA)
             cv2.polylines(image, [points], True, color, stroke, cv2.LINE_AA)
-            interval = f"MASK {item.depth_top:.2f}-{item.depth_base:.2f}m"
+            facies_top = item.facies_top if item.facies_top is not None else item.depth_top
+            facies_base = item.facies_base if item.facies_base is not None else item.depth_base
+            interval = f"FACIES {item.label} | {facies_top:.2f}-{facies_base:.2f}m"
             font_scale = max(0.7, min(1.25, image.shape[1] / 2200))
             font_thickness = max(2, round(image.shape[1] / 1000))
             (text_width, text_height), baseline = cv2.getTextSize(
@@ -415,11 +493,13 @@ def _preview_signature(photo_path: Path, items: list[Annotation]) -> str:
                 "label": item.label,
                 "depth_top": item.depth_top,
                 "depth_base": item.depth_base,
+                "facies_top": item.facies_top,
+                "facies_base": item.facies_base,
                 "polygon": item.polygon,
             }
             for item in sorted(items, key=lambda value: value.annotation_id)
         ],
-        "renderer": 2,
+        "renderer": 3,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 

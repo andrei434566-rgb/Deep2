@@ -8,6 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable
 
+from .depth import format_depth, meters_to_centimeters, normalize_depth
 from .models import ColumnMapping, DescriptionRow, Issue
 
 
@@ -167,8 +168,8 @@ def _best_facies_pair(
                 if thickness is None:
                     continue
                 thickness_checks += 1
-                span = base - top
-                if abs(thickness - span) <= max(0.01, abs(span) * 0.02):
+                span_cm = meters_to_centimeters(base) - meters_to_centimeters(top)
+                if abs(meters_to_centimeters(thickness) - span_cm) <= 1:
                     thickness_matches += 1
             score = float(top_score + base_score + min(valid_pairs, 20))
             if base_column == top_column + 1:
@@ -399,16 +400,23 @@ def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[De
             top, base = parse_interval(_cell(row, mapping.interval))
         if top is None or base is None or base <= top:
             continue
+        top = normalize_depth(top)
+        base = normalize_depth(base)
+        if base <= top:
+            continue
         thickness = as_float(_cell(row, mapping.facies_thickness))
+        if thickness is not None:
+            thickness = normalize_depth(thickness)
         thickness_valid = True
         if thickness is not None:
-            span = base - top
-            thickness_valid = abs(thickness - span) <= max(0.01, abs(span) * 0.02)
+            span_cm = meters_to_centimeters(base) - meters_to_centimeters(top)
+            thickness_valid = abs(meters_to_centimeters(thickness) - span_cm) <= 1
             if not thickness_valid:
                 issues.append(Issue(
                     "error", f"{mapping.sheet}!{row_number}",
-                    f"Толщина фации {thickness:g} м не совпадает с интервалом фации по бурению "
-                    f"{top:g}–{base:g} м ({span:g} м); строка не будет использована для маски.",
+                    f"Толщина фации {format_depth(thickness)} м не совпадает с интервалом фации по бурению "
+                    f"{format_depth(top)}–{format_depth(base)} м "
+                    f"({format_depth(span_cm / 100)} м); строка не будет использована для маски.",
                 ))
         well = display_text(_cell(row, mapping.well)) or last_well or sheet_well
         if not well:
@@ -426,7 +434,11 @@ def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[De
         if core_base is None:
             core_base = last_core_base
         else:
+            core_base = normalize_depth(core_base)
             last_core_base = core_base
+        if core_top is not None:
+            core_top = normalize_depth(core_top)
+            last_core_top = core_top
         name = display_text(_cell(row, mapping.label))
         code = display_text(_cell(row, mapping.class_code))
         index = display_text(_cell(row, mapping.class_index))
@@ -455,7 +467,7 @@ def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[De
             description=description, target_text=target_text, association=association,
             environment=environment, field_name=field_name, source_file=mapping.source_file,
             core_top=core_top, core_base=core_base,
-            thickness=thickness if thickness is not None else round(base - top, 6),
+            thickness=thickness if thickness is not None else normalize_depth(base - top),
             thickness_valid=thickness_valid,
             metadata={key: value for key, value in metadata.items() if value},
         ))

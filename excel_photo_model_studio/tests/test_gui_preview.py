@@ -58,10 +58,12 @@ class GuiPreviewTests(unittest.TestCase):
             self.assertIn("Найдено интервалов", window.matching_preview_title.text())
             self.assertIsNotNone(window.matching_preview.pixmap())
             self.assertFalse(window.matching_preview.pixmap().isNull())
+            tooltip = window.matching_preview.tooltip_for_image_point(80, 120)
             self.assertIn(
                 "Краткое описание: Sandstone description",
-                window.matching_preview.tooltip_for_image_point(80, 120),
+                tooltip,
             )
+            self.assertIn("Полный интервал фации: 100–102 м", tooltip)
             window.close()
 
 

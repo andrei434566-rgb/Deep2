@@ -8,10 +8,12 @@ import cv2
 import numpy as np
 
 from .description_model import generate_description
+from .depth import centimeters_to_meters, meters_to_centimeters
+from .matching import sort_photo_records
 from .models import COLUMN_ORDER_RIGHT_TO_LEFT
 from .photos import discover_photos
 from .standard_excel import export_standardized_workbook
-from .vision import detect_column_order, detect_core_columns, read_image
+from .vision import calibrate_core_columns, detect_column_order, detect_core_columns, read_image
 
 
 def analyze_photos_to_excel(
@@ -50,7 +52,7 @@ def analyze_photos_to_excel(
     if standalone is None and embedded_description is None:
         raise ValueError("В best.pt нет модели столбца 22 и рядом не найден description_best.pt.")
 
-    records = [record for record in discover_photos(photos_dir) if record.has_interval]
+    records = sort_photo_records([record for record in discover_photos(photos_dir) if record.has_interval])
     if not records:
         raise ValueError("Не найдены фотографии с интервалами в именах файлов.")
     visual_model = YOLO(str(model_path))
@@ -159,18 +161,26 @@ def polygon_depth_interval(
         range(len(columns)),
         key=lambda index: _horizontal_distance(x_center, columns[index][0], columns[index][2]),
     )
-    left, column_top, right, column_bottom = columns[column_index]
+    calibrated = calibrate_core_columns(columns, photo_top, photo_base)
+    if column_index >= len(calibrated):
+        return None
+    (left, column_top, right, column_bottom), column_depth_top, column_depth_base = calibrated[column_index]
     del left, right
     y0 = max(float(column_top), float(np.min(polygon[:, 1])))
     y1 = min(float(column_bottom), float(np.max(polygon[:, 1])))
     if y1 <= y0:
         return None
-    visual_length = sum(max(1, bottom - top) for _, top, _, bottom in columns)
-    depth_per_pixel = (photo_base - photo_top) / visual_length
-    previous_pixels = sum(max(1, bottom - top) for _, top, _, bottom in columns[:column_index])
-    depth_top = photo_top + (previous_pixels + y0 - column_top) * depth_per_pixel
-    depth_base = photo_top + (previous_pixels + y1 - column_top) * depth_per_pixel
-    return round(depth_top, 4), round(depth_base, 4)
+    column_span_cm = meters_to_centimeters(column_depth_base) - meters_to_centimeters(column_depth_top)
+    pixel_span = max(1.0, float(column_bottom - column_top))
+    depth_top_cm = meters_to_centimeters(column_depth_top) + round(
+        (y0 - column_top) * column_span_cm / pixel_span
+    )
+    depth_base_cm = meters_to_centimeters(column_depth_top) + round(
+        (y1 - column_top) * column_span_cm / pixel_span
+    )
+    if depth_base_cm <= depth_top_cm:
+        depth_base_cm = min(meters_to_centimeters(column_depth_base), depth_top_cm + 1)
+    return centimeters_to_meters(depth_top_cm), centimeters_to_meters(depth_base_cm)
 
 
 def _horizontal_distance(x: float, left: int, right: int) -> float:

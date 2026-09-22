@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .depth import normalize_depth
+
 
 COLUMN_ORDER_AUTO = "auto"
 COLUMN_ORDER_LEFT_TO_RIGHT = "left_to_right"
@@ -82,6 +84,16 @@ class DescriptionRow:
     thickness_valid: bool = True
     metadata: dict[str, str] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "top", normalize_depth(self.top))
+        object.__setattr__(self, "base", normalize_depth(self.base))
+        if self.core_top is not None:
+            object.__setattr__(self, "core_top", normalize_depth(self.core_top))
+        if self.core_base is not None:
+            object.__setattr__(self, "core_base", normalize_depth(self.core_base))
+        if self.thickness is not None:
+            object.__setattr__(self, "thickness", normalize_depth(self.thickness))
+
     @property
     def source_id(self) -> str:
         prefix = f"{Path(self.source_file).name}:" if self.source_file else ""
@@ -98,6 +110,12 @@ class PhotoRecord:
     mapping_confirmed: bool = False
     column_order: str = COLUMN_ORDER_AUTO
 
+    def __post_init__(self) -> None:
+        if self.top is not None:
+            object.__setattr__(self, "top", normalize_depth(self.top))
+        if self.base is not None:
+            object.__setattr__(self, "base", normalize_depth(self.base))
+
     @property
     def has_interval(self) -> bool:
         return self.top is not None and self.base is not None and self.base > self.top
@@ -109,6 +127,10 @@ class Match:
     description: DescriptionRow
     overlap_top: float
     overlap_base: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "overlap_top", normalize_depth(self.overlap_top))
+        object.__setattr__(self, "overlap_base", normalize_depth(self.overlap_base))
 
     @property
     def overlap(self) -> float:
@@ -130,6 +152,8 @@ class Annotation:
     image_height: int
     source_sheet: str
     source_row: int
+    facies_top: float | None = None
+    facies_base: float | None = None
     source_file: str = ""
     target_text: str = ""
     association: str = ""

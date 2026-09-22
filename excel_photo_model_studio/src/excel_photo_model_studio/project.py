@@ -6,11 +6,17 @@ from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 
-from .matching import match_photos, read_photo_map, suggest_missing_intervals, write_photo_map
+from .depth import format_depth, meters_to_centimeters
+from .matching import (
+    match_photos, read_photo_map, suggest_missing_intervals, uncovered_photo_intervals,
+    write_photo_map,
+)
 from .models import Annotation, ColumnMapping, DescriptionRow, Issue, PhotoRecord
 from .photos import discover_photos
 from .tabular import read_many_tables, save_mappings
-from .vision import calibrate_core_columns, project_matches, render_previews
+from .vision import (
+    calibrate_core_columns, core_photo_capacity_centimeters, project_matches, render_previews,
+)
 
 
 PROJECT_SCHEMA = "excel-photo-model-studio-v1"
@@ -70,7 +76,10 @@ def refresh_project(project_dir: Path) -> dict:
         _write_table_cache(project_dir, rows, mappings, issues, excel_files)
     else:
         rows, mappings, issues, excel_files = cached
-    photos = read_photo_map(project_dir / "photo_map.csv")
+    photos = suggest_missing_intervals(read_photo_map(project_dir / "photo_map.csv"), rows)
+    # This also migrates projects made by 0.3.3, where every OCR page could
+    # incorrectly contain the same full core-sampling interval.
+    write_photo_map(project_dir / "photo_map.csv", photos)
     old_approvals = _existing_approvals(project_dir / "annotations.csv")
     confirmed = [photo for photo in photos if photo.mapping_confirmed]
     matches, unresolved_confirmed = match_photos(confirmed, rows)
@@ -81,21 +90,21 @@ def refresh_project(project_dir: Path) -> dict:
     _write_matches(project_dir / "matches.csv", matches)
     _write_annotations(project_dir / "annotations.csv", annotations, preview_paths)
     photo_by_path = {photo.path: photo for photo in photos}
-    _write_json(project_dir / "detected_columns.json", {
-        str(path): {
+    detected_payload = {}
+    for path, boxes in columns.items():
+        photo = photo_by_path.get(path)
+        depth_ranges = calibrate_core_columns(
+            boxes, float(photo.top), float(photo.base),
+        ) if photo is not None and photo.has_interval else []
+        detected_payload[str(path)] = {
             "order": orders.get(path, "left_to_right"),
             "boxes": [list(box) for box in boxes],
             "depth_ranges": [
                 {"box": list(box), "top": top, "base": base}
-                for box, top, base in calibrate_core_columns(
-                    boxes,
-                    float(photo_by_path[path].top),
-                    float(photo_by_path[path].base),
-                )
-            ] if path in photo_by_path and photo_by_path[path].has_interval else [],
+                for box, top, base in depth_ranges
+            ],
         }
-        for path, boxes in columns.items()
-    })
+    _write_json(project_dir / "detected_columns.json", detected_payload)
     all_issues = list(issues)
     all_issues.extend(
         Issue(
@@ -116,6 +125,37 @@ def refresh_project(project_dir: Path) -> dict:
         for path in sorted(matched_paths, key=lambda item: item.name.casefold())
         if not columns.get(path)
     )
+    uncovered = {
+        photo.path: uncovered_photo_intervals(photo, matches)
+        for photo in confirmed
+    }
+    uncovered = {path: gaps for path, gaps in uncovered.items() if gaps}
+    all_issues.extend(
+        Issue(
+            "error", path.name,
+            "Найденный интервал керна не полностью закрыт фациями Excel: "
+            + "; ".join(f"{format_depth(top)}–{format_depth(base)} м" for top, base in gaps)
+            + ". Проверьте последовательность фото и интервалы фаций по бурению.",
+        )
+        for path, gaps in sorted(uncovered.items(), key=lambda item: item[0].name.casefold())
+    )
+    all_issues.extend(
+        Issue(
+            "error", path.name,
+            f"Интервал фото {format_depth(photo_by_path[path].base - photo_by_path[path].top)} м "
+            f"длиннее вместимости найденного керна "
+            f"{format_depth(core_photo_capacity_centimeters(boxes) / 100)} м. "
+            "Фото нельзя растягивать; проверьте OCR или ручные границы.",
+        )
+        for path, boxes in columns.items()
+        if boxes
+        and path in photo_by_path
+        and photo_by_path[path].has_interval
+        and meters_to_centimeters(photo_by_path[path].base)
+        - meters_to_centimeters(photo_by_path[path].top)
+        > core_photo_capacity_centimeters(boxes) + 2
+        and len(boxes) > 1
+    )
     report = {
         "schema": PROJECT_SCHEMA,
         "excel_rows": len(rows),
@@ -129,7 +169,8 @@ def refresh_project(project_dir: Path) -> dict:
         "excel_text_targets": sum(bool(item.target_text.strip()) for item in rows),
         "invalid_thickness_rows": sum(not item.thickness_valid for item in rows),
         "text_targets": sum(bool(item.target_text.strip()) for item in annotations),
-        "ocr_verified_photos": sum(item.source == "ocr_verified" for item in photos),
+        "ocr_verified_photos": sum(item.source in {"ocr_verified", "ocr_sequenced"} for item in photos),
+        "uncovered_facies_intervals": sum(len(gaps) for gaps in uncovered.values()),
         "column_mappings": [
             {
                 "sheet": item.sheet, "facies_top": item.top, "facies_base": item.base,
@@ -202,6 +243,7 @@ def _write_annotations(path: Path, annotations: list[Annotation], previews: dict
             "preview": str(previews.get(item.photo_path, "")), "well": item.well,
             "photo_top": item.photo_top, "photo_base": item.photo_base,
             "depth_top": item.depth_top, "depth_base": item.depth_base,
+            "facies_top": item.facies_top, "facies_base": item.facies_base,
             "label": item.label, "polygon_json": json.dumps(item.polygon),
             "image_width": item.image_width, "image_height": item.image_height,
             "source_sheet": item.source_sheet, "source_row": item.source_row,
@@ -212,7 +254,7 @@ def _write_annotations(path: Path, annotations: list[Annotation], previews: dict
         })
     _write_dict_rows(path, rows, fieldnames=(
         "annotation_id", "photo", "preview", "well", "photo_top", "photo_base",
-        "depth_top", "depth_base", "label", "polygon_json", "image_width", "image_height",
+        "depth_top", "depth_base", "facies_top", "facies_base", "label", "polygon_json", "image_width", "image_height",
         "source_sheet", "source_row", "source_file", "target_text", "association", "environment", "field_name", "approved",
     ))
 

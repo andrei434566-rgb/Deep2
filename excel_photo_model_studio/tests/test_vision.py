@@ -13,7 +13,7 @@ from excel_photo_model_studio.models import (
     DescriptionRow, Match, PhotoRecord,
 )
 from excel_photo_model_studio.vision import (
-    calibrate_core_columns, detect_column_order, detect_core_columns, project_matches,
+    calibrate_core_columns, core_photo_capacity_centimeters, detect_column_order, detect_core_columns, project_matches,
     read_image, render_previews,
 )
 
@@ -62,9 +62,9 @@ class VisionTests(unittest.TestCase):
                 source="filename", mapping_confirmed=True,
                 column_order=COLUMN_ORDER_RIGHT_TO_LEFT,
             )
-            row = DescriptionRow("W-1", 100.0, 100.0001, "Sand", "Data", 2)
+            row = DescriptionRow("W-1", 100.0, 100.01, "Sand", "Data", 2)
 
-            annotations, _columns, orders = project_matches([Match(photo, row, 100.0, 100.0001)])
+            annotations, _columns, orders = project_matches([Match(photo, row, 100.0, 100.01)])
 
         self.assertEqual(COLUMN_ORDER_RIGHT_TO_LEFT, orders[photo_path])
         self.assertEqual(1, len(annotations))
@@ -130,6 +130,29 @@ class VisionTests(unittest.TestCase):
 
         self.assertEqual([], detect_core_columns(image))
 
+    def test_column_starts_at_core_not_at_depth_number_above_it(self):
+        image = np.full((1000, 700, 3), 255, dtype=np.uint8)
+        cv2.putText(
+            image, "4130.00", (275, 145), cv2.FONT_HERSHEY_SIMPLEX,
+            0.75, (25, 25, 25), 2, cv2.LINE_AA,
+        )
+        cv2.rectangle(image, (275, 210), (410, 850), (242, 242, 242), -1)
+        for y in range(235, 830, 47):
+            cv2.line(image, (275, y), (410, y + 9), (160, 160, 160), 2)
+        cv2.putText(
+            image, "4131.00", (275, 915), cv2.FONT_HERSHEY_SIMPLEX,
+            0.75, (25, 25, 25), 2, cv2.LINE_AA,
+        )
+
+        boxes = detect_core_columns(image)
+
+        self.assertEqual(1, len(boxes))
+        _, top, _, bottom = boxes[0]
+        self.assertGreaterEqual(top, 195)
+        self.assertLessEqual(top, 220)
+        self.assertGreaterEqual(bottom, 835)
+        self.assertLessEqual(bottom, 865)
+
     def test_calibrates_depth_inside_each_detected_column(self):
         columns = [(10, 20, 50, 120), (70, 20, 110, 220), (130, 20, 170, 120)]
 
@@ -138,6 +161,21 @@ class VisionTests(unittest.TestCase):
         self.assertEqual((100.0, 101.0), calibrated[0][1:])
         self.assertEqual((101.0, 103.0), calibrated[1][1:])
         self.assertEqual((103.0, 104.0), calibrated[2][1:])
+
+    def test_calibrates_full_metre_columns_and_last_three_centimetres(self):
+        columns = [(20 + index * 80, 30, 70 + index * 80, 430) for index in range(5)]
+
+        calibrated = calibrate_core_columns(columns, 100.0, 104.03)
+
+        self.assertEqual([
+            (100.0, 101.0), (101.0, 102.0), (102.0, 103.0),
+            (103.0, 104.0), (104.0, 104.03),
+        ], [(top, base) for _, top, base in calibrated])
+
+    def test_capacity_counts_one_full_and_one_half_column_as_150_cm(self):
+        columns = [(20, 20, 70, 420), (100, 20, 150, 220)]
+
+        self.assertEqual(150, core_photo_capacity_centimeters(columns))
 
     def test_does_not_create_full_photo_mask_when_columns_are_missing(self):
         with tempfile.TemporaryDirectory() as directory:

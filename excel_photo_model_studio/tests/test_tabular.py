@@ -136,6 +136,28 @@ class TableReaderTests(unittest.TestCase):
         self.assertFalse(rows[0].thickness_valid)
         self.assertTrue(any("не будет использована для маски" in item.message for item in issues))
 
+    def test_rounds_formula_noise_to_centimetres_and_treats_3_03_as_303_cm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "centimetres.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append([
+                "Скважина", "Интервал фации по бурению Кровля",
+                "Интервал фации по бурению Подошва", "Толщина фации, м", "Класс",
+            ])
+            sheet.append(["W-1", 4129.67, 4130.139999999, 0.47, "A"])
+            sheet.append(["W-1", 4130.139999999, 4133.17, 3.03, "B"])
+            workbook.save(path)
+
+            rows, _, issues = read_table(path)
+
+        self.assertEqual([(4129.67, 4130.14), (4130.14, 4133.17)], [
+            (row.top, row.base) for row in rows
+        ])
+        self.assertEqual([0.47, 3.03], [row.thickness for row in rows])
+        self.assertTrue(all(row.thickness_valid for row in rows))
+        self.assertEqual([], [item for item in issues if item.severity == "error"])
+
     def test_reads_csv_with_one_interval_column(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "description.csv"

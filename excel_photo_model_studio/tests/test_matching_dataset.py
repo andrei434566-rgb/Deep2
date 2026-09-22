@@ -5,12 +5,16 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
 
 from excel_photo_model_studio.dataset import build_dataset
-from excel_photo_model_studio.matching import match_photos, read_photo_map, suggest_missing_intervals, write_photo_map
+from excel_photo_model_studio.matching import (
+    match_photos, read_photo_map, suggest_missing_intervals, uncovered_photo_intervals,
+    write_photo_map,
+)
 from excel_photo_model_studio.models import (
     COLUMN_ORDER_RIGHT_TO_LEFT, DescriptionRow, PhotoRecord,
 )
@@ -32,12 +36,53 @@ class MatchingTests(unittest.TestCase):
             top=4105.0, base=4106.0, source="ocr",
         )
 
-        resolved = suggest_missing_intervals([good, false_pair], rows)
+        with patch("excel_photo_model_studio.matching._photo_core_capacity_cm", return_value=500):
+            resolved = suggest_missing_intervals([good, false_pair], rows)
 
         self.assertEqual("67ПО", resolved[0].well)
         self.assertTrue(resolved[0].mapping_confirmed)
-        self.assertEqual("ocr_verified", resolved[0].source)
+        self.assertEqual("ocr_sequenced", resolved[0].source)
+        self.assertEqual((4104.9, 4109.9), (resolved[0].top, resolved[0].base))
         self.assertFalse(resolved[1].mapping_confirmed)
+
+    def test_sequences_ocr_pages_by_depth_and_carries_long_facies_between_them(self):
+        rows = [DescriptionRow(
+            well="W-1", top=102.0, base=105.03, label="Dch", sheet="Data", row=2,
+            core_top=100.0, core_base=106.03, thickness=3.03,
+            target_text="Одно описание всей фации длиной 3,03 м.",
+        )]
+        records = [
+            PhotoRecord(Path(f"core-{suffix}.jpg"), "W-1", 100.0, 106.03, "ocr", False)
+            for suffix in ("0003", "0001", "0005")
+        ]
+
+        with patch("excel_photo_model_studio.matching._photo_core_capacity_cm", return_value=300):
+            sequenced = suggest_missing_intervals(records, rows)
+        matches, _ = match_photos(sequenced, rows)
+
+        self.assertEqual(
+            [(100.0, 103.0), (103.0, 106.0), (106.0, 106.03)],
+            [(item.top, item.base) for item in sequenced],
+        )
+        self.assertEqual(["core-0001.jpg", "core-0003.jpg"], [item.photo.path.name for item in matches])
+        self.assertEqual([(102.0, 103.0), (103.0, 105.03)], [
+            (item.overlap_top, item.overlap_base) for item in matches
+        ])
+        self.assertTrue(all(
+            item.description.target_text == "Одно описание всей фации длиной 3,03 м."
+            for item in matches
+        ))
+
+    def test_reports_any_centimetre_not_covered_by_a_facies(self):
+        photo = PhotoRecord(Path("W-1 100-103.jpg"), "W-1", 100.0, 103.0, "filename", True)
+        rows = [
+            DescriptionRow("W-1", 100.0, 101.5, "A", "Data", 2),
+            DescriptionRow("W-1", 101.51, 103.0, "B", "Data", 3),
+        ]
+
+        matches, _ = match_photos([photo], rows)
+
+        self.assertEqual([(101.5, 101.51)], uncovered_photo_intervals(photo, matches))
 
     def test_photo_map_preserves_column_order(self):
         with tempfile.TemporaryDirectory() as directory:
