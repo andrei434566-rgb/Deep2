@@ -159,8 +159,8 @@ class VisionTests(unittest.TestCase):
         calibrated = calibrate_core_columns(columns, 100.0, 104.0)
 
         self.assertEqual((100.0, 101.0), calibrated[0][1:])
-        self.assertEqual((101.0, 103.0), calibrated[1][1:])
-        self.assertEqual((103.0, 104.0), calibrated[2][1:])
+        self.assertEqual((101.0, 102.0), calibrated[1][1:])
+        self.assertEqual((102.0, 103.0), calibrated[2][1:])
 
     def test_calibrates_full_metre_columns_and_last_three_centimetres(self):
         columns = [(20 + index * 80, 30, 70 + index * 80, 430) for index in range(5)]

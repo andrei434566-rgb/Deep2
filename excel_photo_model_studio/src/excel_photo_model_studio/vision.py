@@ -230,17 +230,15 @@ def calibrate_core_columns(
             cursor_cm = column_base_cm
         return calibrated
 
-    # A manually entered/cropped photo can legitimately use a different scale.
-    # Preserve complete coverage, but keep centimetre boundaries exact.
-    heights = [max(1, bottom - top) for _, top, _, bottom in columns]
-    visual_length = sum(heights)
-    consumed_pixels = 0
-    for index, (box, height_pixels) in enumerate(zip(columns, heights)):
-        if index == len(columns) - 1:
-            column_base_cm = photo_base_cm
-        else:
-            consumed_pixels += height_pixels
-            column_base_cm = photo_top_cm + round(total_cm * consumed_pixels / max(visual_length, 1))
+    # Never stretch detected core to cover a longer photo interval. Each full
+    # physical column holds at most 1 m (a partial last column less); stretching
+    # a mistaken/drilling interval over the image shifts every facies mask.
+    # Any excess remains uncovered and is reported by project validation.
+    for box, capacity_cm in zip(columns, capacities):
+        remaining_cm = photo_base_cm - cursor_cm
+        if remaining_cm <= 0:
+            break
+        column_base_cm = min(photo_base_cm, cursor_cm + capacity_cm)
         calibrated.append((
             box,
             centimeters_to_meters(cursor_cm),

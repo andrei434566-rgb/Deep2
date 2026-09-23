@@ -24,15 +24,15 @@ class ProjectFlowTests(unittest.TestCase):
             workbook = Workbook()
             sheet = workbook.active
             sheet.append(["Скважина", "Кровля", "Подошва", "Класс", "Краткое описание"])
-            sheet.append(["W-1", 100.0, 102.0, "Sand", "Описание песчаника."])
-            sheet.append(["W-2", 100.0, 102.0, "Sand", "Описание песчаника."])
+            sheet.append(["W-1", 100.0, 101.0, "Sand", "Описание песчаника."])
+            sheet.append(["W-2", 100.0, 101.0, "Sand", "Описание песчаника."])
             workbook.save(excel)
             for well in ("W-1", "W-2"):
                 image = np.full((240, 160, 3), (20, 80, 150), dtype=np.uint8)
                 cv2.rectangle(image, (55, 20), (105, 220), (115, 115, 115), -1)
                 ok, encoded = cv2.imencode(".jpg", image)
                 self.assertTrue(ok)
-                (photos / f"{well} 100-102.jpg").write_bytes(encoded.tobytes())
+                (photos / f"{well} 100-101.jpg").write_bytes(encoded.tobytes())
 
             report = create_project(excel, photos, root / "project")
             self.assertTrue((root / "project" / "table_cache.json").is_file())

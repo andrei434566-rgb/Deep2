@@ -1,0 +1,99 @@
+name: Build Excel Photo Model Studio for Windows
+
+on:
+  push:
+    tags:
+      - 'excel-photo-studio-v*'
+
+permissions:
+  contents: write
+
+env:
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: 'utf-8'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Get source code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: excel_photo_model_studio/requirements.txt
+
+      - name: Install application dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r excel_photo_model_studio/requirements.txt pyinstaller
+
+      - name: Install portable OCR runtime
+        shell: pwsh
+        run: |
+          choco install tesseract --yes --no-progress
+          New-Item -ItemType Directory -Force -Path tools/tesseract | Out-Null
+          Copy-Item -Path 'C:\Program Files\Tesseract-OCR\*' -Destination tools/tesseract -Recurse -Force
+          Invoke-WebRequest -Uri 'https://github.com/tesseract-ocr/tessdata_fast/raw/main/rus.traineddata' -OutFile tools/tesseract/tessdata/rus.traineddata
+
+      - name: Run application tests
+        shell: pwsh
+        working-directory: excel_photo_model_studio
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONPATH: src
+        run: python -B -m unittest discover -s tests -v
+
+      - name: Build portable application
+        working-directory: excel_photo_model_studio
+        run: python -m PyInstaller --noconfirm --clean Excel_Photo_Model_Studio.spec
+
+      - name: Verify packaged application
+        shell: pwsh
+        working-directory: excel_photo_model_studio
+        run: |
+          $process = Start-Process -FilePath 'dist/Excel_Photo_Model_Studio/Excel_Photo_Model_Studio.exe' -ArgumentList '--help' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Portable application smoke test failed: $($process.ExitCode)" }
+
+      - name: Create release archive and checksum
+        if: startsWith(github.ref, 'refs/tags/excel-photo-studio-v')
+        shell: pwsh
+        working-directory: excel_photo_model_studio
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^excel-photo-studio-v', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Unexpected release tag: $env:GITHUB_REF_NAME" }
+          $archiveName = "Excel_Photo_Model_Studio_${version}_Windows_x64.zip"
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          $archivePath = Join-Path 'release' $archiveName
+          Compress-Archive -Path 'dist/Excel_Photo_Model_Studio/*' -DestinationPath $archivePath -CompressionLevel Optimal
+          $size = (Get-Item -LiteralPath $archivePath).Length
+          if ($size -ge 2000000000) { throw "Release ZIP is too large for GitHub: $size bytes" }
+          $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLower()
+          Set-Content -LiteralPath "$archivePath.sha256" -Value "$hash  $archiveName" -Encoding ascii
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Excel-Photo-Model-Studio-Windows
+          path: |
+            excel_photo_model_studio/release/*.zip
+            excel_photo_model_studio/release/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/excel-photo-studio-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Excel Photo Model Studio 0.3.6
+          generate_release_notes: true
+          make_latest: false
+          files: |
+            excel_photo_model_studio/release/*.zip
+            excel_photo_model_studio/release/*.sha256

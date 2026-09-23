@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -53,7 +54,7 @@ class GuiPreviewTests(unittest.TestCase):
             self.assertEqual("yolo11n-seg.yaml", window.architecture.currentData())
             self.assertEqual("auto", window.photo_table.cellWidget(0, 5).currentData())
             self.assertIn("Колонок керна найдено: 1", window.matching_preview_title.text())
-            self.assertIn("Интервалы колонок: 1) 100–102 м", window.matching_preview_title.text())
+            self.assertIn("Интервалы колонок: 1) 100–101 м", window.matching_preview_title.text())
             self.assertIn("Порядок:", window.matching_preview_title.text())
             self.assertIn("Найдено интервалов", window.matching_preview_title.text())
             self.assertIsNotNone(window.matching_preview.pixmap())
@@ -63,7 +64,10 @@ class GuiPreviewTests(unittest.TestCase):
                 "Краткое описание: Sandstone description",
                 tooltip,
             )
+            self.assertIn("Участок на фото: 100–101 м", tooltip)
             self.assertIn("Полный интервал фации: 100–102 м", tooltip)
+            report = json.loads((project / "report.json").read_text(encoding="utf-8"))
+            self.assertTrue(any("длиннее вместимости найденного керна" in issue["message"] for issue in report["issues"]))
             window.close()
 
 

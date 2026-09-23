@@ -11,15 +11,16 @@ from .matching import (
     match_photos, read_photo_map, suggest_missing_intervals,
     uncovered_photo_description_intervals, uncovered_photo_intervals, write_photo_map,
 )
-from .models import Annotation, ColumnMapping, DescriptionRow, Issue, PhotoRecord
+from .models import (
+    Annotation, COLUMN_ORDER_AUTO, COLUMN_ORDER_RIGHT_TO_LEFT, ColumnMapping,
+    DescriptionRow, Issue, PhotoRecord, normalize_column_order,
+)
 from .photos import discover_photos
 from .tabular import read_many_tables, save_mappings, well_key
 from .vision import (
-    calibrate_core_columns, core_photo_capacity_centimeters, detect_core_columns_from_path,
-    project_matches, render_previews,
+    calibrate_core_columns, core_photo_capacity_centimeters, detect_column_order,
+    detect_core_columns_from_path, project_matches, read_image, render_previews,
 )
-
-
 PROJECT_SCHEMA = "excel-photo-model-studio-v1"
 
 
@@ -94,9 +95,17 @@ def refresh_project(project_dir: Path) -> dict:
             continue
         try:
             columns[photo.path] = detect_core_columns_from_path(photo.path)
+            requested_order = normalize_column_order(photo.column_order)
+            if requested_order == COLUMN_ORDER_AUTO:
+                order = detect_column_order(read_image(photo.path), columns[photo.path])
+            else:
+                order = requested_order
+            if order == COLUMN_ORDER_RIGHT_TO_LEFT:
+                columns[photo.path].reverse()
+            orders[photo.path] = order
         except (OSError, ValueError):
             columns[photo.path] = []
-        orders.setdefault(photo.path, photo.column_order)
+            orders[photo.path] = photo.column_order
     annotations = [replace(item, approved=old_approvals.get(item.annotation_id, False)) for item in annotations]
     preview_paths = render_previews(annotations, project_dir / "previews")
     _write_matches(project_dir / "matches.csv", matches)
@@ -197,7 +206,6 @@ def refresh_project(project_dir: Path) -> dict:
         and meters_to_centimeters(photo_by_path[path].base)
         - meters_to_centimeters(photo_by_path[path].top)
         > core_photo_capacity_centimeters(boxes) + 2
-        and len(boxes) > 1
     )
     report = {
         "schema": PROJECT_SCHEMA,

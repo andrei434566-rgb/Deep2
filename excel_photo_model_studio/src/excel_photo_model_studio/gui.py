@@ -9,7 +9,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from PySide6.QtCore import QPointF, Qt, QProcess
-from PySide6.QtGui import QPixmap, QPolygonF
+from PySide6.QtGui import QColor, QImageReader, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSpinBox,
@@ -70,6 +70,39 @@ class MaskPreviewLabel(QLabel):
     def set_regions(self, regions: list[dict]) -> None:
         self._regions = list(regions)
         self._last_tip = ""
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        pixmap = self.pixmap()
+        if pixmap is None or pixmap.isNull():
+            return
+        image_width = max((float(item.get("image_width", 0) or 0) for item in self._regions), default=0)
+        image_height = max((float(item.get("image_height", 0) or 0) for item in self._regions), default=0)
+        if image_width <= 0 or image_height <= 0:
+            return
+        x_offset = (self.width() - pixmap.width()) / 2.0
+        y_offset = (self.height() - pixmap.height()) / 2.0
+        x_scale = pixmap.width() / image_width
+        y_scale = pixmap.height() / image_height
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for region in self._regions:
+            if region.get("kind") != "core_column":
+                continue
+            try:
+                polygon = QPolygonF([
+                    QPointF(x_offset + float(x) * x_scale, y_offset + float(y) * y_scale)
+                    for x, y in region["polygon"]
+                ])
+            except (KeyError, TypeError, ValueError):
+                continue
+            pen = QPen(QColor("#00e5ff"), 2.0, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(QColor(0, 229, 255, 28))
+            painter.drawPolygon(polygon)
+            painter.drawText(polygon.boundingRect().topLeft() + QPointF(3, 16), str(region.get("label", "Керн")))
+        painter.end()
 
     def tooltip_for_image_point(self, x: float, y: float) -> str:
         candidates: list[tuple[float, dict]] = []
@@ -85,6 +118,8 @@ class MaskPreviewLabel(QLabel):
         if not candidates:
             return ""
         region = min(candidates, key=lambda item: item[0])[1]
+        if region.get("kind") == "core_column":
+            return f"Распознанная колонка керна: {region.get('label', '')}".strip()
         description = str(region.get("target_text", "")).strip() or "Описание отсутствует"
         label = str(region.get("label", "")).strip()
         try:
@@ -146,6 +181,7 @@ class MainWindow(QMainWindow):
         self.matching_preview_paths: dict[str, str] = {}
         self.matching_preview_details: dict[str, list[str]] = {}
         self.matching_preview_regions: dict[str, list[dict]] = {}
+        self.matching_column_boxes: dict[str, list[list[int]]] = {}
         self.matching_column_orders: dict[str, str] = {}
         self.matching_column_counts: dict[str, int] = {}
         self.matching_column_depths: dict[str, list[str]] = {}
@@ -440,6 +476,7 @@ class MainWindow(QMainWindow):
             self.matching_preview_paths.clear()
             self.matching_preview_details.clear()
             self.matching_preview_regions.clear()
+            self.matching_column_boxes.clear()
             self.matching_column_orders.clear()
             self.matching_column_counts.clear()
             self.matching_column_depths.clear()
@@ -505,6 +542,7 @@ class MainWindow(QMainWindow):
         self.matching_preview_paths.clear()
         self.matching_preview_details.clear()
         self.matching_preview_regions.clear()
+        self.matching_column_boxes.clear()
         self._load_detected_column_orders()
         self.review_table.blockSignals(True)
         self.review_table.setUpdatesEnabled(False)
@@ -586,7 +624,21 @@ class MainWindow(QMainWindow):
         photo_key = self._photo_key(photo_path)
         preview_path = self.matching_preview_paths.get(photo_key)
         details = self.matching_preview_details.get(photo_key, [])
-        self.matching_preview.set_regions(self.matching_preview_regions.get(photo_key, []))
+        regions = list(self.matching_preview_regions.get(photo_key, []))
+        source_size = QImageReader(photo_path).size()
+        image_width, image_height = source_size.width(), source_size.height()
+        for index, box in enumerate(self.matching_column_boxes.get(photo_key, []), start=1):
+            if len(box) != 4 or image_width <= 0 or image_height <= 0:
+                continue
+            left, top, right, bottom = (int(value) for value in box)
+            regions.append({
+                "kind": "core_column",
+                "polygon": ((left, top), (right, top), (right, bottom), (left, bottom)),
+                "image_width": image_width,
+                "image_height": image_height,
+                "label": f"Керн {index}",
+            })
+        self.matching_preview.set_regions(regions)
         order_widget = self.photo_table.cellWidget(row, 5)
         requested_order = order_widget.currentData() if isinstance(order_widget, QComboBox) else COLUMN_ORDER_AUTO
         effective_order = self.matching_column_orders.get(photo_key)
@@ -615,8 +667,22 @@ class MainWindow(QMainWindow):
             )
             self._set_preview_pixmap(self.matching_preview, preview_path, "Не удалось открыть фото с масками.")
         else:
+            confirmed = self.photo_table.item(row, 0).checkState() == Qt.CheckState.Checked
+            top = as_float(self.photo_table.item(row, 3).text())
+            base = as_float(self.photo_table.item(row, 4).text())
+            if not confirmed or top is None or base is None or base <= top:
+                reason = (
+                    "Маски пока не построены: заполните начало и конец интервала, отметьте OK "
+                    "и нажмите «Пересчитать после исправлений»."
+                )
+            else:
+                reason = (
+                    f"Для интервала {format_depth(top)}–{format_depth(base)} м совпадающие фации Excel не найдены. "
+                    "Проверьте скважину и интервалы фаций."
+                )
             self.matching_preview_title.setText(
-                f"{columns_text}{depth_text}\n{order_text}\nНа этом фото совпадающие интервалы пока не найдены."
+                f"{columns_text}{depth_text}\n{order_text}\n{reason}\n"
+                "Бирюзовый контур показывает найденную колонку керна."
             )
             self._set_preview_pixmap(self.matching_preview, photo_path, "Не удалось открыть исходную фотографию.")
 
@@ -638,6 +704,7 @@ class MainWindow(QMainWindow):
             boxes = value.get("boxes", [])
             if isinstance(boxes, list) and boxes:
                 self.matching_column_counts[self._photo_key(photo_path)] = len(boxes)
+                self.matching_column_boxes[self._photo_key(photo_path)] = boxes
             depth_ranges = value.get("depth_ranges", [])
             if isinstance(depth_ranges, list):
                 labels = []
