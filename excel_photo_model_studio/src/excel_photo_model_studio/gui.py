@@ -498,6 +498,9 @@ class MainWindow(QMainWindow):
             f"Нужно подтвердить интервалы: {report['unconfirmed_photos']}",
             f"Фото без обязательного интервала: {report.get('photos_without_intervals', 0)}",
             f"Фото без распознанного керна: {report.get('photos_without_core_columns', 0)}",
+            f"Фото с найденными фациями: {report.get('photos_with_facies', 0)} из {report.get('photos', 0)}",
+            f"Фото без масок в датасете: {report.get('photos_without_masks', 0)}",
+            f"Полный список фото и причин пропуска: {report.get('photo_inventory', 'photo_inventory.csv')}",
             f"Автоматически восстановлено интервалов фото: "
             f"{report.get('auto_sequenced_photos', report.get('ocr_verified_photos', 0))}",
             f"Спроецировано масок: {report['annotations']}",

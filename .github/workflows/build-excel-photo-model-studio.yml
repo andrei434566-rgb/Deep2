@@ -91,7 +91,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/excel-photo-studio-v')
         uses: softprops/action-gh-release@v2
         with:
-          name: Excel Photo Model Studio 0.3.6
+          name: Excel Photo Model Studio 0.3.7
           generate_release_notes: true
           make_latest: false
           files: |

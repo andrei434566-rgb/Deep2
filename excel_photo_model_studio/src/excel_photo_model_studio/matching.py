@@ -83,10 +83,33 @@ def suggest_missing_intervals(records: list[PhotoRecord], rows: list[Description
         top_cm, base_cm = canonical
         groups.setdefault((well_key(record.well), top_cm, base_cm), []).append(index)
     for (_well, core_top_cm, core_base_cm), indices in groups.items():
+        capacities = {
+            index: _photo_core_capacity_cm(result[index].path)
+            for index in indices
+        }
+        total_capacity_cm = sum(capacities.values())
+        largest_page_cm = max(capacities.values(), default=0)
+        core_span_cm = core_base_cm - core_top_cm
+        # OCR often reads the same *whole sampling interval* from adjacent
+        # report pages. Split only while the group can fit inside that range,
+        # allowing the last page to be partial. If the OCR group is too large,
+        # it is probably a subset of a larger well sequence; leave it for the
+        # complete-well sequencer instead of silently discarding excess pages.
+        if (
+            largest_page_cm <= 0
+            or total_capacity_cm - core_span_cm > largest_page_cm + 2
+        ):
+            for index in indices:
+                record = result[index]
+                result[index] = replace(
+                    record, top=None, base=None, source="ocr_not_found",
+                    mapping_confirmed=False,
+                )
+            continue
         cursor_cm = core_top_cm
         for index in sorted(indices, key=lambda item: _natural_name_key(result[item].path.name)):
             record = result[index]
-            capacity_cm = _photo_core_capacity_cm(record.path)
+            capacity_cm = capacities[index]
             if capacity_cm <= 0 or cursor_cm >= core_base_cm:
                 result[index] = replace(record, source="ocr_columns_not_found", mapping_confirmed=False)
                 continue
@@ -148,10 +171,15 @@ def _sequence_complete_wells(
         ordered_indices = sorted(indices, key=lambda index: _natural_name_key(result[index].path.name))
         ordered_records = [result[index] for index in ordered_indices]
         if not ordered_records or any(
-            record.source not in _AUTOMATIC_SEQUENCE_SOURCES for record in ordered_records
+            record.source not in _AUTOMATIC_SEQUENCE_SOURCES
+            and not (record.source == "filename" and not record.has_interval)
+            for record in ordered_records
         ):
             # Filename and manually entered intervals are authoritative and
             # must never be silently replaced by the full-well sequencer.
+            # A filename with no parsed interval is different: OCR may be
+            # disabled, so it is an unlabelled page and can be safely placed
+            # from the complete Excel core sequence and neighboring pages.
             continue
         core_intervals = _core_intervals_for_well(rows, key)
         if not core_intervals:
@@ -232,7 +260,11 @@ def _sequence_matches_anchors(
     """Reject a full-well plan if it contradicts a trustworthy OCR anchor."""
     core_intervals = _core_intervals_for_well(rows, well_key(records[0].well))
     for record, (top_cm, base_cm, core_index) in zip(records, plan):
-        if record.source in {"ocr", "ocr_verified"} and record.has_interval:
+        if (
+            record.source in {"ocr", "ocr_verified"}
+            and record.mapping_confirmed
+            and record.has_interval
+        ):
             canonical = _matching_core_interval(record, rows)
             if canonical is not None and canonical != core_intervals[core_index]:
                 return False

@@ -10,7 +10,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from excel_photo_model_studio.dataset import build_dataset
+from excel_photo_model_studio.dataset import _report_blockers, build_dataset
 from excel_photo_model_studio.matching import (
     match_photos, read_photo_map, suggest_missing_intervals,
     uncovered_photo_description_intervals, uncovered_photo_intervals, write_photo_map,
@@ -22,6 +22,101 @@ from excel_photo_model_studio.photos import parse_filename
 
 
 class MatchingTests(unittest.TestCase):
+    def test_sequences_filename_only_pages_when_ocr_is_disabled(self):
+        rows = [DescriptionRow(
+            well="67ПО", top=100.0, base=110.0, label="Sand", sheet="Data", row=2,
+            core_top=100.0, core_base=110.0, target_text="Песчаник.",
+        )]
+        records = [
+            PhotoRecord(
+                Path(f"Рис. 5.1-20 Восточно-Тазовское, скв№ 67ПО-{suffix:04d}.jpg"),
+                "67ПО", source="filename",
+            )
+            for suffix in range(1, 20, 2)
+        ]
+
+        with patch("excel_photo_model_studio.matching._photo_core_capacity_cm", return_value=100):
+            sequenced = suggest_missing_intervals(records, rows)
+
+        self.assertEqual(10, len(sequenced))
+        self.assertTrue(all(item.mapping_confirmed for item in sequenced))
+        self.assertEqual("excel_sequenced", sequenced[0].source)
+        self.assertEqual((100.0, 101.0), (sequenced[0].top, sequenced[0].base))
+        self.assertEqual((109.0, 110.0), (sequenced[-1].top, sequenced[-1].base))
+
+    def test_complete_excel_sequence_overrides_unconfirmed_ocr_anchor(self):
+        rows = [DescriptionRow(
+            well="W-1", top=100.0, base=110.0, label="Sand", sheet="Data", row=2,
+            core_top=100.0, core_base=110.0, target_text="Песчаник.",
+        )]
+        records = [
+            PhotoRecord(Path(f"core-{index:04d}.jpg"), "W-1", source="ocr_not_found")
+            for index in range(10)
+        ]
+        # A weak, unconfirmed OCR hit on one page must not veto an exact
+        # complete sequence through the Excel core range.
+        records[4] = PhotoRecord(
+            records[4].path, "W-1", 200.0, 201.0, "ocr", False,
+        )
+
+        with patch("excel_photo_model_studio.matching._photo_core_capacity_cm", return_value=100):
+            sequenced = suggest_missing_intervals(records, rows)
+
+        self.assertEqual(10, len(sequenced))
+        self.assertTrue(all(item.mapping_confirmed for item in sequenced))
+        self.assertEqual((104.0, 105.0), (sequenced[4].top, sequenced[4].base))
+
+    def test_weak_ocr_on_an_earlier_core_range_does_not_drop_later_pages(self):
+        rows = [
+            DescriptionRow(
+                "W-1", 100.0, 102.0, "A", "Data", 2,
+                core_top=100.0, core_base=102.0, target_text="Первая фация.",
+            ),
+            DescriptionRow(
+                "W-1", 110.0, 112.0, "B", "Data", 3,
+                core_top=110.0, core_base=112.0, target_text="Вторая фация.",
+            ),
+        ]
+        records = [
+            PhotoRecord(Path(f"core-{index:04d}.jpg"), "W-1", source="ocr_not_found")
+            for index in range(4)
+        ]
+        records[2] = PhotoRecord(records[2].path, "W-1", 100.0, 102.0, "ocr", False)
+
+        with patch("excel_photo_model_studio.matching._photo_core_capacity_cm", return_value=100):
+            sequenced = suggest_missing_intervals(records, rows)
+
+        self.assertEqual(
+            [(100.0, 101.0), (101.0, 102.0), (110.0, 111.0), (111.0, 112.0)],
+            [(item.top, item.base) for item in sequenced],
+        )
+        self.assertTrue(all(item.mapping_confirmed for item in sequenced))
+
+    def test_partial_ocr_group_gets_page_ranges_not_the_full_well_range(self):
+        rows = [DescriptionRow(
+            well="W-1", top=100.0, base=110.0, label="Sand", sheet="Data", row=2,
+            core_top=100.0, core_base=110.0, target_text="Песчаник.",
+        )]
+        records = [
+            PhotoRecord(Path(f"core-{index:04d}.jpg"), "W-1", 100.0, 110.0, "ocr")
+            for index in range(2)
+        ]
+
+        with patch("excel_photo_model_studio.matching._photo_core_capacity_cm", return_value=100):
+            sequenced = suggest_missing_intervals(records, rows)
+
+        self.assertTrue(all(item.mapping_confirmed for item in sequenced))
+        self.assertEqual([(100.0, 101.0), (101.0, 102.0)], [
+            (item.top, item.base) for item in sequenced
+        ])
+        self.assertTrue(all(item.source == "ocr_sequenced" for item in sequenced))
+
+    def test_dataset_reports_photos_without_masks_as_a_blocker(self):
+        self.assertEqual(
+            ["фото без масок в датасете: 2"],
+            _report_blockers({"photos": 10, "photos_without_masks": 2}),
+        )
+
     def test_ocr_interval_is_auto_confirmed_only_when_it_matches_excel_core_interval(self):
         rows = [DescriptionRow(
             well="67ПО", top=4105.0, base=4108.65, label="Dch", sheet="седимент", row=5,

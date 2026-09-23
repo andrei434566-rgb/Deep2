@@ -169,6 +169,11 @@ def _report_blockers(report: dict) -> list[str]:
             "фото без распознанного керна",
         ),
         (
+            "photos_without_masks",
+            int(report.get("photos_without_masks", 0) or 0),
+            "фото без масок в датасете",
+        ),
+        (
             "uncovered_facies_intervals",
             int(report.get("uncovered_facies_intervals", 0) or 0),
             "участков керна без фации",

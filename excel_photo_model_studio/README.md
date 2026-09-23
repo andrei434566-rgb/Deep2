@@ -4,7 +4,7 @@
 
 ## Готовая Windows-сборка
 
-Скачать ZIP-релиз 0.3.6 можно со страницы [Excel Photo Model Studio 0.3.6 на GitHub](https://github.com/andrei434566-rgb/Deep2/releases/tag/excel-photo-studio-v0.3.6). Распакуйте архив целиком и запустите `Excel_Photo_Model_Studio.exe`.
+Скачать ZIP-релиз 0.3.7 можно со страницы [Excel Photo Model Studio 0.3.7 на GitHub](https://github.com/andrei434566-rgb/Deep2/releases/tag/excel-photo-studio-v0.3.7). Распакуйте архив целиком и запустите `Excel_Photo_Model_Studio.exe`.
 
 ## Входной Excel и выходная схема
 

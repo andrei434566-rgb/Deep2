@@ -1,11 +1,28 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
+from pathlib import Path
 
-from excel_photo_model_studio.photos import extract_depth_interval, extract_well
+from excel_photo_model_studio.photos import discover_photos, extract_depth_interval, extract_well
 
 
 class PhotoOcrParsingTests(unittest.TestCase):
+    def test_discovery_keeps_every_supported_photo_in_nested_folders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "nested").mkdir()
+            for index in range(10):
+                parent = root if index % 2 == 0 else root / "nested"
+                suffix = ".png" if index == 0 else ".JPG"
+                (parent / f"core-{index:04d}{suffix}").write_bytes(b"test")
+            (root / "ignore.txt").write_text("not a photo", encoding="utf-8")
+
+            photos = discover_photos(root)
+
+        self.assertEqual(10, len(photos))
+        self.assertEqual(10, len({photo.path for photo in photos}))
+
     def test_prefers_captioned_full_core_interval_over_column_numbers(self):
         text = (
             "Глубина по керну 4105.00 4106.00 4107.00 4107.94 4108.94. "

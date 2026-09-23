@@ -36,6 +36,7 @@ class ProjectFlowTests(unittest.TestCase):
 
             report = create_project(excel, photos, root / "project")
             self.assertTrue((root / "project" / "table_cache.json").is_file())
+            self.assertTrue((root / "project" / "photo_inventory.csv").is_file())
             detected = json.loads((root / "project" / "detected_columns.json").read_text(encoding="utf-8"))
             self.assertTrue(all(len(item["depth_ranges"]) == 1 for item in detected.values()))
             with patch(
@@ -47,6 +48,8 @@ class ProjectFlowTests(unittest.TestCase):
             self.assertEqual(2, report["confirmed_photos"])
             self.assertEqual(0, report["photos_without_intervals"])
             self.assertEqual(0, report["photos_without_core_columns"])
+            self.assertEqual(2, report["photos_with_facies"])
+            self.assertEqual(0, report["photos_without_masks"])
             self.assertEqual(0, report["uncovered_facies_intervals"])
             self.assertEqual(0, report["uncovered_description_intervals"])
             self.assertGreaterEqual(len(annotations), 2)

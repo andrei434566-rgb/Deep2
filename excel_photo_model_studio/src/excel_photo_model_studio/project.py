@@ -110,6 +110,8 @@ def refresh_project(project_dir: Path) -> dict:
     preview_paths = render_previews(annotations, project_dir / "previews")
     _write_matches(project_dir / "matches.csv", matches)
     _write_annotations(project_dir / "annotations.csv", annotations, preview_paths)
+    inventory_path = project_dir / "photo_inventory.csv"
+    _write_photo_inventory(inventory_path, photos, matches, annotations, columns)
     photo_by_path = {photo.path: photo for photo in photos}
     detected_payload = {}
     for path, boxes in columns.items():
@@ -149,6 +151,17 @@ def refresh_project(project_dir: Path) -> dict:
             "должны быть найдены физические колонки и их интервал.",
         )
         for photo in sorted(photos_without_core, key=lambda item: item.path.name.casefold())
+    )
+    photos_with_facies = {item.photo.path for item in matches}
+    photos_with_masks = {item.photo_path for item in annotations}
+    photos_without_masks = [photo for photo in photos if photo.path not in photos_with_masks]
+    all_issues.extend(
+        Issue(
+            "error", photo.path.name,
+            "Фото не попало в датасет масок: проверьте интервал, распознанные колонки керна "
+            "и наличие перекрывающих фаций Excel.",
+        )
+        for photo in sorted(photos_without_masks, key=lambda item: item.path.name.casefold())
     )
     uncovered = {
         photo.path: uncovered_photo_intervals(photo, matches)
@@ -220,6 +233,11 @@ def refresh_project(project_dir: Path) -> dict:
         "photos_without_core_columns": len(photos_without_core),
         "matches": len(matches),
         "annotations": len(annotations),
+        "photos_with_facies": len(photos_with_facies),
+        "photos_without_facies": len(photos) - len(photos_with_facies),
+        "photos_with_masks": len(photos_with_masks),
+        "photos_without_masks": len(photos_without_masks),
+        "photo_inventory": str(inventory_path),
         "approved_annotations": sum(item.approved for item in annotations),
         "excel_text_targets": sum(bool(item.target_text.strip()) for item in rows),
         "facies_rows_without_description": sum(not item.target_text.strip() for item in rows),
@@ -369,6 +387,53 @@ def _write_annotations(path: Path, annotations: list[Annotation], previews: dict
         "annotation_id", "photo", "preview", "well", "photo_top", "photo_base",
         "depth_top", "depth_base", "facies_top", "facies_base", "label", "polygon_json", "image_width", "image_height",
         "source_sheet", "source_row", "source_file", "target_text", "association", "environment", "field_name", "approved",
+    ))
+
+
+def _write_photo_inventory(path: Path, photos, matches, annotations, columns) -> None:
+    """Persist one auditable row per discovered image, including misses."""
+    facies_by_photo: dict[Path, set[tuple[str, str, int]]] = {}
+    masks_by_photo: dict[Path, int] = {}
+    for item in matches:
+        facies_by_photo.setdefault(item.photo.path, set()).add((
+            item.description.label, item.description.sheet, item.description.row,
+        ))
+    for item in annotations:
+        masks_by_photo[item.photo_path] = masks_by_photo.get(item.photo_path, 0) + 1
+
+    inventory = []
+    for photo in photos:
+        boxes = columns.get(photo.path, [])
+        facies_count = len(facies_by_photo.get(photo.path, ()))
+        mask_count = masks_by_photo.get(photo.path, 0)
+        if not photo.mapping_confirmed or not photo.has_interval:
+            status = "NO_CONFIRMED_INTERVAL"
+        elif not boxes:
+            status = "NO_CORE_COLUMNS"
+        elif not facies_count:
+            status = "NO_FACIES_MATCH"
+        elif not mask_count:
+            status = "NO_MASKS"
+        else:
+            status = "READY_FOR_REVIEW"
+        inventory.append({
+            "photo": str(photo.path),
+            "file_name": photo.path.name,
+            "well": photo.well,
+            "depth_top_m": "" if photo.top is None else format_depth(photo.top),
+            "depth_base_m": "" if photo.base is None else format_depth(photo.base),
+            "interval_source": photo.source,
+            "interval_confirmed": "1" if photo.mapping_confirmed else "0",
+            "core_columns": len(boxes),
+            "core_capacity_m": format_depth(core_photo_capacity_centimeters(boxes) / 100),
+            "matched_facies": facies_count,
+            "mask_count": mask_count,
+            "status": status,
+        })
+    _write_dict_rows(path, inventory, fieldnames=(
+        "photo", "file_name", "well", "depth_top_m", "depth_base_m",
+        "interval_source", "interval_confirmed", "core_columns", "core_capacity_m",
+        "matched_facies", "mask_count", "status",
     ))
 
 
