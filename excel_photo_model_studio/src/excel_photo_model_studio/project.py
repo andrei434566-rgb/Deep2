@@ -112,6 +112,10 @@ def refresh_project(project_dir: Path) -> dict:
     _write_annotations(project_dir / "annotations.csv", annotations, preview_paths)
     inventory_path = project_dir / "photo_inventory.csv"
     _write_photo_inventory(inventory_path, photos, matches, annotations, columns)
+    facies_inventory_path = project_dir / "facies_inventory.csv"
+    unmatched_facies_rows = _write_facies_inventory(
+        facies_inventory_path, rows, confirmed, matches,
+    )
     photo_by_path = {photo.path: photo for photo in photos}
     detected_payload = {}
     for path, boxes in columns.items():
@@ -238,6 +242,8 @@ def refresh_project(project_dir: Path) -> dict:
         "photos_with_masks": len(photos_with_masks),
         "photos_without_masks": len(photos_without_masks),
         "photo_inventory": str(inventory_path),
+        "facies_inventory": str(facies_inventory_path),
+        "excel_facies_rows_without_photo_match": unmatched_facies_rows,
         "approved_annotations": sum(item.approved for item in annotations),
         "excel_text_targets": sum(bool(item.target_text.strip()) for item in rows),
         "facies_rows_without_description": sum(not item.target_text.strip() for item in rows),
@@ -435,6 +441,62 @@ def _write_photo_inventory(path: Path, photos, matches, annotations, columns) ->
         "interval_source", "interval_confirmed", "core_columns", "core_capacity_m",
         "matched_facies", "mask_count", "status",
     ))
+
+
+def _write_facies_inventory(path: Path, rows, photos, matches) -> int:
+    """Audit each parsed Excel facies row against all confirmed photo ranges."""
+    def row_key(item) -> tuple[str, str, int]:
+        source_file = str(Path(item.source_file).expanduser().resolve()) if item.source_file else ""
+        return source_file.casefold(), item.sheet, item.row
+
+    matched_photos: dict[tuple[str, str, int], set[str]] = {}
+    for match in matches:
+        matched_photos.setdefault(row_key(match.description), set()).add(match.photo.path.name)
+
+    output = []
+    for row in rows:
+        key = well_key(row.well)
+        top_cm = meters_to_centimeters(row.top)
+        base_cm = meters_to_centimeters(row.base)
+        overlapping = [
+            photo.path.name
+            for photo in photos
+            if (not key or well_key(photo.well) == key)
+            and photo.has_interval
+            and min(base_cm, meters_to_centimeters(photo.base))
+            > max(top_cm, meters_to_centimeters(photo.top))
+        ]
+        matched = sorted(matched_photos.get(row_key(row), ()), key=str.casefold)
+        if not row.thickness_valid:
+            status = "INVALID_FACIES_THICKNESS"
+        elif matched:
+            status = "MATCHED"
+        elif overlapping:
+            status = "PHOTO_OVERLAPS_BUT_ROW_NOT_MATCHED"
+        else:
+            status = "NO_PHOTO_OVERLAP"
+        output.append({
+            "source_file": row.source_file,
+            "sheet": row.sheet,
+            "excel_row": row.row,
+            "well": row.well,
+            "facies_top_m": format_depth(row.top),
+            "facies_base_m": format_depth(row.base),
+            "facies_thickness_m": "" if row.thickness is None else format_depth(row.thickness),
+            "thickness_valid": "1" if row.thickness_valid else "0",
+            "label": row.label,
+            "short_description_present": "1" if row.target_text.strip() else "0",
+            "target_text": row.target_text,
+            "overlapping_photos": ", ".join(sorted(set(overlapping), key=str.casefold)),
+            "matched_photos": ", ".join(matched),
+            "status": status,
+        })
+    _write_dict_rows(path, output, fieldnames=(
+        "source_file", "sheet", "excel_row", "well", "facies_top_m", "facies_base_m",
+        "facies_thickness_m", "thickness_valid", "label", "short_description_present",
+        "target_text", "overlapping_photos", "matched_photos", "status",
+    ))
+    return sum(not matched_photos.get(row_key(row)) for row in rows)
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:

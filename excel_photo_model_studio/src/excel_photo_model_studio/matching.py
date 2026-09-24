@@ -63,6 +63,12 @@ def suggest_missing_intervals(records: list[PhotoRecord], rows: list[Description
         updated = replace(record, well=well) if well != record.well else record
         result.append(updated)
 
+    # Figure numbers and other numeric fragments in filenames can look like
+    # depth ranges (for example ``Рис. 15.1-20 ...``). A filename interval is
+    # trusted only when it intersects the selected well's Excel core/facies
+    # ranges; otherwise let OCR/full-well sequencing recover the photo.
+    result = _discard_filename_intervals_outside_excel(result, rows)
+
     # A failed caption OCR must not remove an otherwise valid page from the
     # well. When the selected folder contains the complete photographed core,
     # pack every page into the ordered core-sampling ranges from Excel. OCR
@@ -172,14 +178,17 @@ def _sequence_complete_wells(
         ordered_records = [result[index] for index in ordered_indices]
         if not ordered_records or any(
             record.source not in _AUTOMATIC_SEQUENCE_SOURCES
-            and not (record.source == "filename" and not record.has_interval)
+            and record.source != "filename"
+            and not (
+                record.source == "manual"
+                and record.mapping_confirmed
+                and record.has_interval
+            )
             for record in ordered_records
         ):
-            # Filename and manually entered intervals are authoritative and
-            # must never be silently replaced by the full-well sequencer.
-            # A filename with no parsed interval is different: OCR may be
-            # disabled, so it is an unlabelled page and can be safely placed
-            # from the complete Excel core sequence and neighboring pages.
+            # Complete automatic sequences may include verified filename or
+            # manually edited anchors. Their intervals must agree with the
+            # Excel-derived plan before only the missing pages are filled.
             continue
         core_intervals = _core_intervals_for_well(rows, key)
         if not core_intervals:
@@ -193,6 +202,8 @@ def _sequence_complete_wells(
         for result_index, record, (top_cm, base_cm, _core_index) in zip(
             ordered_indices, ordered_records, plan,
         ):
+            if record.source == "manual" and record.mapping_confirmed and record.has_interval:
+                continue
             result[result_index] = replace(
                 record,
                 top=centimeters_to_meters(top_cm),
@@ -257,7 +268,7 @@ def _sequence_matches_anchors(
     records: list[PhotoRecord], rows: list[DescriptionRow],
     plan: list[tuple[int, int, int]],
 ) -> bool:
-    """Reject a full-well plan if it contradicts a trustworthy OCR anchor."""
+    """Reject a full-well plan if it contradicts a trusted depth anchor."""
     core_intervals = _core_intervals_for_well(rows, well_key(records[0].well))
     for record, (top_cm, base_cm, core_index) in zip(records, plan):
         if (
@@ -268,12 +279,58 @@ def _sequence_matches_anchors(
             canonical = _matching_core_interval(record, rows)
             if canonical is not None and canonical != core_intervals[core_index]:
                 return False
+        if (
+            record.source in {"filename", "manual"}
+            and record.mapping_confirmed
+            and record.has_interval
+        ):
+            if (
+                abs(meters_to_centimeters(record.top) - top_cm) > 2
+                or abs(meters_to_centimeters(record.base) - base_cm) > 2
+            ):
+                return False
         if record.source == "ocr_sequenced" and record.has_interval:
             old_top_cm = meters_to_centimeters(record.top)
             old_base_cm = meters_to_centimeters(record.base)
             if abs(old_top_cm - top_cm) > 2 or abs(old_base_cm - base_cm) > 2:
                 return False
     return True
+
+
+def _discard_filename_intervals_outside_excel(
+    records: list[PhotoRecord], rows: list[DescriptionRow],
+) -> list[PhotoRecord]:
+    result: list[PhotoRecord] = []
+    wells = {well_key(row.well) for row in rows if well_key(row.well)}
+    for record in records:
+        if record.source != "filename" or not record.has_interval:
+            result.append(record)
+            continue
+        key = well_key(record.well)
+        # Do not invalidate a filename range if its well is ambiguous.
+        if not key and len(wells) != 1:
+            result.append(record)
+            continue
+        candidates = [row for row in rows if not key or well_key(row.well) == key]
+        if not candidates:
+            result.append(record)
+            continue
+        photo_top_cm = meters_to_centimeters(record.top)
+        photo_base_cm = meters_to_centimeters(record.base)
+        intersects_excel = any(
+            min(photo_base_cm, meters_to_centimeters(bottom))
+            > max(photo_top_cm, meters_to_centimeters(top))
+            for row in candidates
+            for top, bottom in (
+                (row.top, row.base),
+                (row.core_top, row.core_base),
+            )
+            if top is not None and bottom is not None and bottom > top
+        )
+        result.append(record if intersects_excel else replace(
+            record, top=None, base=None, source="not_found", mapping_confirmed=False,
+        ))
+    return result
 
 
 def _resolve_well(record: PhotoRecord, canonical_wells: dict[str, str], single_well: str) -> str:

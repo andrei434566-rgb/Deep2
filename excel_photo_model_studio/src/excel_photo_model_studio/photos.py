@@ -22,6 +22,8 @@ def parse_filename(path: Path) -> PhotoRecord:
     stem = path.stem.replace("−", "-").replace("–", "-").replace("—", "-")
     matches = list(re.finditer(r"(?P<top>\d{2,6}(?:[.,]\d{1,4})?)\s*-\s*(?P<base>\d{2,6}(?:[.,]\d{1,4})?)", stem))
     for match in reversed(matches):
+        if _is_figure_number(stem, match.start()):
+            continue
         top = as_float(match.group("top"))
         base = as_float(match.group("base"))
         if top is None or base is None or base <= top or base - top > 500:
@@ -31,6 +33,12 @@ def parse_filename(path: Path) -> PhotoRecord:
         well = _well_hint(prefix) or display_text(prefix)
         return PhotoRecord(path=path, well=well, top=top, base=base, source="filename", mapping_confirmed=True)
     return PhotoRecord(path=path, well=_well_hint(stem))
+
+
+def _is_figure_number(stem: str, start: int) -> bool:
+    """Figure references such as ``Fig. 15.1-20`` are not depth intervals."""
+    before = stem[:start]
+    return re.search(r"(?:рис(?:унок)?|fig(?:ure)?)\s*\.?\s*$", before, re.IGNORECASE) is not None
 
 
 def discover_photos(

@@ -10,7 +10,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from excel_photo_model_studio.dataset import _report_blockers, build_dataset
+from excel_photo_model_studio.dataset import _report_blockers, _split_sources, build_dataset
 from excel_photo_model_studio.matching import (
     match_photos, read_photo_map, suggest_missing_intervals,
     uncovered_photo_description_intervals, uncovered_photo_intervals, write_photo_map,
@@ -22,6 +22,72 @@ from excel_photo_model_studio.photos import parse_filename
 
 
 class MatchingTests(unittest.TestCase):
+    def test_sequences_missing_pages_around_verified_filename_anchors(self):
+        rows = [DescriptionRow(
+            well="W-1", top=100.0, base=110.0, label="Sand", sheet="Data", row=2,
+            core_top=100.0, core_base=110.0, target_text="Песчаник.",
+        )]
+        records = [PhotoRecord(
+            Path(f"core-{index:04d}.jpg"), "W-1", source="not_found",
+        ) for index in range(10)]
+        records[0] = PhotoRecord(records[0].path, "W-1", 100.0, 101.0, "filename", True)
+        records[9] = PhotoRecord(records[9].path, "W-1", 109.0, 110.0, "filename", True)
+
+        with patch("excel_photo_model_studio.matching._photo_core_capacity_cm", return_value=100):
+            sequenced = suggest_missing_intervals(records, rows)
+
+        self.assertTrue(all(item.mapping_confirmed for item in sequenced))
+        self.assertEqual((100.0, 101.0), (sequenced[0].top, sequenced[0].base))
+        self.assertEqual((109.0, 110.0), (sequenced[-1].top, sequenced[-1].base))
+
+    def test_manual_anchor_is_preserved_while_other_pages_are_sequenced(self):
+        rows = [DescriptionRow(
+            well="W-1", top=100.0, base=110.0, label="Sand", sheet="Data", row=2,
+            core_top=100.0, core_base=110.0, target_text="Песчаник.",
+        )]
+        records = [PhotoRecord(
+            Path(f"core-{index:04d}.jpg"), "W-1", source="not_found",
+        ) for index in range(10)]
+        records[4] = PhotoRecord(records[4].path, "W-1", 104.0, 105.0, "manual", True)
+
+        with patch("excel_photo_model_studio.matching._photo_core_capacity_cm", return_value=100):
+            sequenced = suggest_missing_intervals(records, rows)
+
+        self.assertTrue(all(item.mapping_confirmed for item in sequenced))
+        self.assertEqual("manual", sequenced[4].source)
+        self.assertEqual((104.0, 105.0), (sequenced[4].top, sequenced[4].base))
+
+    def test_rejects_conflicting_manual_anchor_without_overwriting_it(self):
+        rows = [DescriptionRow(
+            well="W-1", top=100.0, base=110.0, label="Sand", sheet="Data", row=2,
+            core_top=100.0, core_base=110.0, target_text="Песчаник.",
+        )]
+        records = [PhotoRecord(
+            Path(f"core-{index:04d}.jpg"), "W-1", source="not_found",
+        ) for index in range(10)]
+        records[0] = PhotoRecord(records[0].path, "W-1", 105.0, 106.0, "manual", True)
+
+        with patch("excel_photo_model_studio.matching._photo_core_capacity_cm", return_value=100):
+            sequenced = suggest_missing_intervals(records, rows)
+
+        self.assertEqual("manual", sequenced[0].source)
+        self.assertEqual((105.0, 106.0), (sequenced[0].top, sequenced[0].base))
+        self.assertTrue(all(not item.mapping_confirmed for item in sequenced[1:]))
+
+    def test_wrong_filename_interval_outside_excel_is_recovered_from_full_sequence(self):
+        rows = [DescriptionRow(
+            well="W-1", top=100.0, base=110.0, label="Sand", sheet="Data", row=2,
+            core_top=100.0, core_base=110.0, target_text="Песчаник.",
+        )]
+        photo = PhotoRecord(Path("W-1 120-130.jpg"), "W-1", 120.0, 130.0, "filename", True)
+
+        with patch("excel_photo_model_studio.matching._photo_core_capacity_cm", return_value=1000):
+            sequenced = suggest_missing_intervals([photo], rows)
+
+        self.assertEqual(1, len(sequenced))
+        self.assertEqual("excel_sequenced", sequenced[0].source)
+        self.assertEqual((100.0, 110.0), (sequenced[0].top, sequenced[0].base))
+
     def test_sequences_filename_only_pages_when_ocr_is_disabled(self):
         rows = [DescriptionRow(
             well="67ПО", top=100.0, base=110.0, label="Sand", sheet="Data", row=2,
@@ -334,6 +400,25 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(1, manifest["val_photo_count"])
         self.assertEqual(["Sand"], manifest["class_names"])
         self.assertEqual(3, manifest["caption_count"])
+
+
+class DatasetSplitTests(unittest.TestCase):
+    def test_validation_falls_back_to_photo_split_when_well_split_loses_all_classes(self):
+        by_photo = {
+            photo: [{"label": label, "well": well}]
+            for photo, label, well in (
+                ("a", "A", "w1"), ("b", "A", "w1"),
+                ("c", "B", "w1"), ("d", "B", "w1"),
+                ("e", "C", "w2"), ("f", "C", "w2"),
+                ("g", "D", "w2"), ("h", "D", "w2"),
+            )
+        }
+
+        split, strategy = _split_sources(by_photo)
+
+        self.assertEqual("photo_fallback", strategy)
+        self.assertIn("val", split.values())
+        self.assertIn("train", split.values())
 
 
 if __name__ == "__main__":

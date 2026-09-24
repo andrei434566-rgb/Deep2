@@ -195,6 +195,7 @@ class MainWindow(QMainWindow):
         self.dataset_process: QProcess | None = None
         self.process: QProcess | None = None
         self.analysis_process: QProcess | None = None
+        self.discovery_process: QProcess | None = None
         self._pending_project_action = ""
         self._ensure_training_output_paths()
 
@@ -306,23 +307,205 @@ class MainWindow(QMainWindow):
         form.addRow("Early stopping patience:", self.patience)
         form.addRow("Эпохи модели «Краткое описание»:", self.description_epochs)
         layout.addLayout(form)
+        queue_title = QLabel(
+            "Автоматический режим: добавьте пары «таблица + папка фото» для каждой скважины. "
+            "Дальше приложение само сопоставит интервалы, проверит покрытие, соберёт датасет и обучит модель."
+        )
+        queue_title.setWordWrap(True)
+        layout.addWidget(queue_title)
+        self.automatic_queue = QTableWidget(0, 2)
+        self.automatic_queue.setHorizontalHeaderLabels(("Файл Excel", "Папка фотографий"))
+        self.automatic_queue.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.automatic_queue.setMaximumHeight(170)
+        layout.addWidget(self.automatic_queue)
+        queue_buttons = QHBoxLayout()
+        discover_wells = QPushButton("Автонаходить Excel и фото в папке")
+        discover_wells.clicked.connect(self._discover_automatic_wells)
+        self.discovery_button = discover_wells
+        add_well = QPushButton("Добавить скважину (Excel + фото)")
+        add_well.clicked.connect(self._add_automatic_well)
+        remove_well = QPushButton("Убрать выбранную")
+        remove_well.clicked.connect(self._remove_automatic_well)
+        self.automatic_train_button = QPushButton("Автоматически обработать всё и создать best.pt")
+        self.automatic_train_button.clicked.connect(self._start_automatic_training)
+        queue_buttons.addWidget(discover_wells)
+        queue_buttons.addWidget(add_well)
+        queue_buttons.addWidget(remove_well)
+        queue_buttons.addWidget(self.automatic_train_button)
+        queue_buttons.addStretch(1)
+        layout.addLayout(queue_buttons)
         self.catalog_status = QLabel()
         self.catalog_status.setWordWrap(True)
         layout.addWidget(self.catalog_status)
         buttons = QHBoxLayout()
         self.dataset_button = QPushButton("Собрать датасет")
         self.dataset_button.clicked.connect(self._build_dataset)
-        train = QPushButton("Обучить с нуля единый best.pt: слои + фации + описание")
-        train.clicked.connect(self._start_training)
+        self.standard_train_button = QPushButton("Обучить с нуля единый best.pt: слои + фации + описание")
+        self.standard_train_button.clicked.connect(self._start_training)
         buttons.addWidget(self.dataset_button)
-        buttons.addWidget(train)
+        buttons.addWidget(self.standard_train_button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
         self.train_log = QTextEdit()
         self.train_log.setReadOnly(True)
         layout.addWidget(self.train_log, 1)
         self.tabs.addTab(page, "3. Датасет и best.pt")
+        self._load_automatic_queue()
         self._update_catalog_status()
+
+    def _automatic_queue_path(self) -> Path:
+        local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        return local_app_data / "ExcelPhotoModelStudio" / "automatic_training_queue.json"
+
+    def _load_automatic_queue(self) -> None:
+        try:
+            items = json.loads(self._automatic_queue_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            items = []
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if isinstance(item, dict) and item.get("excel") and item.get("photos"):
+                self._append_automatic_well(item["excel"], item["photos"])
+
+    def _append_automatic_well(self, excel: str, photos: str) -> None:
+        row = self.automatic_queue.rowCount()
+        self.automatic_queue.insertRow(row)
+        for column, value in enumerate((excel, photos)):
+            item = QTableWidgetItem(str(value))
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.automatic_queue.setItem(row, column, item)
+
+    def _save_automatic_queue(self) -> None:
+        items = []
+        for row in range(self.automatic_queue.rowCount()):
+            excel = self.automatic_queue.item(row, 0)
+            photos = self.automatic_queue.item(row, 1)
+            if excel and photos:
+                items.append({"excel": excel.text(), "photos": photos.text()})
+        path = self._automatic_queue_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(items, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _add_automatic_well(self) -> None:
+        excel, _ = QFileDialog.getOpenFileName(
+            self, "Выберите Excel для скважины", str(Path.home()),
+            "Таблицы (*.xlsx *.xlsm *.xltx *.xltm *.xls *.csv *.tsv)",
+        )
+        if not excel:
+            return
+        photos = QFileDialog.getExistingDirectory(self, "Выберите папку фото этой скважины", str(Path(excel).parent))
+        if not photos:
+            return
+        for row in range(self.automatic_queue.rowCount()):
+            if (self.automatic_queue.item(row, 0).text() == excel
+                    and self.automatic_queue.item(row, 1).text() == photos):
+                return self._error("Эта пара Excel + фото уже есть в очереди.")
+        self._append_automatic_well(excel, photos)
+        self._save_automatic_queue()
+
+    def _discover_automatic_wells(self) -> None:
+        if self.discovery_process and self.discovery_process.state() != QProcess.ProcessState.NotRunning:
+            return self._error("Поиск архива уже выполняется.")
+        root = QFileDialog.getExistingDirectory(self, "Выберите папку с архивом Excel и фото", str(Path.home()))
+        if not root:
+            return
+        self.discovery_button.setEnabled(False)
+        self.discovery_button.setText("Ищу Excel и фото…")
+        self.discovery_process = QProcess(self)
+        self.discovery_process.setProgram(sys.executable)
+        self.discovery_process.setArguments(self._with_launcher(["discover-wells", "--root", root]))
+        self.discovery_process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.discovery_process.finished.connect(self._automatic_discovery_finished)
+        self.discovery_process.start()
+
+    def _automatic_discovery_finished(self, code: int, _status) -> None:
+        self.discovery_button.setEnabled(True)
+        self.discovery_button.setText("Автонаходить Excel и фото в папке")
+        if not self.discovery_process:
+            return
+        output = bytes(self.discovery_process.readAllStandardOutput()).decode(errors="replace").strip()
+        if code != 0:
+            return self._error(output or "Не удалось просканировать архив.")
+        try:
+            result = json.loads(output)
+        except ValueError:
+            return self._error("Сканер вернул некорректный результат. Подробности: " + output[:500])
+        existing = {
+            (self.automatic_queue.item(row, 0).text(), self.automatic_queue.item(row, 1).text())
+            for row in range(self.automatic_queue.rowCount())
+        }
+        added = 0
+        for pair in result["pairs"]:
+            key = (pair["excel"], pair["photos"])
+            if key not in existing:
+                self._append_automatic_well(*key)
+                existing.add(key)
+                added += 1
+        if added:
+            self._save_automatic_queue()
+        message = (
+            f"Найдено Excel: {result['workbooks_found']}; фотографий: {result['photos_found']}; "
+            f"однозначных пар добавлено: {added}."
+        )
+        if result["unmatched"]:
+            examples = "\n".join(
+                f"• {Path(item['excel']).name}: {item['reason']}"
+                for item in result["unmatched"][:8]
+            )
+            tail = f"\n…и ещё {len(result['unmatched']) - 8}" if len(result["unmatched"]) > 8 else ""
+            message += f"\n\nНе сопоставлено автоматически — проверьте эти случаи вручную:\n{examples}{tail}"
+        QMessageBox.information(self, "Автопоиск завершён", message)
+
+    def _remove_automatic_well(self) -> None:
+        rows = sorted({index.row() for index in self.automatic_queue.selectedIndexes()}, reverse=True)
+        for row in rows:
+            self.automatic_queue.removeRow(row)
+        self._save_automatic_queue()
+
+    def _start_automatic_training(self) -> None:
+        if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
+            return self._error("Обучение уже запущено.")
+        wells = []
+        for row in range(self.automatic_queue.rowCount()):
+            excel = self.automatic_queue.item(row, 0)
+            photos = self.automatic_queue.item(row, 1)
+            if excel and photos:
+                wells.append({"excel": excel.text(), "photos": photos.text()})
+        if not wells:
+            return self._error("Добавьте хотя бы одну пару Excel + папка фото.")
+        if not self.dataset_output.edit.text().strip() or not self.model_output.edit.text().strip():
+            return self._error("Укажите папки для нового датасета и результата модели.")
+        try:
+            self._save_automatic_queue()
+            local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+            job_dir = local_app_data / "ExcelPhotoModelStudio" / "automatic_jobs" / f"job_{uuid4().hex[:12]}"
+            job_dir.mkdir(parents=True, exist_ok=False)
+            manifest = job_dir / "manifest.json"
+            manifest.write_text(json.dumps({"wells": wells}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            return self._error(f"Не удалось сохранить очередь автоматического обучения: {exc}")
+        command = [
+            "auto-train", "--manifest", str(manifest),
+            "--dataset", str(self.dataset_output.value()), "--output", str(self.model_output.value()),
+            "--architecture", str(self.architecture.currentData()),
+            "--epochs", str(self.epochs.value()), "--patience", str(self.patience.value()),
+            "--description-epochs", str(self.description_epochs.value()),
+        ]
+        if not self.ocr.isChecked():
+            command.append("--no-ocr")
+        self.process = QProcess(self)
+        self.process.setProgram(sys.executable)
+        self.process.setArguments(self._with_launcher(command))
+        self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.process.readyReadStandardOutput.connect(self._read_training_output)
+        self.process.finished.connect(self._training_finished)
+        self.train_log.clear()
+        self.train_log.append(f"Поставлено наборов скважин: {len(wells)}. Автоматический цикл запущен.")
+        self.automatic_train_button.setEnabled(False)
+        self.dataset_button.setEnabled(False)
+        self.standard_train_button.setEnabled(False)
+        self.process.start()
 
     def _build_analyze_tab(self) -> None:
         page = QWidget(self)
@@ -402,6 +585,11 @@ class MainWindow(QMainWindow):
             self.photo_table.setCellWidget(row, 5, order)
             source = QTableWidgetItem(record.source)
             source.setFlags(source.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            source.setData(Qt.ItemDataRole.UserRole, (
+                record.well,
+                "" if record.top is None else format_depth(record.top),
+                "" if record.base is None else format_depth(record.base),
+            ))
             self.photo_table.setItem(row, 6, source)
         self.photo_table.setUpdatesEnabled(True)
         self.photo_table.blockSignals(False)
@@ -420,9 +608,19 @@ class MainWindow(QMainWindow):
             column_order = order_widget.currentData() if isinstance(order_widget, QComboBox) else COLUMN_ORDER_AUTO
             if confirmed and (not well or top is None or base is None or base <= top):
                 return self._error(f"{path.name}: для подтверждения нужны скважина и корректный интервал.")
+            source_item = self.photo_table.item(row, 6)
+            original = source_item.data(Qt.ItemDataRole.UserRole) if source_item else None
+            current = (
+                well,
+                "" if top is None else format_depth(top),
+                "" if base is None else format_depth(base),
+            )
+            source = source_item.text().strip() if source_item else "not_found"
+            if original is not None and current != tuple(original):
+                source = "manual"
             records.append(PhotoRecord(
                 path=path, well=well, top=top, base=base,
-                source=self.photo_table.item(row, 6).text().strip() or "manual",
+                source=source or "manual",
                 mapping_confirmed=confirmed,
                 column_order=column_order,
             ))
@@ -513,6 +711,10 @@ class MainWindow(QMainWindow):
             f"Строк Excel с «Кратким описанием»: {report.get('excel_text_targets', 0)}",
             f"Строк фаций без «Краткого описания»: "
             f"{report.get('facies_rows_without_description', 0)}",
+            f"Строк фаций без сопоставленного фото: "
+            f"{report.get('excel_facies_rows_without_photo_match', 0)}",
+            f"Подробная сверка каждой строки Excel: "
+            f"{report.get('facies_inventory', 'facies_inventory.csv')}",
             f"Масок с «Кратким описанием»: {report.get('text_targets', 0)}",
             f"Подтверждено масок: {report['approved_annotations']}",
             f"Блокирующих ошибок: {report.get('blocking_errors', 0)}",
@@ -824,6 +1026,12 @@ class MainWindow(QMainWindow):
 
     def _training_finished(self, code: int, _status) -> None:
         self.train_log.append(f"\nПроцесс завершён, код {code}.")
+        if hasattr(self, "automatic_train_button"):
+            self.automatic_train_button.setEnabled(True)
+        if hasattr(self, "dataset_button"):
+            self.dataset_button.setEnabled(True)
+        if hasattr(self, "standard_train_button"):
+            self.standard_train_button.setEnabled(True)
         if code == 0:
             self.analysis_model.set_value(self.model_output.value() / "best.pt")
 

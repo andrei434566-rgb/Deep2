@@ -4,7 +4,9 @@ import unittest
 import tempfile
 from pathlib import Path
 
-from excel_photo_model_studio.photos import discover_photos, extract_depth_interval, extract_well
+from excel_photo_model_studio.photos import (
+    discover_photos, extract_depth_interval, extract_well, parse_filename,
+)
 
 
 class PhotoOcrParsingTests(unittest.TestCase):
@@ -34,6 +36,19 @@ class PhotoOcrParsingTests(unittest.TestCase):
 
     def test_extracts_well_and_removes_figure_suffix(self):
         self.assertEqual("67ПО", extract_well("Восточно-Тазовское м-е, скв№ 67ПО-0001"))
+
+    def test_filename_parser_does_not_read_figure_number_as_depth(self):
+        record = parse_filename(Path("Рис. 15.1-20 Восточно-Тазовское, скв№ 67ПО-0001.jpg"))
+
+        self.assertEqual("67ПО", record.well)
+        self.assertFalse(record.has_interval)
+
+    def test_filename_parser_still_reads_depth_after_a_figure_reference(self):
+        record = parse_filename(Path(
+            "Рис. 15.1-20 Восточно-Тазовское, скв№ 67ПО 4104,90-4105,90.jpg"
+        ))
+
+        self.assertEqual((4104.9, 4105.9), (record.top, record.base))
 
     def test_rejects_numbers_from_ruler_and_figure_caption_as_depth_pair(self):
         self.assertIsNone(extract_depth_interval(

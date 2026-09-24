@@ -5,13 +5,6 @@ import json
 import sys
 from pathlib import Path
 
-from .catalog import load_project_catalog
-from .dataset import build_dataset
-from .inference import analyze_photos_to_excel
-from .project import create_project, refresh_project
-from .training import train_bundle, train_model
-
-
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Excel Photo Model Studio: Excel + photos -> reviewed YOLO dataset -> best.pt")
     commands = root.add_subparsers(dest="command", required=True)
@@ -44,6 +37,21 @@ def parser() -> argparse.ArgumentParser:
     train.add_argument("--description-patience", type=int, default=8)
     train.add_argument("--visual-only", action="store_true", help="Обучить только YOLO best.pt без модели краткого описания")
 
+    automatic = commands.add_parser(
+        "auto-train", help="Автоматически обработать очередь Excel + фото, собрать датасет и обучить best.pt",
+    )
+    automatic.add_argument("--manifest", type=Path, required=True, help="JSON со списком пар Excel + папка фото")
+    automatic.add_argument("--dataset", type=Path, required=True)
+    automatic.add_argument("--output", type=Path, required=True)
+    automatic.add_argument("--architecture", default="yolo11n-seg.yaml")
+    automatic.add_argument("--epochs", type=int, default=50)
+    automatic.add_argument("--patience", type=int, default=12)
+    automatic.add_argument("--description-epochs", type=int, default=40)
+    automatic.add_argument("--no-ocr", action="store_true")
+
+    discovery = commands.add_parser("discover-wells", help="Найти пары Excel + фото в архивной папке")
+    discovery.add_argument("--root", type=Path, required=True)
+
     analyze = commands.add_parser("analyze", help="Применить единый best.pt и создать стандартный Excel из 22 столбцов")
     analyze.add_argument("--model", type=Path, required=True)
     analyze.add_argument("--photos", type=Path, required=True)
@@ -56,16 +64,24 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     args = parser().parse_args(argv)
     try:
         if args.command == "create":
+            from .project import create_project
             result = create_project(args.excel, args.photos, args.project, mapping_file=args.mapping, use_ocr=args.ocr)
         elif args.command == "refresh":
+            from .project import refresh_project
             result = refresh_project(args.project)
         elif args.command == "dataset":
+            from .catalog import load_project_catalog
+            from .dataset import build_dataset
             projects = load_project_catalog(args.catalog) if args.catalog else args.project
             result = build_dataset(projects, args.output)
         elif args.command == "train":
+            from .training import train_bundle, train_model
             device = args.device
             if isinstance(device, str) and device.isdigit():
                 device = int(device)
@@ -81,7 +97,20 @@ def main(argv: list[str] | None = None) -> int:
                     description_patience=args.description_patience,
                 )
             result = trainer(args.dataset, args.output, **options)
+        elif args.command == "auto-train":
+            from .autopipeline import run_automatic_training
+            result = run_automatic_training(
+                args.manifest, args.dataset, args.output,
+                architecture=args.architecture, epochs=args.epochs,
+                patience=args.patience, description_epochs=args.description_epochs,
+                use_ocr=not args.no_ocr,
+                progress=lambda message: print(message, flush=True),
+            )
+        elif args.command == "discover-wells":
+            from .autodiscovery import discover_well_pairs
+            result = discover_well_pairs(args.root)
         elif args.command == "analyze":
+            from .inference import analyze_photos_to_excel
             result = analyze_photos_to_excel(
                 args.model, args.photos, args.output_excel,
                 description_model=args.description_model, confidence=args.confidence,
@@ -89,7 +118,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             from .gui import run_gui
             return run_gui()
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if args.command == "discover-wells":
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        elif args.command != "auto-train":
+            print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except (OSError, ValueError, RuntimeError, ImportError, KeyError) as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)

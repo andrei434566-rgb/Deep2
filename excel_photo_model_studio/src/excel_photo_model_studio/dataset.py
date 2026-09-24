@@ -218,16 +218,27 @@ def _split_sources(by_photo: dict[str, list[dict[str, str]]]) -> tuple[dict[str,
         well = rows[0].get("well", "").strip().casefold()
         if well:
             by_well[well].append(photo)
-    groups = by_well if len(by_well) >= 2 and sum(len(items) for items in by_well.values()) == len(by_photo) else {photo: [photo] for photo in by_photo}
-    strategy = "well" if groups is by_well else "photo"
     target = max(1, round(len(by_photo) * 0.2))
-    candidates = []
-    for group_name, photos in groups.items():
-        counts = sum((photo_labels[photo] for photo in photos), Counter())
-        if any(totals[label] <= count for label, count in counts.items()):
-            continue
-        score = (abs(len(photos) - target), len(photos), group_name)
-        candidates.append((score, photos))
+    can_group_by_well = len(by_well) >= 2 and sum(len(items) for items in by_well.values()) == len(by_photo)
+    groups = by_well if can_group_by_well else {photo: [photo] for photo in by_photo}
+    strategy = "well" if can_group_by_well else "photo"
+
+    def validation_candidates(grouped_photos: dict[str, list[str]]) -> list[tuple[tuple, list[str]]]:
+        candidates = []
+        for group_name, photos in grouped_photos.items():
+            counts = sum((photo_labels[photo] for photo in photos), Counter())
+            if any(totals[label] <= count for label, count in counts.items()):
+                continue
+            score = (abs(len(photos) - target), len(photos), group_name)
+            candidates.append((score, photos))
+        return candidates
+
+    candidates = validation_candidates(groups)
+    # Prefer holding out whole wells. If that leaves no class-complete validation
+    # split, fall back to whole photos while still keeping every class in training.
+    if not candidates and can_group_by_well:
+        strategy = "photo_fallback"
+        candidates = validation_candidates({photo: [photo] for photo in by_photo})
     if not candidates:
         return ({photo: "train" for photo in by_photo}, strategy)
     _, validation_photos = min(candidates, key=lambda item: item[0])
