@@ -177,7 +177,7 @@ def refresh_project(project_dir: Path) -> dict:
             "error", path.name,
             "Найденный интервал керна не полностью закрыт фациями Excel: "
             + "; ".join(f"{format_depth(top)}–{format_depth(base)} м" for top, base in gaps)
-            + ". Проверьте последовательность фото и интервалы фаций по бурению.",
+            + ". Проверьте последовательность фото и интервалы фаций по бурению/ГИС.",
         )
         for path, gaps in sorted(uncovered.items(), key=lambda item: item[0].name.casefold())
     )
@@ -248,6 +248,9 @@ def refresh_project(project_dir: Path) -> dict:
         "excel_text_targets": sum(bool(item.target_text.strip()) for item in rows),
         "facies_rows_without_description": sum(not item.target_text.strip() for item in rows),
         "invalid_thickness_rows": sum(not item.thickness_valid for item in rows),
+        "gis_fallback_matches": sum(
+            item.description.metadata.get("interval_source") == "gis" for item in matches
+        ),
         "text_targets": sum(bool(item.target_text.strip()) for item in annotations),
         "auto_sequenced_photos": sum(
             item.source in {"ocr_verified", "ocr_sequenced", "excel_sequenced"} for item in photos
@@ -264,6 +267,8 @@ def refresh_project(project_dir: Path) -> dict:
             {
                 "sheet": item.sheet, "facies_top": item.top, "facies_base": item.base,
                 "facies_thickness": item.facies_thickness, "target_text": item.target_text,
+                "gis_facies_top": item.gis_top, "gis_facies_base": item.gis_base,
+                "gis_facies_interval": item.gis_interval,
             }
             for item in mappings
             if item.top or item.base or item.target_text
@@ -365,10 +370,11 @@ def _write_matches(path: Path, matches) -> None:
             "layer_base": item.description.base, "overlap_top": item.overlap_top,
             "overlap_base": item.overlap_base, "source_sheet": item.description.sheet,
             "source_row": item.description.row,
+            "interval_source": item.description.metadata.get("interval_source", "drilling"),
         })
     _write_dict_rows(path, rows, fieldnames=(
         "photo", "well", "photo_top", "photo_base", "label", "layer_top", "layer_base",
-        "overlap_top", "overlap_base", "source_sheet", "source_row",
+        "overlap_top", "overlap_base", "source_sheet", "source_row", "interval_source",
     ))
 
 
@@ -450,27 +456,36 @@ def _write_facies_inventory(path: Path, rows, photos, matches) -> int:
         return source_file.casefold(), item.sheet, item.row
 
     matched_photos: dict[tuple[str, str, int], set[str]] = {}
+    gis_fallback_rows: set[tuple[str, str, int]] = set()
     for match in matches:
-        matched_photos.setdefault(row_key(match.description), set()).add(match.photo.path.name)
+        key = row_key(match.description)
+        matched_photos.setdefault(key, set()).add(match.photo.path.name)
+        if match.description.metadata.get("interval_source") == "gis":
+            gis_fallback_rows.add(key)
 
     output = []
     for row in rows:
         key = well_key(row.well)
-        top_cm = meters_to_centimeters(row.top)
-        base_cm = meters_to_centimeters(row.base)
         overlapping = [
             photo.path.name
             for photo in photos
             if (not key or well_key(photo.well) == key)
             and photo.has_interval
-            and min(base_cm, meters_to_centimeters(photo.base))
-            > max(top_cm, meters_to_centimeters(photo.top))
+            and any(
+                top is not None and base is not None
+                and min(meters_to_centimeters(base), meters_to_centimeters(photo.base))
+                > max(meters_to_centimeters(top), meters_to_centimeters(photo.top))
+                for top, base in ((row.top, row.base), (row.gis_top, row.gis_base))
+            )
         ]
-        matched = sorted(matched_photos.get(row_key(row), ()), key=str.casefold)
-        if not row.thickness_valid:
-            status = "INVALID_FACIES_THICKNESS"
+        source_key = row_key(row)
+        matched = sorted(matched_photos.get(source_key, ()), key=str.casefold)
+        if matched and source_key in gis_fallback_rows:
+            status = "MATCHED_GIS_FALLBACK"
         elif matched:
             status = "MATCHED"
+        elif not row.thickness_valid:
+            status = "INVALID_FACIES_THICKNESS"
         elif overlapping:
             status = "PHOTO_OVERLAPS_BUT_ROW_NOT_MATCHED"
         else:
@@ -483,6 +498,9 @@ def _write_facies_inventory(path: Path, rows, photos, matches) -> int:
             "facies_top_m": format_depth(row.top),
             "facies_base_m": format_depth(row.base),
             "facies_thickness_m": "" if row.thickness is None else format_depth(row.thickness),
+            "thickness_declared": "1" if row.thickness_declared else "0",
+            "gis_top_m": "" if row.gis_top is None else format_depth(row.gis_top),
+            "gis_base_m": "" if row.gis_base is None else format_depth(row.gis_base),
             "thickness_valid": "1" if row.thickness_valid else "0",
             "label": row.label,
             "short_description_present": "1" if row.target_text.strip() else "0",
@@ -493,7 +511,8 @@ def _write_facies_inventory(path: Path, rows, photos, matches) -> int:
         })
     _write_dict_rows(path, output, fieldnames=(
         "source_file", "sheet", "excel_row", "well", "facies_top_m", "facies_base_m",
-        "facies_thickness_m", "thickness_valid", "label", "short_description_present",
+        "facies_thickness_m", "thickness_declared", "gis_top_m", "gis_base_m",
+        "thickness_valid", "label", "short_description_present",
         "target_text", "overlapping_photos", "matched_photos", "status",
     ))
     return sum(not matched_photos.get(row_key(row)) for row in rows)
@@ -533,7 +552,9 @@ def _table_source_signature(excel_paths: list[Path], mapping_path: Path) -> str:
 def _write_table_cache(project_dir: Path, rows, mappings, issues, excel_files) -> None:
     mapping_path = project_dir / "column_mapping.json"
     payload = {
-        "schema": "excel-photo-table-cache-v1",
+        # v2 persists the alternate GIS limits. Invalidate pre-GIS caches so
+        # existing projects automatically re-read their Excel headers once.
+        "schema": "excel-photo-table-cache-v2",
         "signature": _table_source_signature([Path(path) for path in excel_files], mapping_path),
         "excel_files": [str(path) for path in excel_files],
         "rows": [asdict(item) for item in rows],
@@ -552,7 +573,7 @@ def _load_table_cache(project_dir: Path, excel_paths: list[Path]):
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("schema") != "excel-photo-table-cache-v1":
+        if payload.get("schema") != "excel-photo-table-cache-v2":
             return None
         if payload.get("signature") != _table_source_signature(excel_paths, project_dir / "column_mapping.json"):
             return None

@@ -132,6 +132,7 @@ def _best(headers: list[str], role: str, used: set[int]) -> int | None:
 def _best_facies_pair(
     headers: list[str], rows: list[list[Any]], header_row: int,
     used: set[int], thickness_column: int | None,
+    interval_source: str | None = None,
 ) -> tuple[int | None, int | None]:
     """Choose drilling facies limits together and verify them by facies thickness.
 
@@ -140,16 +141,29 @@ def _best_facies_pair(
     ``Подошва - Кровля == Толщина фации`` is an independent safeguard against
     accidentally selecting the much wider core-sampling interval.
     """
-    tops = [
-        (index + 1, _score(value, "top"))
-        for index, value in enumerate(headers)
-        if index + 1 not in used and _score(value, "top") > 0
-    ]
-    bases = [
-        (index + 1, _score(value, "base"))
-        for index, value in enumerate(headers)
-        if index + 1 not in used and _score(value, "base") > 0
-    ]
+    def belongs_to_source(header: str) -> bool:
+        text = normalize_text(header)
+        is_facies = any(word in text for word in ("фаци", "слоя", "facies", "layer"))
+        is_drilling = any(word in text for word in ("по бурен", "буров", "drilling"))
+        is_gis = any(word in text for word in ("по гис", "gis", "logging"))
+        if interval_source == "drilling":
+            return is_facies and is_drilling
+        if interval_source == "gis":
+            return is_facies and is_gis and not is_drilling
+        return True
+
+    tops = []
+    bases = []
+    for index, value in enumerate(headers):
+        column = index + 1
+        if column in used or not belongs_to_source(value):
+            continue
+        top_score = _score(value, "top")
+        base_score = _score(value, "base")
+        if top_score > 0:
+            tops.append((column, top_score))
+        if base_score > 0:
+            bases.append((column, base_score))
     candidates: list[tuple[float, int, int]] = []
     for top_column, top_score in tops:
         for base_column, base_score in bases:
@@ -182,6 +196,27 @@ def _best_facies_pair(
         return None, None
     _, top_column, base_column = max(candidates, key=lambda item: (item[0], -item[1], -item[2]))
     return top_column, base_column
+
+
+def _best_source_interval(headers: list[str], used: set[int], source: str) -> int | None:
+    candidates = []
+    for index, header in enumerate(headers, start=1):
+        text = normalize_text(header)
+        if index in used or not any(word in text for word in ("фаци", "слоя", "facies", "layer")):
+            continue
+        if any(word in text for word in ("кровл", "подошв", "верх", "низ", "top", "base", "bottom")):
+            continue
+        if source == "drilling" and not any(word in text for word in ("по бурен", "буров", "drilling")):
+            continue
+        if source == "gis" and (
+            not any(word in text for word in ("по гис", "gis", "logging"))
+            or any(word in text for word in ("по бурен", "буров", "drilling"))
+        ):
+            continue
+        score = _score(header, "interval")
+        if score:
+            candidates.append((score, index))
+    return max(candidates, default=(0, None))[1]
 
 
 def detect_mapping(sheet: str, rows: list[list[Any]]) -> ColumnMapping:
@@ -228,15 +263,35 @@ def detect_mapping(sheet: str, rows: list[list[Any]]) -> ColumnMapping:
         if values[role]:
             used.add(int(values[role]))
     values["top"], values["base"] = _best_facies_pair(
-        headers, rows, header_row, used, values.get("facies_thickness"),
+        headers, rows, header_row, used, values.get("facies_thickness"), "drilling",
     )
+    # Some workbooks contain only GIS facies limits. Use those as the primary
+    # limits only when no drilling limits exist; otherwise retain both systems
+    # so matching can use GIS strictly as a fallback.
+    if not (values["top"] and values["base"]):
+        values["top"], values["base"] = _best_facies_pair(
+            headers, rows, header_row, used, values.get("facies_thickness"),
+        )
     if values["top"]:
         used.add(int(values["top"]))
     if values["base"]:
         used.add(int(values["base"]))
     values["interval"] = None
     if not (values["top"] and values["base"]):
-        values["interval"] = _best(headers, "interval", used)
+        values["interval"] = _best_source_interval(headers, used, "drilling")
+        if not values["interval"]:
+            values["interval"] = _best(headers, "interval", used)
+    values["gis_top"], values["gis_base"] = _best_facies_pair(
+        headers, rows, header_row, used, values.get("facies_thickness"), "gis",
+    )
+    if not (values["gis_top"] and values["gis_base"]):
+        values["gis_top"] = values["gis_base"] = None
+    if values["gis_top"] and values["gis_base"]:
+        values["gis_interval"] = None
+    elif values["interval"] and "gis" in normalize_text(headers[values["interval"] - 1]):
+        values["gis_interval"] = values["interval"]
+    else:
+        values["gis_interval"] = _best_source_interval(headers, used, "gis")
     return ColumnMapping(sheet=sheet, header_row=header_row, **values)
 
 
@@ -251,7 +306,29 @@ def read_table(path: Path, mapping_file: Path | None = None) -> tuple[list[Descr
     issues: list[Issue] = []
     for sheet_name, rows in sheets:
         mapping_key = f"{path}::{sheet_name}"
-        mapping = overrides.get(mapping_key) or overrides.get(sheet_name) or detect_mapping(sheet_name, rows)
+        detected = detect_mapping(sheet_name, rows)
+        override = overrides.get(mapping_key) or overrides.get(sheet_name)
+        if override is None:
+            mapping = detected
+        else:
+            # Saved column maps from older versions intentionally remain
+            # authoritative for the primary drilling columns. New semantic
+            # fallback fields (GIS) are auto-discovered when absent.
+            override_gis_pair = bool(override.gis_top and override.gis_base)
+            detected_gis_pair = bool(detected.gis_top and detected.gis_base)
+            if override_gis_pair:
+                gis_top, gis_base = override.gis_top, override.gis_base
+            elif detected_gis_pair:
+                gis_top, gis_base = detected.gis_top, detected.gis_base
+            else:
+                gis_top, gis_base = override.gis_top, override.gis_base
+            gis_interval = None if gis_top and gis_base else (override.gis_interval or detected.gis_interval)
+            mapping = replace(
+                override,
+                gis_interval=gis_interval,
+                gis_top=gis_top,
+                gis_base=gis_base,
+            )
         mapping = replace(mapping, source_file=str(path))
         mappings.append(mapping)
         parsed, sheet_issues = _parse_sheet(rows, mapping)
@@ -405,18 +482,41 @@ def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[De
         if base <= top:
             continue
         thickness = as_float(_cell(row, mapping.facies_thickness))
+        thickness_declared = thickness is not None
         if thickness is not None:
             thickness = normalize_depth(thickness)
+        gis_top = as_float(_cell(row, mapping.gis_top))
+        gis_base = as_float(_cell(row, mapping.gis_base))
+        if mapping.gis_interval:
+            gis_top, gis_base = parse_interval(_cell(row, mapping.gis_interval))
+        if gis_top is None or gis_base is None or gis_base <= gis_top:
+            gis_top = gis_base = None
+        elif gis_top == top and gis_base == base:
+            # If there was no drilling pair, GIS already became the primary
+            # pair above and must not be counted twice as a fallback source.
+            gis_top = gis_base = None
+        gis_thickness_valid = False
+        if thickness is not None and gis_top is not None and gis_base is not None:
+            gis_span_cm = meters_to_centimeters(gis_base) - meters_to_centimeters(gis_top)
+            gis_thickness_valid = abs(meters_to_centimeters(thickness) - gis_span_cm) <= 1
         thickness_valid = True
         if thickness is not None:
             span_cm = meters_to_centimeters(base) - meters_to_centimeters(top)
             thickness_valid = abs(meters_to_centimeters(thickness) - span_cm) <= 1
             if not thickness_valid:
                 issues.append(Issue(
-                    "error", f"{mapping.sheet}!{row_number}",
-                    f"Толщина фации {format_depth(thickness)} м не совпадает с интервалом фации по бурению "
-                    f"{format_depth(top)}–{format_depth(base)} м "
-                    f"({format_depth(span_cm / 100)} м); строка не будет использована для маски.",
+                    "warning" if gis_thickness_valid else "error",
+                    f"{mapping.sheet}!{row_number}",
+                    (
+                        f"Толщина фации {format_depth(thickness)} м не совпадает с интервалом по бурению "
+                        f"{format_depth(top)}–{format_depth(base)} м "
+                        f"({format_depth(span_cm / 100)} м); резервный интервал ГИС совпадает с толщиной "
+                        "и будет применяться только при отсутствии пересечения по бурению."
+                        if gis_thickness_valid else
+                        f"Толщина фации {format_depth(thickness)} м не совпадает с интервалом фации по бурению "
+                        f"{format_depth(top)}–{format_depth(base)} м "
+                        f"({format_depth(span_cm / 100)} м); строка не будет использована для маски."
+                    ),
                 ))
         well = display_text(_cell(row, mapping.well)) or last_well or sheet_well
         if not well:
@@ -470,5 +570,7 @@ def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[De
             thickness=thickness if thickness is not None else normalize_depth(base - top),
             thickness_valid=thickness_valid,
             metadata={key: value for key, value in metadata.items() if value},
+            gis_top=gis_top, gis_base=gis_base,
+            thickness_declared=thickness_declared,
         ))
     return output, issues

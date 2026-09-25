@@ -63,6 +63,25 @@ class PhotoOcrParsingTests(unittest.TestCase):
             extract_depth_interval(text, ((4104.9, 4116.9),)),
         )
 
+    def test_ignores_ruler_rows_when_recovering_caption_depths(self):
+        text = (
+            "Глубина по керну 4105.00 4106.00 4107.00 4108.00\n"
+            "Шкала 0 10 20 30 40 50 60 70 80 90 100\n"
+            "Интервал отбора керна с 4104,90 до 4116,55 м"
+        )
+        self.assertEqual(
+            (4104.9, 4116.55),
+            extract_depth_interval(text, ((4104.9, 4116.9),)),
+        )
+
+    def test_does_not_pair_depths_across_unrelated_ocr_lines(self):
+        text = "Интервал отбора керна\n4104.90\nШкала 0 10 20 30 40\n4116.55"
+        self.assertIsNone(extract_depth_interval(text, ((4104.9, 4116.9),)))
+
+    def test_does_not_accept_bare_numeric_ruler_without_excel_or_caption(self):
+        self.assertIsNone(extract_depth_interval("Шкала 40 50 60 70 80 90 100"))
+        self.assertEqual((4104.9, 4116.55), extract_depth_interval("4104.90-4116.55 м"))
+
 
 if __name__ == "__main__":
     unittest.main()

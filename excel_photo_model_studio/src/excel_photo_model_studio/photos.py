@@ -114,19 +114,49 @@ def extract_depth_interval(
     expected_intervals: Iterable[tuple[float, float]] = (),
 ) -> tuple[float, float] | None:
     """Extract the full photographed-core interval from an OCR transcript."""
-    normalized = display_text(text).replace(",", ".").replace("−", "-").replace("–", "-").replace("—", "-")
+    # Keep OCR line boundaries. Previously display_text flattened every line,
+    # then paired unrelated values several tokens apart (often ruler ticks,
+    # column headers and page numbers). Depth limits should be an explicit
+    # range or adjacent values on the same OCR line.
+    raw = str(text or "").replace("−", "-").replace("–", "-").replace("—", "-")
+    lines = [" ".join(line.replace(",", ".").split()) for line in raw.splitlines()]
+    label_pattern = re.compile(
+        r"(?:интервал\s+(?:отбора\s+)?керна|core\s+interval)", re.IGNORECASE,
+    )
+    label_lines = {
+        index for index, line in enumerate(lines)
+        if label_pattern.search(line)
+    }
+    label_context = {
+        line_index
+        for label_index in label_lines
+        for line_index in range(max(0, label_index - 1), min(len(lines), label_index + 3))
+    }
     candidates: list[tuple[int, float, float]] = []
-    labelled = list(re.finditer(r"(?:интервал\s+(?:отбора\s+)?керна|core\s+interval)", normalized, flags=re.IGNORECASE))
-    windows = [(1000, normalized[item.start():item.start() + 220]) for item in labelled]
-    windows.append((0, normalized))
-    for priority, window in windows:
-        values = [float(value) for value in re.findall(r"(?<!\d)(\d{2,6}(?:\.\d{1,4})?)(?!\d)", window)]
-        for left, top in enumerate(values):
-            for base in values[left + 1:left + 7]:
-                span = base - top
-                same_depth_scale = min(top, base) >= max(top, base) * 0.35
-                if 0.01 <= span <= 500 and same_depth_scale:
-                    candidates.append((priority, top, base))
+    number = r"\d{2,6}(?:\.\d{1,4})?"
+    explicit_range = re.compile(rf"(?<!\d)({number})\s*(?:-|\bдо\b|\bto\b)\s*({number})(?!\d)", re.IGNORECASE)
+    plain_number = re.compile(rf"(?<!\d)({number})(?!\d)")
+
+    for line_index, line in enumerate(lines):
+        if not line:
+            continue
+        labelled = line_index in label_context
+        priority = 1200 if labelled else 100
+        for match in explicit_range.finditer(line):
+            has_depth_unit = re.search(r"(?:\sм\.?(?:\s|$)|\bметр)", line, re.IGNORECASE) is not None
+            candidates.append((priority + 100 + (100 if has_depth_unit else 0), float(match.group(1)), float(match.group(2))))
+
+        values = [float(value) for value in plain_number.findall(line)]
+        # Adjacent OCR values on the same line cover captions where the dash
+        # was lost, without constructing pairs across unrelated rows.
+        for top, base in zip(values, values[1:]):
+            candidates.append((priority, top, base))
+
+    candidates = [
+        item for item in candidates
+        if 0.01 <= item[2] - item[1] <= 500
+        and min(item[1], item[2]) >= max(item[1], item[2]) * 0.35
+    ]
     if not candidates:
         return None
     expected = tuple(expected_intervals)
@@ -134,13 +164,22 @@ def extract_depth_interval(
         aligned: list[tuple[float, int, float, float]] = []
         for priority, top, base in candidates:
             for expected_top, expected_base in expected:
-                span = max(0.01, expected_base - expected_top)
                 error = abs(top - expected_top) + abs(base - expected_base)
-                if error <= max(2.0, span * 0.20):
+                # A generous multi-metre tolerance allowed column-header and
+                # ruler numbers to masquerade as the caption interval. OCR
+                # may differ by a few tenths, but both endpoints must remain
+                # close to one of the actual Excel core intervals.
+                if abs(top - expected_top) <= 0.5 and abs(base - expected_base) <= 0.5:
                     aligned.append((error, -priority, top, base))
         if aligned:
             _, _, top, base = min(aligned)
             return top, base
+        return None
+    # Without Excel core intervals, require either an interval caption or an
+    # explicit range with a depth unit. Bare numeric lines are commonly ruler
+    # graduations and must not become an unverified photo depth.
+    candidates = [item for item in candidates if item[0] >= 200]
+    if not candidates:
         return None
     _, top, base = max(candidates, key=lambda item: (item[0], item[2] - item[1]))
     return top, base

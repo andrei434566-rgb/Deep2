@@ -29,23 +29,49 @@ def match_photos(records: list[PhotoRecord], rows: list[DescriptionRow]) -> tupl
             photo_well = next(iter(wells))
         photo_matches = []
         for row in rows:
-            if not row.thickness_valid:
-                continue
             if photo_well and well_key(row.well) != photo_well:
                 continue
-            overlap_top_cm = max(meters_to_centimeters(photo.top), meters_to_centimeters(row.top))
-            overlap_base_cm = min(meters_to_centimeters(photo.base), meters_to_centimeters(row.base))
-            if overlap_base_cm > overlap_top_cm:
+            primary_overlap = _overlap_cm(photo, row.top, row.base) if row.thickness_valid else None
+            if primary_overlap is not None:
                 photo_matches.append(Match(
                     photo, row,
-                    centimeters_to_meters(overlap_top_cm),
-                    centimeters_to_meters(overlap_base_cm),
+                    centimeters_to_meters(primary_overlap[0]),
+                    centimeters_to_meters(primary_overlap[1]),
+                ))
+                continue
+
+            # GIS limits are a fallback for this facies row only: a valid
+            # drilling interval always wins when it overlaps the photo. Check
+            # the GIS span against the declared facies thickness before using
+            # it, so a broad core-sampling interval cannot become a mask.
+            if row.gis_top is None or row.gis_base is None or row.gis_base <= row.gis_top:
+                continue
+            if row.thickness_declared and row.thickness is not None:
+                gis_span_cm = meters_to_centimeters(row.gis_base) - meters_to_centimeters(row.gis_top)
+                if abs(meters_to_centimeters(row.thickness) - gis_span_cm) > 1:
+                    continue
+            gis_overlap = _overlap_cm(photo, row.gis_top, row.gis_base)
+            if gis_overlap is not None:
+                gis_row = replace(
+                    row, top=row.gis_top, base=row.gis_base, thickness_valid=True,
+                    metadata={**row.metadata, "interval_source": "gis"},
+                )
+                photo_matches.append(Match(
+                    photo, gis_row,
+                    centimeters_to_meters(gis_overlap[0]),
+                    centimeters_to_meters(gis_overlap[1]),
                 ))
         if photo_matches:
             matches.extend(photo_matches)
         else:
             unresolved.append(photo)
     return matches, unresolved
+
+
+def _overlap_cm(photo: PhotoRecord, top: float, base: float) -> tuple[int, int] | None:
+    overlap_top_cm = max(meters_to_centimeters(photo.top), meters_to_centimeters(top))
+    overlap_base_cm = min(meters_to_centimeters(photo.base), meters_to_centimeters(base))
+    return (overlap_top_cm, overlap_base_cm) if overlap_base_cm > overlap_top_cm else None
 
 
 def suggest_missing_intervals(records: list[PhotoRecord], rows: list[DescriptionRow]) -> list[PhotoRecord]:

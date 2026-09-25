@@ -709,6 +709,7 @@ class MainWindow(QMainWindow):
             f"{report.get('uncovered_excel_core_intervals', 0)}",
             f"Строк с ошибкой толщины фации: {report.get('invalid_thickness_rows', 0)}",
             f"Строк Excel с «Кратким описанием»: {report.get('excel_text_targets', 0)}",
+            f"Фаций сопоставлено по резервному интервалу ГИС: {report.get('gis_fallback_matches', 0)}",
             f"Строк фаций без «Краткого описания»: "
             f"{report.get('facies_rows_without_description', 0)}",
             f"Строк фаций без сопоставленного фото: "
@@ -723,10 +724,17 @@ class MainWindow(QMainWindow):
         if mappings:
             lines.append("\nРаспознанные столбцы Excel (по названиям):")
             lines.extend(
-                f"- {item.get('sheet', '')}: интервал фации по бурению "
-                f"{item.get('facies_top') or '?'}–{item.get('facies_base') or '?'}, "
-                f"толщина фации {item.get('facies_thickness') or '?'}, "
-                f"«Краткое описание» {item.get('target_text') or '?'}"
+                (
+                    f"- {item.get('sheet', '')}: основной интервал фации "
+                    f"{item.get('facies_top') or '?'}–{item.get('facies_base') or '?'}, "
+                    + (
+                        f"резерв ГИС {item.get('gis_facies_top')}–{item.get('gis_facies_base')}, "
+                        if item.get("gis_facies_top") is not None and item.get("gis_facies_base") is not None
+                        else "резерв ГИС не найден, "
+                    )
+                    + f"толщина фации {item.get('facies_thickness') or '?'}, "
+                    + f"«Краткое описание» {item.get('target_text') or '?'}"
+                )
                 for item in mappings
             )
         if report.get("issues"):

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from openpyxl import Workbook
 
-from excel_photo_model_studio.tabular import read_table
+from excel_photo_model_studio.tabular import read_table, save_mappings
 
 
 class TableReaderTests(unittest.TestCase):
@@ -111,10 +113,12 @@ class TableReaderTests(unittest.TestCase):
 
         self.assertEqual([], [item for item in issues if item.severity == "error"])
         self.assertEqual((14, 15), (mappings[0].top, mappings[0].base))
+        self.assertEqual((16, 17), (mappings[0].gis_top, mappings[0].gis_base))
         self.assertEqual(19, mappings[0].facies_thickness)
         self.assertEqual(30, mappings[0].target_text)
         self.assertEqual("Песчаник светло-серый, слоистый.", rows[0].target_text)
         self.assertEqual((4105.0, 4108.65), (rows[0].top, rows[0].base))
+        self.assertEqual((4104.9, 4108.55), (rows[0].gis_top, rows[0].gis_base))
         self.assertTrue(rows[0].thickness_valid)
 
     def test_thickness_mismatch_blocks_row_from_masking(self):
@@ -168,6 +172,82 @@ class TableReaderTests(unittest.TestCase):
         self.assertEqual(1, len(rows))
         self.assertEqual((100.0, 101.5), (rows[0].top, rows[0].base))
         self.assertEqual("Sand", rows[0].label)
+
+    def test_reads_gis_facies_limits_as_a_separate_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "drilling_and_gis.csv"
+            path.write_text(
+                "Скважина;Интервал фации по бурению Кровля;Интервал фации по бурению Подошва;"
+                "Интервал фации по ГИС Кровля;Интервал фации по ГИС Подошва;"
+                "Толщина фации;Код фации;Краткое описание\n"
+                "W-1;100.00;101.00;200.00;201.00;1.00;Sand;Песчаник серый.\n",
+                encoding="utf-8",
+            )
+
+            rows, mappings, issues = read_table(path)
+
+        self.assertEqual([], [item for item in issues if item.severity == "error"])
+        self.assertEqual((2, 3), (mappings[0].top, mappings[0].base))
+        self.assertEqual((4, 5), (mappings[0].gis_top, mappings[0].gis_base))
+        self.assertEqual((100.0, 101.0), (rows[0].top, rows[0].base))
+        self.assertEqual((200.0, 201.0), (rows[0].gis_top, rows[0].gis_base))
+
+    def test_valid_gis_thickness_turns_bad_drilling_interval_into_a_warning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gis_rescue.csv"
+            path.write_text(
+                "Скважина;Интервал фации по бурению Кровля;Интервал фации по бурению Подошва;"
+                "Интервал фации по ГИС Кровля;Интервал фации по ГИС Подошва;"
+                "Толщина фации;Код фации\nW-1;100.00;102.00;200.00;201.00;1.00;Sand\n",
+                encoding="utf-8",
+            )
+
+            rows, _, issues = read_table(path)
+
+        self.assertFalse(rows[0].thickness_valid)
+        self.assertEqual((200.0, 201.0), (rows[0].gis_top, rows[0].gis_base))
+        self.assertTrue(any(item.severity == "warning" and "резервный интервал ГИС" in item.message for item in issues))
+        self.assertFalse(any(item.severity == "error" and "Толщина фации" in item.message for item in issues))
+
+    def test_old_saved_column_map_is_supplemented_with_new_gis_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "old_mapping.csv"
+            path.write_text(
+                "Скважина;Интервал фации по бурению Кровля;Интервал фации по бурению Подошва;"
+                "Интервал фации по ГИС Кровля;Интервал фации по ГИС Подошва;"
+                "Толщина фации;Код фации\nW-1;100.00;101.00;200.00;201.00;1.00;Sand\n",
+                encoding="utf-8",
+            )
+            _, detected, _ = read_table(path)
+            mapping_file = Path(directory) / "column_mapping.json"
+            save_mappings(mapping_file, [replace(detected[0], gis_top=None, gis_base=None)])
+            old_map = json.loads(mapping_file.read_text(encoding="utf-8"))
+            for saved in old_map.values():
+                saved.pop("gis_interval", None)
+                saved.pop("gis_top", None)
+                saved.pop("gis_base", None)
+            mapping_file.write_text(json.dumps(old_map), encoding="utf-8")
+
+            rows, mappings, _ = read_table(path, mapping_file)
+
+        self.assertEqual((2, 3), (mappings[0].top, mappings[0].base))
+        self.assertEqual((4, 5), (mappings[0].gis_top, mappings[0].gis_base))
+        self.assertEqual((200.0, 201.0), (rows[0].gis_top, rows[0].gis_base))
+
+    def test_uses_gis_as_primary_interval_when_workbook_has_no_drilling_limits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gis_only.csv"
+            path.write_text(
+                "Скважина;Интервал фации по ГИС Кровля;Интервал фации по ГИС Подошва;"
+                "Толщина фации;Код фации\nW-1;200.00;201.00;1.00;Sand\n",
+                encoding="utf-8",
+            )
+
+            rows, mappings, issues = read_table(path)
+
+        self.assertEqual([], [item for item in issues if item.severity == "error"])
+        self.assertEqual((2, 3), (mappings[0].top, mappings[0].base))
+        self.assertEqual((200.0, 201.0), (rows[0].top, rows[0].base))
 
 
 if __name__ == "__main__":

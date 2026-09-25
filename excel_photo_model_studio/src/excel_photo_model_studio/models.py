@@ -54,6 +54,9 @@ class ColumnMapping:
     association: int | None = None
     environment: int | None = None
     field_name: int | None = None
+    gis_interval: int | None = None
+    gis_top: int | None = None
+    gis_base: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -83,6 +86,9 @@ class DescriptionRow:
     thickness: float | None = None
     thickness_valid: bool = True
     metadata: dict[str, str] = field(default_factory=dict)
+    gis_top: float | None = None
+    gis_base: float | None = None
+    thickness_declared: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "top", normalize_depth(self.top))
@@ -93,6 +99,10 @@ class DescriptionRow:
             object.__setattr__(self, "core_base", normalize_depth(self.core_base))
         if self.thickness is not None:
             object.__setattr__(self, "thickness", normalize_depth(self.thickness))
+        if self.gis_top is not None:
+            object.__setattr__(self, "gis_top", normalize_depth(self.gis_top))
+        if self.gis_base is not None:
+            object.__setattr__(self, "gis_base", normalize_depth(self.gis_base))
 
     @property
     def source_id(self) -> str:

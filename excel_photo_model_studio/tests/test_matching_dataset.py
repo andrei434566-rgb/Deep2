@@ -22,6 +22,48 @@ from excel_photo_model_studio.photos import parse_filename
 
 
 class MatchingTests(unittest.TestCase):
+    def test_uses_gis_limits_only_when_drilling_does_not_match_that_facies(self):
+        row = DescriptionRow(
+            well="W-1", top=100.0, base=101.0, gis_top=200.0, gis_base=201.0,
+            thickness=1.0, label="Sand", sheet="Data", row=2,
+            target_text="Песчаник серый.",
+        )
+        photo = PhotoRecord(Path("core.jpg"), "W-1", 200.0, 201.0, "manual", True)
+
+        matches, unresolved = match_photos([photo], [row])
+
+        self.assertEqual([], unresolved)
+        self.assertEqual(1, len(matches))
+        self.assertEqual((200.0, 201.0), (matches[0].description.top, matches[0].description.base))
+        self.assertEqual("gis", matches[0].description.metadata["interval_source"])
+        self.assertEqual("Песчаник серый.", matches[0].description.target_text)
+
+    def test_drilling_match_wins_over_overlapping_gis_fallback(self):
+        row = DescriptionRow(
+            well="W-1", top=100.0, base=101.0, gis_top=100.5, gis_base=101.5,
+            thickness=1.0, label="Sand", sheet="Data", row=2,
+        )
+        photo = PhotoRecord(Path("core.jpg"), "W-1", 100.0, 101.5, "manual", True)
+
+        matches, unresolved = match_photos([photo], [row])
+
+        self.assertEqual([], unresolved)
+        self.assertEqual(1, len(matches))
+        self.assertEqual((100.0, 101.0), (matches[0].description.top, matches[0].description.base))
+        self.assertNotIn("interval_source", matches[0].description.metadata)
+
+    def test_rejects_gis_fallback_when_its_span_disagrees_with_facies_thickness(self):
+        row = DescriptionRow(
+            well="W-1", top=100.0, base=101.0, gis_top=200.0, gis_base=202.0,
+            thickness=1.0, label="Sand", sheet="Data", row=2,
+        )
+        photo = PhotoRecord(Path("core.jpg"), "W-1", 200.0, 202.0, "manual", True)
+
+        matches, unresolved = match_photos([photo], [row])
+
+        self.assertEqual([], matches)
+        self.assertEqual([photo], unresolved)
+
     def test_sequences_missing_pages_around_verified_filename_anchors(self):
         rows = [DescriptionRow(
             well="W-1", top=100.0, base=110.0, label="Sand", sheet="Data", row=2,
