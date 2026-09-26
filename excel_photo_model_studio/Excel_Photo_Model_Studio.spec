@@ -15,7 +15,7 @@ if portable_tesseract.is_dir():
     datas.append((str(portable_tesseract), "tools/tesseract"))
 binaries = collect_dynamic_libs("shiboken6")
 hiddenimports = collect_submodules("excel_photo_model_studio") + [
-    "PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets",
+    "PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets", "xlrd",
 ]
 
 for package in ("ultralytics", "cv2", "openpyxl", "xlrd", "numpy", "pytesseract"):

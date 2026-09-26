@@ -58,8 +58,9 @@ jobs:
         shell: pwsh
         working-directory: excel_photo_model_studio
         run: |
-          $process = Start-Process -FilePath 'dist/Excel_Photo_Model_Studio/Excel_Photo_Model_Studio.exe' -ArgumentList '--help' -Wait -PassThru
+          $process = Start-Process -FilePath 'dist/Excel_Photo_Model_Studio/Excel_Photo_Model_Studio.exe' -ArgumentList 'self-test --output portable-self-test.json' -WindowStyle Hidden -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Portable application smoke test failed: $($process.ExitCode)" }
+          Get-Content portable-self-test.json
 
       - name: Create release archive and checksum
         if: startsWith(github.ref, 'refs/tags/excel-photo-studio-v')
@@ -94,6 +95,7 @@ jobs:
           name: Excel Photo Model Studio ${{ github.ref_name }}
           generate_release_notes: true
           make_latest: false
+          body_path: excel_photo_model_studio/RELEASE_NOTES_0.4.0.md
           files: |
             excel_photo_model_studio/release/*.zip
             excel_photo_model_studio/release/*.sha256

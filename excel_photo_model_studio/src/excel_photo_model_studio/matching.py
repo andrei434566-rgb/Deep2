@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import re
 from dataclasses import replace
 from pathlib import Path
@@ -27,45 +28,79 @@ def match_photos(records: list[PhotoRecord], rows: list[DescriptionRow]) -> tupl
         photo_well = well_key(photo.well)
         if not photo_well and len(wells) == 1:
             photo_well = next(iter(wells))
-        photo_matches = []
-        for row in rows:
-            if photo_well and well_key(row.well) != photo_well:
-                continue
-            primary_overlap = _overlap_cm(photo, row.top, row.base) if row.thickness_valid else None
-            if primary_overlap is not None:
-                photo_matches.append(Match(
-                    photo, row,
-                    centimeters_to_meters(primary_overlap[0]),
-                    centimeters_to_meters(primary_overlap[1]),
-                ))
-                continue
-
-            # GIS limits are a fallback for this facies row only: a valid
-            # drilling interval always wins when it overlaps the photo. Check
-            # the GIS span against the declared facies thickness before using
-            # it, so a broad core-sampling interval cannot become a mask.
-            if row.gis_top is None or row.gis_base is None or row.gis_base <= row.gis_top:
-                continue
-            if row.thickness_declared and row.thickness is not None:
-                gis_span_cm = meters_to_centimeters(row.gis_base) - meters_to_centimeters(row.gis_top)
-                if abs(meters_to_centimeters(row.thickness) - gis_span_cm) > 1:
-                    continue
-            gis_overlap = _overlap_cm(photo, row.gis_top, row.gis_base)
-            if gis_overlap is not None:
-                gis_row = replace(
-                    row, top=row.gis_top, base=row.gis_base, thickness_valid=True,
-                    metadata={**row.metadata, "interval_source": "gis"},
-                )
-                photo_matches.append(Match(
-                    photo, gis_row,
-                    centimeters_to_meters(gis_overlap[0]),
-                    centimeters_to_meters(gis_overlap[1]),
-                ))
+        if not photo_well and len(wells) > 1:
+            unresolved.append(photo)
+            continue
+        well_rows = [row for row in rows if not photo_well or well_key(row.well) == photo_well]
+        # Depth systems belong to a whole image, not to individual facies.
+        # Falling back per row can put a shifted GIS facies on top of a valid
+        # drilling facies from the neighbouring row and silently mislabel it.
+        by_basis = {
+            basis: _matches_for_basis(photo, well_rows, basis)
+            for basis in ("drilling", "gis")
+        }
+        basis = getattr(photo, "depth_basis", "unknown")
+        if basis not in by_basis:
+            basis = max(by_basis, key=lambda candidate: (
+                _match_coverage_score(by_basis[candidate]), candidate == "drilling",
+            ))
+        photo_matches = by_basis[basis]
         if photo_matches:
             matches.extend(photo_matches)
         else:
             unresolved.append(photo)
     return matches, unresolved
+
+
+def _matches_for_basis(photo: PhotoRecord, rows: list[DescriptionRow], basis: str) -> list[Match]:
+    matches = []
+    for row in rows:
+        primary_is_gis = row.metadata.get("interval_source") == "gis"
+        if basis == "drilling":
+            if primary_is_gis or not row.thickness_valid:
+                continue
+            selected = row
+        elif primary_is_gis:
+            if not row.thickness_valid:
+                continue
+            selected = row
+        else:
+            if row.gis_top is None or row.gis_base is None or row.gis_base <= row.gis_top:
+                continue
+            span_cm = meters_to_centimeters(row.gis_base) - meters_to_centimeters(row.gis_top)
+            if row.thickness_declared and row.thickness is not None:
+                if abs(meters_to_centimeters(row.thickness) - span_cm) > 1:
+                    continue
+            selected = replace(
+                row, top=row.gis_top, base=row.gis_base, thickness_valid=True,
+                metadata={**row.metadata, "interval_source": "gis"},
+            )
+        overlap = _overlap_cm(photo, selected.top, selected.base)
+        if overlap is not None:
+            matches.append(Match(
+                photo, selected, centimeters_to_meters(overlap[0]),
+                centimeters_to_meters(overlap[1]),
+            ))
+    return sorted(matches, key=lambda item: (item.overlap_top, item.overlap_base, item.description.source_id))
+
+
+def _match_coverage_score(matches: list[Match]) -> tuple[int, int]:
+    """Prefer covered centimetres without conflicting, overlapping labels."""
+    intervals = [(meters_to_centimeters(item.overlap_top), meters_to_centimeters(item.overlap_base)) for item in matches]
+    total = sum(base - top for top, base in intervals)
+    covered = _union_length_cm(intervals)
+    conflict = total - covered
+    return covered - conflict, -conflict
+
+
+def _union_length_cm(intervals: list[tuple[int, int]]) -> int:
+    covered = 0
+    cursor = None
+    for top, base in sorted(intervals):
+        start = max(top, cursor if cursor is not None else top)
+        covered += max(0, base - start)
+        cursor = max(base, cursor if cursor is not None else base)
+    return covered
 
 
 def _overlap_cm(photo: PhotoRecord, top: float, base: float) -> tuple[int, int] | None:
@@ -100,14 +135,27 @@ def suggest_missing_intervals(records: list[PhotoRecord], rows: list[Description
     # pack every page into the ordered core-sampling ranges from Excel. OCR
     # pages and already sequenced pages are used as anchors, while missing
     # pages before, between and after them inherit exact centimetre depths.
-    result = _sequence_complete_wells(result, rows)
+    capacity_cache: dict[Path, int] = {}
 
-    # OCR intentionally reads the full core-sampling interval from the caption.
-    # Several consecutive report pages therefore carry the same range. Split
-    # that range into one-metre physical columns in natural filename order.
+    def capacity(record: PhotoRecord) -> int:
+        if record.path not in capacity_cache:
+            capacity_cache[record.path] = (
+                _photo_core_capacity_cm(record.path, record.column_depths)
+                if record.column_depths else _photo_core_capacity_cm(record.path)
+            )
+        return capacity_cache[record.path]
+
+    result = _sequence_complete_wells(result, rows, capacity)
+
+    # OCR may read the same adjusted core interval from consecutive report
+    # pages. Split that range by the measured physical-column capacities and
+    # keep the natural filename order as a deterministic tie-breaker.
     groups: dict[tuple[str, int, int], list[int]] = {}
     for index, record in enumerate(result):
-        if record.source not in {"ocr", "ocr_verified"} or not record.has_interval:
+        if (
+            record.source not in {"ocr", "ocr_verified"} or not record.has_interval
+            or record.column_depths or record.depth_basis == "gis"
+        ):
             continue
         canonical = _matching_core_interval(record, rows)
         if canonical is None:
@@ -116,7 +164,7 @@ def suggest_missing_intervals(records: list[PhotoRecord], rows: list[Description
         groups.setdefault((well_key(record.well), top_cm, base_cm), []).append(index)
     for (_well, core_top_cm, core_base_cm), indices in groups.items():
         capacities = {
-            index: _photo_core_capacity_cm(result[index].path)
+            index: capacity(result[index])
             for index in indices
         }
         total_capacity_cm = sum(capacities.values())
@@ -127,10 +175,7 @@ def suggest_missing_intervals(records: list[PhotoRecord], rows: list[Description
         # allowing the last page to be partial. If the OCR group is too large,
         # it is probably a subset of a larger well sequence; leave it for the
         # complete-well sequencer instead of silently discarding excess pages.
-        if (
-            largest_page_cm <= 0
-            or total_capacity_cm - core_span_cm > largest_page_cm + 2
-        ):
+        if largest_page_cm <= 0 or total_capacity_cm > core_span_cm + 2:
             for index in indices:
                 record = result[index]
                 result[index] = replace(
@@ -138,6 +183,7 @@ def suggest_missing_intervals(records: list[PhotoRecord], rows: list[Description
                     mapping_confirmed=False,
                 )
             continue
+        complete_group = abs(total_capacity_cm - core_span_cm) <= 2
         cursor_cm = core_top_cm
         for index in sorted(indices, key=lambda item: _natural_name_key(result[item].path.name)):
             record = result[index]
@@ -151,7 +197,7 @@ def suggest_missing_intervals(records: list[PhotoRecord], rows: list[Description
                 top=centimeters_to_meters(cursor_cm),
                 base=centimeters_to_meters(page_base_cm),
                 source="ocr_sequenced",
-                mapping_confirmed=True,
+                mapping_confirmed=complete_group,
             )
             cursor_cm = page_base_cm
 
@@ -176,21 +222,58 @@ def suggest_missing_intervals(records: list[PhotoRecord], rows: list[Description
     available = [value for key, value in sorted(intervals.items()) if key not in claimed]
     unresolved = [index for index, record in enumerate(result) if not record.has_interval]
     for index in list(unresolved):
+        if result[index].depth_basis == "gis":
+            continue
         name_key = well_key(result[index].path.stem)
         candidates = [item for item in available if well_key(item[0]) and well_key(item[0]) in name_key]
         if len(candidates) == 1:
             item = candidates[0]
-            result[index] = replace(result[index], well=item[0], top=item[1], base=item[2], source="excel_suggestion")
-            available.remove(item)
-            unresolved.remove(index)
-    if unresolved and len(available) == len(unresolved):
-        for index, item in zip(unresolved, available):
-            result[index] = replace(result[index], well=item[0], top=item[1], base=item[2], source="excel_suggestion")
+            span_cm = meters_to_centimeters(item[2]) - meters_to_centimeters(item[1])
+            if abs(capacity(result[index]) - span_cm) <= 2:
+                result[index] = replace(
+                    result[index], well=item[0], top=item[1], base=item[2],
+                    source="excel_suggestion",
+                )
+                available.remove(item)
+                unresolved.remove(index)
+
+    # Never attach an entire Excel core interval to a short image fragment
+    # simply because the count of photos and intervals happens to match. Pack
+    # unresolved images over the remaining ranges using measured capacities;
+    # only accept a complete, centimetre-accurate fit.
+    unresolved_by_well: dict[str, list[int]] = {}
+    for index in unresolved:
+        if result[index].depth_basis == "gis":
+            continue
+        key = well_key(result[index].well)
+        if key:
+            unresolved_by_well.setdefault(key, []).append(index)
+    for key, indices in unresolved_by_well.items():
+        intervals = [
+            (meters_to_centimeters(top), meters_to_centimeters(base))
+            for well, top, base in available if well_key(well) == key
+        ]
+        if not intervals:
+            continue
+        ordered = sorted(indices, key=lambda item: _natural_name_key(result[item].path.name))
+        capacities = [capacity(result[index]) for index in ordered]
+        if any(value <= 0 for value in capacities):
+            continue
+        plan = _pack_complete_core_intervals(capacities, sorted(intervals))
+        if plan is None:
+            continue
+        for index, (top_cm, base_cm, _core_index) in zip(ordered, plan):
+            result[index] = replace(
+                result[index], top=centimeters_to_meters(top_cm),
+                base=centimeters_to_meters(base_cm), source="excel_sequenced",
+                mapping_confirmed=True,
+            )
     return sort_photo_records(result)
 
 
 def _sequence_complete_wells(
     records: list[PhotoRecord], rows: list[DescriptionRow],
+    capacity_reader=None,
 ) -> list[PhotoRecord]:
     result = list(records)
     record_groups: dict[str, list[int]] = {}
@@ -202,6 +285,11 @@ def _sequence_complete_wells(
     for key, indices in record_groups.items():
         ordered_indices = sorted(indices, key=lambda index: _natural_name_key(result[index].path.name))
         ordered_records = [result[index] for index in ordered_indices]
+        # These sampling ranges are in drilling coordinates. A raw-depth
+        # packing plan must never overwrite OCR anchors explicitly read in
+        # adjusted/GIS coordinates while leaving their basis marked GIS.
+        if any(record.depth_basis == "gis" for record in ordered_records):
+            continue
         if not ordered_records or any(
             record.source not in _AUTOMATIC_SEQUENCE_SOURCES
             and record.source != "filename"
@@ -219,7 +307,11 @@ def _sequence_complete_wells(
         core_intervals = _core_intervals_for_well(rows, key)
         if not core_intervals:
             continue
-        capacities = [_photo_core_capacity_cm(record.path) for record in ordered_records]
+        capacities = [
+            capacity_reader(record) if capacity_reader is not None
+            else _photo_core_capacity_cm(record.path, record.column_depths)
+            for record in ordered_records
+        ]
         if any(capacity <= 0 for capacity in capacities):
             continue
         plan = _pack_complete_core_intervals(capacities, core_intervals)
@@ -228,7 +320,7 @@ def _sequence_complete_wells(
         for result_index, record, (top_cm, base_cm, _core_index) in zip(
             ordered_indices, ordered_records, plan,
         ):
-            if record.source == "manual" and record.mapping_confirmed and record.has_interval:
+            if record.column_depths or (record.source == "manual" and record.mapping_confirmed and record.has_interval):
                 continue
             result[result_index] = replace(
                 record,
@@ -259,13 +351,15 @@ def _pack_complete_core_intervals(
 ) -> list[tuple[int, int, int]] | None:
     """Pack one natural photo sequence over every Excel core range.
 
-    A page never stretches across a no-core gap between two sampling ranges.
-    The last page of a range may therefore be shorter than its detected full
-    capacity. The plan is accepted only when all photos and all Excel core
-    ranges are consumed, which prevents a partial folder from being assigned
-    confidently but incorrectly.
+    Physical capacity is measured from the actual rock, including short final
+    columns. It cannot be arbitrarily truncated to fit Excel: that would turn
+    a metre of rock into a few centimetres and still look fully covered.
     """
     if not capacities or not core_intervals:
+        return None
+    if any(base <= top for top, base in core_intervals) or any(
+        right[0] < left[1] for left, right in zip(core_intervals, core_intervals[1:])
+    ):
         return None
     plan: list[tuple[int, int, int]] = []
     core_index = 0
@@ -275,7 +369,11 @@ def _pack_complete_core_intervals(
             return None
         core_top_cm, core_base_cm = core_intervals[core_index]
         cursor_cm = max(cursor_cm, core_top_cm)
+        if capacity_cm <= 0 or cursor_cm + capacity_cm > core_base_cm + 2:
+            return None
         page_base_cm = min(core_base_cm, cursor_cm + capacity_cm)
+        if 0 < core_base_cm - page_base_cm <= 2:
+            page_base_cm = core_base_cm
         if page_base_cm <= cursor_cm:
             return None
         plan.append((cursor_cm, page_base_cm, core_index))
@@ -297,6 +395,11 @@ def _sequence_matches_anchors(
     """Reject a full-well plan if it contradicts a trusted depth anchor."""
     core_intervals = _core_intervals_for_well(rows, well_key(records[0].well))
     for record, (top_cm, base_cm, core_index) in zip(records, plan):
+        if record.column_depths:
+            label_top_cm = min(meters_to_centimeters(item[1]) for item in record.column_depths)
+            label_base_cm = max(meters_to_centimeters(item[2]) for item in record.column_depths)
+            if abs(label_top_cm - top_cm) > 2 or abs(label_base_cm - base_cm) > 2:
+                return False
         if (
             record.source in {"ocr", "ocr_verified"}
             and record.mapping_confirmed
@@ -304,6 +407,15 @@ def _sequence_matches_anchors(
         ):
             canonical = _matching_core_interval(record, rows)
             if canonical is not None and canonical != core_intervals[core_index]:
+                return False
+            is_whole_core_caption = canonical is not None and (
+                abs(meters_to_centimeters(record.top) - canonical[0]) <= 2
+                and abs(meters_to_centimeters(record.base) - canonical[1]) <= 2
+            )
+            if not is_whole_core_caption and (
+                abs(meters_to_centimeters(record.top) - top_cm) > 2
+                or abs(meters_to_centimeters(record.base) - base_cm) > 2
+            ):
                 return False
         if (
             record.source in {"filename", "manual"}
@@ -350,6 +462,7 @@ def _discard_filename_intervals_outside_excel(
             for top, bottom in (
                 (row.top, row.base),
                 (row.core_top, row.core_base),
+                (row.gis_top, row.gis_base),
             )
             if top is not None and bottom is not None and bottom > top
         )
@@ -398,11 +511,15 @@ def _matching_core_interval(record: PhotoRecord, rows: list[DescriptionRow]) -> 
     return top_cm, base_cm
 
 
-def _photo_core_capacity_cm(path: Path) -> int:
+def _photo_core_capacity_cm(
+    path: Path, column_depths: tuple[tuple[float, float, float], ...] = (),
+) -> int:
     try:
-        from .vision import core_photo_capacity_centimeters, detect_core_columns_from_path
+        from .vision import core_photo_capacity_centimeters, detect_core_columns_from_path, read_image
 
-        return core_photo_capacity_centimeters(detect_core_columns_from_path(path))
+        columns = detect_core_columns_from_path(path)
+        image = read_image(path)
+        return core_photo_capacity_centimeters(columns, image, column_depths)
     except (OSError, ValueError):
         return 0
 
@@ -471,7 +588,11 @@ def write_photo_map(path: Path, records: list[PhotoRecord]) -> None:
     with Path(path).open("w", encoding="utf-8-sig", newline="") as target:
         writer = csv.DictWriter(
             target,
-            fieldnames=("photo", "well", "top", "base", "column_order", "source", "mapping_confirmed"),
+            fieldnames=(
+                "photo", "well", "top", "base", "column_order", "source",
+                "mapping_confirmed", "column_depths", "column_ocr_checked",
+                "depth_basis",
+            ),
             delimiter=";",
         )
         writer.writeheader()
@@ -482,6 +603,9 @@ def write_photo_map(path: Path, records: list[PhotoRecord]) -> None:
                 "base": "" if record.base is None else format_depth(record.base),
                 "column_order": normalize_column_order(record.column_order),
                 "source": record.source, "mapping_confirmed": "1" if record.mapping_confirmed else "0",
+                "column_depths": json.dumps(record.column_depths, ensure_ascii=False),
+                "column_ocr_checked": "1" if record.column_ocr_checked else "0",
+                "depth_basis": record.depth_basis,
             })
 
 
@@ -490,11 +614,22 @@ def read_photo_map(path: Path) -> list[PhotoRecord]:
         rows = list(csv.DictReader(source, delimiter=";"))
     output = []
     for row in rows:
+        try:
+            column_depths = tuple(
+                (float(item[0]), float(item[1]), float(item[2]))
+                for item in json.loads(row.get("column_depths", "") or "[]")
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            column_depths = ()
         output.append(PhotoRecord(
             path=Path(row["photo"]), well=row.get("well", "").strip(),
             top=as_float(row.get("top")), base=as_float(row.get("base")),
             source=row.get("source", "manual").strip() or "manual",
             mapping_confirmed=row.get("mapping_confirmed", "").strip().casefold() in {"1", "true", "yes", "да"},
             column_order=normalize_column_order(row.get("column_order")),
+            column_depths=column_depths,
+            column_ocr_checked=row.get("column_ocr_checked", "").strip().casefold()
+            in {"1", "true", "yes", "да"},
+            depth_basis=row.get("depth_basis", "unknown").strip() or "unknown",
         ))
     return sort_photo_records(output)

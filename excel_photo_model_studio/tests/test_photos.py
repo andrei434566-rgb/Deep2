@@ -25,14 +25,43 @@ class PhotoOcrParsingTests(unittest.TestCase):
         self.assertEqual(10, len(photos))
         self.assertEqual(10, len({photo.path for photo in photos}))
 
-    def test_prefers_captioned_full_core_interval_over_column_numbers(self):
+    def test_prefers_adjusted_caption_interval_over_raw_sampling_and_column_numbers(self):
         text = (
             "Глубина по керну 4105.00 4106.00 4107.00 4107.94 4108.94. "
             "Глубина с увязкой 4104.90 4105.90 4106.90 4107.84 4108.84. "
             "Интервал отбора керна с 4104,90 до 4116,55 м, после увязки 4104,90-4116,45 м."
         )
 
-        self.assertEqual((4104.9, 4116.55), extract_depth_interval(text))
+        self.assertEqual((4104.9, 4116.45), extract_depth_interval(text))
+
+    def test_prefers_post_alignment_range_over_full_sampling_interval(self):
+        text = (
+            "Интервал отбора керна 4106.00-4116.55 м, "
+            "после увязки 4106.00-4114.65 м."
+        )
+
+        self.assertEqual(
+            (4106.0, 4114.65),
+            extract_depth_interval(text, ((4105.0, 4117.0),)),
+        )
+
+    def test_accepts_photo_page_interval_inside_excel_core_interval(self):
+        self.assertEqual(
+            (4109.94, 4114.65),
+            extract_depth_interval(
+                "Интервал отбора керна 4109.94-4114.65 м",
+                ((4105.0, 4117.0),),
+            ),
+        )
+
+    def test_caption_records_depth_coordinate_basis(self):
+        for caption, basis in (
+            ("Интервал отбора керна 4105.00-4117.00 м", "drilling"),
+            ("Интервал отбора керна 4105.00-4117.00 м, после увязки 4104.90-4116.90 м", "gis"),
+        ):
+            metadata = {}
+            self.assertIsNotNone(extract_depth_interval(caption, metadata=metadata))
+            self.assertEqual(basis, metadata["depth_basis"])
 
     def test_extracts_well_and_removes_figure_suffix(self):
         self.assertEqual("67ПО", extract_well("Восточно-Тазовское м-е, скв№ 67ПО-0001"))

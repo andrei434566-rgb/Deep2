@@ -14,7 +14,7 @@ from excel_photo_model_studio.models import (
 )
 from excel_photo_model_studio.vision import (
     calibrate_core_columns, core_photo_capacity_centimeters, detect_column_order, detect_core_columns, project_matches,
-    read_image, render_previews,
+    _column_depths_by_box, _depth_label_value, _pair_column_depth_rows, read_image, render_previews,
 )
 
 
@@ -153,6 +153,18 @@ class VisionTests(unittest.TestCase):
         self.assertGreaterEqual(bottom, 835)
         self.assertLessEqual(bottom, 865)
 
+    def test_close_depth_digits_are_excluded_from_core_geometry(self):
+        for gap in (1, 3, 6, 12):
+            with self.subTest(gap_pixels=gap):
+                image = np.full((1000, 700, 3), 255, dtype=np.uint8)
+                cv2.putText(image, "4130.00", (275, 200 - gap), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.75, (25, 25, 25), 2, cv2.LINE_AA)
+                cv2.rectangle(image, (275, 200), (410, 850), (242, 242, 242), -1)
+                boxes = detect_core_columns(image)
+                self.assertEqual(1, len(boxes))
+                self.assertGreaterEqual(boxes[0][1], 197)
+                self.assertLessEqual(boxes[0][1], 203)
+
     def test_calibrates_depth_inside_each_detected_column(self):
         columns = [(10, 20, 50, 120), (70, 20, 110, 220), (130, 20, 170, 120)]
 
@@ -176,6 +188,137 @@ class VisionTests(unittest.TestCase):
         columns = [(20, 20, 70, 420), (100, 20, 150, 220)]
 
         self.assertEqual(150, core_photo_capacity_centimeters(columns))
+
+    def test_capacity_uses_ruler_for_a_single_short_core_fragment(self):
+        image = np.full((1000, 700, 3), 255, dtype=np.uint8)
+        for y in range(100, 901, 80):
+            cv2.line(image, (100, y), (650, y), (35, 35, 35), 2)
+        columns = [(300, 100, 400, 260)]
+
+        self.assertEqual(20, core_photo_capacity_centimeters(columns, image))
+
+    def test_partial_column_depth_calibration_uses_actual_pixel_capacity(self):
+        image = np.full((1000, 700, 3), 255, dtype=np.uint8)
+        for y in range(100, 901, 80):
+            cv2.line(image, (100, y), (650, y), (35, 35, 35), 2)
+        columns = [(300, 100, 400, 260)]
+
+        calibrated = calibrate_core_columns(columns, 4144.1, 4144.3, image=image)
+
+        self.assertEqual([(4144.1, 4144.3)], [item[1:] for item in calibrated])
+
+    def test_printed_grid_rejects_squeezing_complete_columns_to_shorter_caption(self):
+        image = np.full((1000, 900, 3), 255, dtype=np.uint8)
+        for y in range(100, 901, 80):
+            cv2.line(image, (100, y), (850, y), (35, 35, 35), 2)
+        columns = [(150 + 130 * index, 100, 240 + 130 * index, 900) for index in range(5)]
+        self.assertEqual([], calibrate_core_columns(columns, 100.0, 104.1, image))
+        self.assertEqual([], calibrate_core_columns(columns, 100.0, 106.0, image))
+        calibrated = calibrate_core_columns(columns, 100.0, 105.0, image)
+        self.assertEqual(5, len(calibrated))
+        self.assertEqual((104.0, 105.0), calibrated[-1][1:])
+
+    def test_single_column_without_depth_grid_uses_safe_full_lane_fallback(self):
+        image = np.full((900, 700, 3), 255, dtype=np.uint8)
+        columns = [(300, 100, 400, 400)]
+
+        self.assertEqual(100, core_photo_capacity_centimeters(columns, image))
+
+    def test_calibration_prefers_per_column_depth_labels(self):
+        image = np.full((1000, 500, 3), 255, dtype=np.uint8)
+        columns = [(100, 100, 180, 900), (260, 100, 340, 900)]
+        labels = ((0.28, 4109.94, 4110.93), (0.60, 4110.93, 4111.73))
+
+        calibrated = calibrate_core_columns(
+            columns, 4109.90, 4111.80, image=image, column_depths=labels,
+        )
+
+        self.assertEqual([(4109.94, 4110.93), (4110.93, 4111.73)], [item[1:] for item in calibrated])
+        self.assertEqual(179, core_photo_capacity_centimeters(columns, image, labels))
+
+    def test_ocr_depth_rows_assign_each_header_footer_pair_to_its_column(self):
+        columns = [(100, 100, 180, 900), (260, 100, 340, 900)]
+        tokens = [
+            (4109.94, 110.0, 70.0, 90.0), (4110.93, 270.0, 70.0, 90.0),
+            (4110.93, 110.0, 930.0, 90.0), (4111.73, 270.0, 930.0, 90.0),
+        ]
+
+        ranges = _pair_column_depth_rows(tokens, columns, 500, 1000)
+
+        self.assertEqual(1, len(ranges))
+        self.assertEqual({0: (4109.94, 4110.93), 1: (4110.93, 4111.73)}, ranges[0])
+
+    def test_partial_column_reads_its_footer_label_at_the_bottom_of_the_page(self):
+        columns = [(200, 100, 300, 300)]
+        tokens = [
+            (4144.0, 210.0, 70.0, 90.0),
+            (4144.2, 210.0, 930.0, 90.0),
+        ]
+
+        ranges = _pair_column_depth_rows(tokens, columns, 700, 1000)
+
+        self.assertEqual([{0: (4144.0, 4144.2)}], ranges)
+
+    def test_depth_label_parser_handles_decimal_comma_and_ocr_zeros(self):
+        self.assertAlmostEqual(4114.65, _depth_label_value("4I14,65"))
+
+    def test_depth_label_parser_accepts_shallow_and_deep_wells(self):
+        for text, depth in (("12,03", 12.03), ("100.01", 100.01), ("0.20", 0.2), ("12345.67", 12345.67)):
+            self.assertEqual(depth, _depth_label_value(text))
+        for text in ("Fig.4105", "№12345", "20cm", "5.1-20"):
+            self.assertIsNone(_depth_label_value(text))
+
+    def test_column_depth_labels_are_not_reused_for_two_boxes(self):
+        columns = [(100, 100, 160, 900), (160, 100, 220, 900)]
+        self.assertEqual({}, _column_depths_by_box(columns, ((0.32, 100.0, 101.0),), 500))
+        self.assertEqual({}, _column_depths_by_box(
+            columns, ((0.32, 100.0, 101.0), (0.32, 101.0, 102.0)), 500,
+        ))
+
+    def test_stale_or_overlapping_column_labels_cannot_fall_back_to_guessed_masks(self):
+        columns = [(100, 100, 160, 900), (260, 100, 320, 900)]
+        image = np.full((1000, 500, 3), 255, dtype=np.uint8)
+        for labels in (
+            ((0.26, 100.0, 101.0),),
+            ((0.26, 100.0, 101.0), (0.58, 100.5, 101.5)),
+        ):
+            self.assertEqual([], calibrate_core_columns(columns, 100.0, 102.0, image, labels))
+            self.assertEqual(0, core_photo_capacity_centimeters(columns, image, labels))
+
+    def test_source_identity_distinguishes_same_workbook_name_in_different_wells(self):
+        first = DescriptionRow("W", 100, 101, "Sand", "Data", 2, source_file="well_a/description.xlsx")
+        second = DescriptionRow("W", 100, 101, "Sand", "Data", 2, source_file="well_b/description.xlsx")
+        self.assertNotEqual(first.source_id, second.source_id)
+
+    def test_ocr_rows_do_not_cross_pair_drilling_and_gis(self):
+        columns = [(100, 150, 180, 900), (260, 150, 340, 900)]
+        tokens = []
+        for y, depths in ((70, (100, 101)), (90, (99.9, 100.9)), (930, (101, 102)), (950, (100.9, 101.9))):
+            tokens.extend((depth, x, y, 90) for depth, x in zip(depths, (140, 300)))
+        ranges = _pair_column_depth_rows(tokens, columns, 500, 1000)
+        self.assertEqual([
+            {0: (100, 101), 1: (101, 102)},
+            {0: (99.9, 100.9), 1: (100.9, 101.9)},
+        ], ranges)
+
+    def test_ocr_row_labels_pair_same_basis_even_when_one_row_is_missing(self):
+        columns = [(100, 150, 180, 900)]
+        tokens = [(100, 140, 70, 90), (99.9, 140, 90, 90), (100.9, 140, 950, 90)]
+        # With no semantic evidence the incomplete two-row table is ambiguous.
+        self.assertEqual([], _pair_column_depth_rows(tokens, columns, 500, 1000))
+        bases = {}
+        ranges = _pair_column_depth_rows(
+            tokens, columns, 500, 1000,
+            label_tokens=[("Глубина по керну", 40, 70), ("Глубина с увязкой", 40, 90), ("Глубина с увязкой", 40, 950)],
+            candidate_bases=bases,
+        )
+        self.assertEqual([{0: (99.9, 100.9)}], ranges)
+        self.assertEqual({0: "gis"}, bases)
+
+    def test_one_centimetre_column_is_not_rejected_by_float_rounding(self):
+        self.assertEqual([{0: (100.0, 100.01)}], _pair_column_depth_rows(
+            [(100.0, 140, 70, 90), (100.01, 140, 950, 90)], [(100, 150, 180, 200)], 500, 1000,
+        ))
 
     def test_does_not_create_full_photo_mask_when_columns_are_missing(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -15,7 +15,7 @@ from .models import (
     Annotation, COLUMN_ORDER_AUTO, COLUMN_ORDER_RIGHT_TO_LEFT, ColumnMapping,
     DescriptionRow, Issue, PhotoRecord, normalize_column_order,
 )
-from .photos import discover_photos
+from .photos import discover_photos, enrich_core_column_depths
 from .tabular import read_many_tables, save_mappings, well_key
 from .vision import (
     calibrate_core_columns, core_photo_capacity_centimeters, detect_column_order,
@@ -78,7 +78,21 @@ def refresh_project(project_dir: Path) -> dict:
         _write_table_cache(project_dir, rows, mappings, issues, excel_files)
     else:
         rows, mappings, issues, excel_files = cached
-    photos = suggest_missing_intervals(read_photo_map(project_dir / "photo_map.csv"), rows)
+    photo_records = read_photo_map(project_dir / "photo_map.csv")
+    # A recalculation must include files added after the project was created.
+    # Preserve edits to existing records; discover/OCR only new paths.
+    known_paths = {item.path.resolve() for item in photo_records}
+    discovered = discover_photos(Path(config["photos_dir"]), use_ocr=False)
+    photo_records.extend(item for item in discovered if item.path.resolve() not in known_paths)
+    if config.get("use_ocr", False):
+        core_intervals = tuple(sorted({
+            (float(row.core_top), float(row.core_base))
+            for row in rows
+            if row.core_top is not None and row.core_base is not None
+            and row.core_base > row.core_top
+        }))
+        photo_records = enrich_core_column_depths(photo_records, core_intervals)
+    photos = suggest_missing_intervals(photo_records, rows)
     # This also migrates projects made by 0.3.3, where every OCR page could
     # incorrectly contain the same full core-sampling interval.
     write_photo_map(project_dir / "photo_map.csv", photos)
@@ -86,7 +100,12 @@ def refresh_project(project_dir: Path) -> dict:
     confirmed = [photo for photo in photos if photo.mapping_confirmed]
     matches, unresolved_confirmed = match_photos(confirmed, rows)
     unconfirmed = [photo for photo in photos if not photo.mapping_confirmed]
-    annotations, columns, orders = project_matches(matches)
+    capacity_by_path: dict[Path, int] = {}
+    depth_ranges_by_path: dict[Path, list[tuple[tuple[int, int, int, int], float, float]]] = {}
+    annotations, columns, orders = project_matches(
+        matches, capacities_by_photo=capacity_by_path,
+        depth_ranges_by_photo=depth_ranges_by_path,
+    )
     # Every selected image is required to be a core photo. Detect columns even
     # when its depth or Excel match is missing, so it cannot disappear silently
     # before validation and dataset creation.
@@ -95,34 +114,45 @@ def refresh_project(project_dir: Path) -> dict:
             continue
         try:
             columns[photo.path] = detect_core_columns_from_path(photo.path)
+            image = read_image(photo.path)
             requested_order = normalize_column_order(photo.column_order)
             if requested_order == COLUMN_ORDER_AUTO:
-                order = detect_column_order(read_image(photo.path), columns[photo.path])
+                order = detect_column_order(image, columns[photo.path])
             else:
                 order = requested_order
             if order == COLUMN_ORDER_RIGHT_TO_LEFT:
                 columns[photo.path].reverse()
             orders[photo.path] = order
+            capacity_by_path[photo.path] = core_photo_capacity_centimeters(
+                columns[photo.path], image, photo.column_depths,
+            )
+            depth_ranges_by_path[photo.path] = (
+                calibrate_core_columns(
+                    columns[photo.path], float(photo.top), float(photo.base), image=image,
+                    column_depths=photo.column_depths,
+                )
+                if photo.has_interval else []
+            )
         except (OSError, ValueError):
             columns[photo.path] = []
             orders[photo.path] = photo.column_order
-    annotations = [replace(item, approved=old_approvals.get(item.annotation_id, False)) for item in annotations]
+            capacity_by_path[photo.path] = 0
+            depth_ranges_by_path[photo.path] = []
+    annotations = [replace(item, approved=old_approvals.get(_annotation_revision(item), False)) for item in annotations]
     preview_paths = render_previews(annotations, project_dir / "previews")
     _write_matches(project_dir / "matches.csv", matches)
     _write_annotations(project_dir / "annotations.csv", annotations, preview_paths)
+    photo_by_path = {photo.path: photo for photo in photos}
     inventory_path = project_dir / "photo_inventory.csv"
-    _write_photo_inventory(inventory_path, photos, matches, annotations, columns)
+    _write_photo_inventory(inventory_path, photos, matches, annotations, columns, capacity_by_path)
     facies_inventory_path = project_dir / "facies_inventory.csv"
     unmatched_facies_rows = _write_facies_inventory(
         facies_inventory_path, rows, confirmed, matches,
     )
-    photo_by_path = {photo.path: photo for photo in photos}
     detected_payload = {}
     for path, boxes in columns.items():
         photo = photo_by_path.get(path)
-        depth_ranges = calibrate_core_columns(
-            boxes, float(photo.top), float(photo.base),
-        ) if photo is not None and photo.has_interval else []
+        depth_ranges = depth_ranges_by_path.get(path, [])
         detected_payload[str(path)] = {
             "order": orders.get(path, "left_to_right"),
             "boxes": [list(box) for box in boxes],
@@ -133,6 +163,14 @@ def refresh_project(project_dir: Path) -> dict:
         }
     _write_json(project_dir / "detected_columns.json", detected_payload)
     all_issues = list(issues)
+    projection_issues = _projection_issues(photos, annotations, columns, depth_ranges_by_path)
+    all_issues.extend(projection_issues)
+    facies_mask_gaps = _facies_mask_gaps(rows, annotations)
+    all_issues.extend(
+        Issue("error", source, "Фация Excel не полностью представлена масками: "
+              + "; ".join(f"{format_depth(top)}–{format_depth(base)} м" for top, base in gaps))
+        for source, gaps in facies_mask_gaps
+    )
     all_issues.extend(
         Issue(
             "error", photo.path.name,
@@ -199,7 +237,7 @@ def refresh_project(project_dir: Path) -> dict:
             uncovered_descriptions.items(), key=lambda item: item[0].name.casefold()
         )
     )
-    uncovered_excel_core = _uncovered_excel_core_intervals(rows, confirmed)
+    uncovered_excel_core = _uncovered_excel_core_intervals(rows, confirmed, matches)
     all_issues.extend(
         Issue(
             "error", well or "Excel",
@@ -213,7 +251,7 @@ def refresh_project(project_dir: Path) -> dict:
             "error", path.name,
             f"Интервал фото {format_depth(photo_by_path[path].base - photo_by_path[path].top)} м "
             f"длиннее вместимости найденного керна "
-            f"{format_depth(core_photo_capacity_centimeters(boxes) / 100)} м. "
+            f"{format_depth(capacity_by_path.get(path, core_photo_capacity_centimeters(boxes)) / 100)} м. "
             "Фото нельзя растягивать; проверьте OCR или ручные границы.",
         )
         for path, boxes in columns.items()
@@ -222,7 +260,7 @@ def refresh_project(project_dir: Path) -> dict:
         and photo_by_path[path].has_interval
         and meters_to_centimeters(photo_by_path[path].base)
         - meters_to_centimeters(photo_by_path[path].top)
-        > core_photo_capacity_centimeters(boxes) + 2
+        > capacity_by_path.get(path, core_photo_capacity_centimeters(boxes)) + 2
     )
     report = {
         "schema": PROJECT_SCHEMA,
@@ -244,6 +282,8 @@ def refresh_project(project_dir: Path) -> dict:
         "photo_inventory": str(inventory_path),
         "facies_inventory": str(facies_inventory_path),
         "excel_facies_rows_without_photo_match": unmatched_facies_rows,
+        "facies_rows_with_incomplete_masks": len(facies_mask_gaps),
+        "projection_errors": len(projection_issues),
         "approved_annotations": sum(item.approved for item in annotations),
         "excel_text_targets": sum(bool(item.target_text.strip()) for item in rows),
         "facies_rows_without_description": sum(not item.target_text.strip() for item in rows),
@@ -277,13 +317,14 @@ def refresh_project(project_dir: Path) -> dict:
         "blocking_errors": sum(item.severity == "error" for item in all_issues),
         "issues": [item.to_dict() for item in all_issues],
         "project_dir": str(project_dir),
+        "validation_snapshot": _validation_snapshot(project_dir, config, photos),
     }
     _write_json(project_dir / "report.json", report)
     return report
 
 
 def _uncovered_excel_core_intervals(
-    rows: list[DescriptionRow], photos: list[PhotoRecord],
+    rows: list[DescriptionRow], photos: list[PhotoRecord], matches=None,
 ) -> list[tuple[str, float, float]]:
     """Return centimetre-exact Excel core ranges missing from confirmed photos."""
     core_ranges: dict[tuple[str, int, int], str] = {}
@@ -300,9 +341,30 @@ def _uncovered_excel_core_intervals(
     for photo in photos:
         if not photo.mapping_confirmed or not photo.has_interval:
             continue
-        photo_spans.setdefault(well_key(photo.well), []).append((
-            meters_to_centimeters(photo.top), meters_to_centimeters(photo.base),
-        ))
+        matched = [item for item in (matches or ()) if item.photo.path == photo.path]
+        uses_gis = getattr(photo, "depth_basis", "unknown") == "gis" or (
+            matched and all(item.description.metadata.get("interval_source") == "gis" for item in matched)
+        )
+        if uses_gis:
+            # Audit coverage in the drilling coordinate system of core_top/base.
+            # Convert only paired facies limits, never shift the whole well by
+            # one offset (the tie-in can change between drilling runs).
+            for row in rows:
+                if well_key(row.well) != well_key(photo.well) or row.gis_top is None or row.gis_base is None:
+                    continue
+                if row.gis_base <= row.gis_top:
+                    continue
+                top, base = max(photo.top, row.gis_top), min(photo.base, row.gis_base)
+                if base > top:
+                    ratio = (row.base - row.top) / (row.gis_base - row.gis_top)
+                    photo_spans.setdefault(well_key(photo.well), []).append((
+                        meters_to_centimeters(row.top + (top - row.gis_top) * ratio),
+                        meters_to_centimeters(row.top + (base - row.gis_top) * ratio),
+                    ))
+        else:
+            photo_spans.setdefault(well_key(photo.well), []).append((
+                meters_to_centimeters(photo.top), meters_to_centimeters(photo.base),
+            ))
 
     missing: list[tuple[str, float, float]] = []
     for (key, core_top_cm, core_base_cm), well in sorted(core_ranges.items()):
@@ -329,6 +391,122 @@ def _uncovered_excel_core_intervals(
     return missing
 
 
+def _gaps_cm(top: int, base: int, spans) -> list[tuple[int, int]]:
+    gaps = []
+    cursor = top
+    for left, right in sorted(spans):
+        left, right = max(top, left), min(base, right)
+        if right <= cursor:
+            continue
+        if left > cursor:
+            gaps.append((cursor, left))
+        cursor = right
+    if cursor < base:
+        gaps.append((cursor, base))
+    return gaps
+
+
+def _projection_issues(photos, annotations, columns, depth_ranges) -> list[Issue]:
+    """Validate actual masks, not just mathematical Excel/photo intersections."""
+    by_photo = {}
+    for item in annotations:
+        by_photo.setdefault(item.photo_path, []).append(item)
+    issues = []
+    for photo in photos:
+        if not photo.has_interval or not photo.mapping_confirmed:
+            continue
+        calibrated = depth_ranges.get(photo.path, [])
+        boxes = columns.get(photo.path, [])
+        if not boxes:
+            continue  # Already reported as NO_CORE_COLUMNS.
+        problems = []
+        if {tuple(item[0]) for item in calibrated} != {tuple(box) for box in boxes}:
+            problems.append("не всем физическим столбикам присвоена глубина")
+        spans = [(meters_to_centimeters(top), meters_to_centimeters(base)) for _, top, base in calibrated]
+        if _gaps_cm(meters_to_centimeters(photo.top), meters_to_centimeters(photo.base), spans):
+            problems.append("границы столбиков не покрывают весь интервал фото")
+        ordered = sorted(spans)
+        if any(right > next_left for (_, right), (next_left, _) in zip(ordered, ordered[1:])):
+            problems.append("глубины разных столбиков перекрываются")
+        if any(top < meters_to_centimeters(photo.top) or base > meters_to_centimeters(photo.base) for top, base in spans):
+            problems.append("глубины столбиков выходят за интервал фото")
+        assigned = set()
+        for index, (box, top, base) in enumerate(calibrated, start=1):
+            left, pixel_top, right, pixel_base = box
+            top_cm, base_cm = meters_to_centimeters(top), meters_to_centimeters(base)
+            covered = []
+            for item in by_photo.get(photo.path, []):
+                xs, ys = zip(*item.polygon)
+                center = (min(xs) + max(xs)) / 2
+                if not left <= center < right:
+                    continue
+                assigned.add(item.annotation_id)
+                if (min(xs) < left - 1 or max(xs) > right + 1
+                        or min(ys) < pixel_top - 1 or max(ys) > pixel_base + 1):
+                    problems.append(f"маска выходит за границы столбика {index}")
+                if (max(xs) - min(xs)) < max(1, right - left - 2):
+                    problems.append(f"маска не покрывает ширину столбика {index}")
+                mask_top, mask_base = meters_to_centimeters(item.depth_top), meters_to_centimeters(item.depth_base)
+                pixel_span = max(1, pixel_base - pixel_top)
+                projected_top = top_cm + round((min(ys) - pixel_top) * (base_cm - top_cm) / pixel_span)
+                projected_base = top_cm + round((max(ys) - pixel_top) * (base_cm - top_cm) / pixel_span)
+                if abs(projected_top - mask_top) > 1 or abs(projected_base - mask_base) > 1:
+                    problems.append(f"метраж маски не совпадает с пикселями столбика {index}")
+                if item.target_text.strip() and item.label.strip():
+                    covered.append((mask_top, mask_base))
+            if _gaps_cm(top_cm, base_cm, covered):
+                problems.append(f"столбик {index} не полностью закрыт масками с описанием")
+            covered.sort()
+            if any(end > next_start for (_, end), (next_start, _) in zip(covered, covered[1:])):
+                problems.append(f"на столбике {index} пересекаются маски фаций")
+        if any(item.annotation_id not in assigned for item in by_photo.get(photo.path, [])):
+            problems.append("маска находится вне распознанного керна")
+        if problems:
+            issues.append(Issue("error", photo.path.name, "Ошибка проекции: " + "; ".join(dict.fromkeys(problems))))
+    return issues
+
+
+def _facies_mask_gaps(rows, annotations) -> list[tuple[str, list[tuple[float, float]]]]:
+    grouped = {}
+    for item in annotations:
+        grouped.setdefault((item.source_file, item.source_sheet, item.source_row), []).append(item)
+    missing = []
+    for row in rows:
+        spans = []
+        for item in grouped.get((row.source_file, row.sheet, row.row), []):
+            source_top = item.facies_top if item.facies_top is not None else row.top
+            source_base = item.facies_base if item.facies_base is not None else row.base
+            if source_base <= source_top or not item.target_text.strip() or not item.label.strip():
+                continue
+            # GIS and drilling limits can differ; compare progress within the
+            # very same Excel row, not raw numbers from different depth systems.
+            ratio = (row.base - row.top) / (source_base - source_top)
+            spans.append((
+                meters_to_centimeters(row.top + (item.depth_top - source_top) * ratio),
+                meters_to_centimeters(row.top + (item.depth_base - source_top) * ratio),
+            ))
+        gaps = _gaps_cm(meters_to_centimeters(row.top), meters_to_centimeters(row.base), spans)
+        if gaps:
+            missing.append((row.source_id, [(centimeters_to_meters(a), centimeters_to_meters(b)) for a, b in gaps]))
+    return missing
+
+
+def _file_stamp(path: Path) -> list[int]:
+    stat = Path(path).stat()
+    return [stat.st_size, stat.st_mtime_ns]
+
+
+def _validation_snapshot(project_dir: Path, config: dict, photos) -> dict:
+    paths = [Path(path) for path in config.get("excel_paths", ())]
+    paths += [photo.path for photo in photos]
+    paths += [project_dir / name for name in ("annotations.csv", "photo_map.csv", "column_mapping.json", "detected_columns.json")]
+    return {
+        "files": {str(path.resolve()): _file_stamp(path) for path in paths},
+        "photos_dir": config["photos_dir"],
+        "photos": sorted(str(photo.path.resolve()) for photo in photos),
+    }
+
+
 def set_annotation_approvals(project_dir: Path, approvals: dict[str, bool]) -> dict:
     path = Path(project_dir) / "annotations.csv"
     rows = _read_csv(path)
@@ -339,6 +517,8 @@ def set_annotation_approvals(project_dir: Path, approvals: dict[str, bool]) -> d
     report_path = Path(project_dir) / "report.json"
     report = json.loads(report_path.read_text(encoding="utf-8"))
     report["approved_annotations"] = sum(row.get("approved") == "1" for row in rows)
+    if "validation_snapshot" in report:
+        report["validation_snapshot"]["files"][str(path.resolve())] = _file_stamp(path)
     _write_json(report_path, report)
     return report
 
@@ -354,10 +534,25 @@ def _read_project(project_dir: Path) -> dict:
     return config
 
 
+def _annotation_revision(item) -> str:
+    """Changing pixels, text or metadata invalidates the earlier review."""
+    if isinstance(item, Annotation):
+        data = asdict(item)
+        data["polygon_json"] = json.dumps(item.polygon)
+    else:
+        data = item
+    values = {key: str(data.get(key, "")) for key in (
+        "annotation_id", "target_text", "association", "environment", "field_name",
+        "image_width", "image_height", "label", "source_file",
+    )}
+    values["polygon"] = json.loads(data["polygon_json"])
+    return json.dumps(values, sort_keys=True, ensure_ascii=False)
+
+
 def _existing_approvals(path: Path) -> dict[str, bool]:
     if not path.is_file():
         return {}
-    return {row["annotation_id"]: row.get("approved", "") == "1" for row in _read_csv(path)}
+    return {_annotation_revision(row): row.get("approved", "") == "1" for row in _read_csv(path)}
 
 
 def _write_matches(path: Path, matches) -> None:
@@ -402,7 +597,9 @@ def _write_annotations(path: Path, annotations: list[Annotation], previews: dict
     ))
 
 
-def _write_photo_inventory(path: Path, photos, matches, annotations, columns) -> None:
+def _write_photo_inventory(
+    path: Path, photos, matches, annotations, columns, capacity_by_path=None,
+) -> None:
     """Persist one auditable row per discovered image, including misses."""
     facies_by_photo: dict[Path, set[tuple[str, str, int]]] = {}
     masks_by_photo: dict[Path, int] = {}
@@ -437,7 +634,9 @@ def _write_photo_inventory(path: Path, photos, matches, annotations, columns) ->
             "interval_source": photo.source,
             "interval_confirmed": "1" if photo.mapping_confirmed else "0",
             "core_columns": len(boxes),
-            "core_capacity_m": format_depth(core_photo_capacity_centimeters(boxes) / 100),
+            "core_capacity_m": format_depth(
+                (capacity_by_path or {}).get(photo.path, core_photo_capacity_centimeters(boxes)) / 100
+            ),
             "matched_facies": facies_count,
             "mask_count": mask_count,
             "status": status,

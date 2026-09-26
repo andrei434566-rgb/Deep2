@@ -49,7 +49,9 @@ def train_model(
         data=str(yaml_path), task="segment", epochs=int(epochs), patience=int(patience),
         pretrained=False,
         imgsz=int(image_size), device=device, batch=-1 if device != "cpu" else 4,
-        cache=False, amp=device != "cpu", seed=42, deterministic=True,
+        # Ultralytics' AMP self-test can fetch pretrained weights even when
+        # pretrained=False. Keep scratch/offline training genuinely offline.
+        cache=False, amp=False, seed=42, deterministic=True, workers=0,
         project=str(runs_dir), name="training", exist_ok=False,
         mosaic=0.0, mixup=0.0, copy_paste=0.0, flipud=0.0,
         degrees=0.0, perspective=0.0, translate=0.05, scale=0.15,
@@ -97,7 +99,7 @@ def train_bundle(
     )
     from .description_model import train_description_model
     text = train_description_model(
-        dataset_dir, output_dir, epochs=description_epochs, patience=description_patience,
+        dataset_dir, output_dir, epochs=description_epochs, patience=description_patience, device=device,
     )
     facies_reference = _facies_reference(dataset_dir)
     contract = {

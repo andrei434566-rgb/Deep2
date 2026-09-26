@@ -13,5 +13,8 @@ from excel_photo_model_studio.cli import main
 
 
 if __name__ == "__main__":
+    from multiprocessing import freeze_support
+
+    freeze_support()
     arguments = sys.argv[1:] or ["gui"]
     raise SystemExit(main(arguments))

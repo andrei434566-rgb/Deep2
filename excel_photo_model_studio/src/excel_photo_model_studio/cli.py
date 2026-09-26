@@ -60,6 +60,8 @@ def parser() -> argparse.ArgumentParser:
     analyze.add_argument("--confidence", type=float, default=0.25)
 
     commands.add_parser("gui", help="Открыть графическое приложение")
+    self_test = commands.add_parser("self-test", help="Проверить библиотеки, окно, Excel, OCR и нейросеть без загрузок")
+    self_test.add_argument("--output", type=Path, required=True)
     return root
 
 
@@ -69,7 +71,10 @@ def main(argv: list[str] | None = None) -> int:
             stream.reconfigure(encoding="utf-8", errors="replace")
     args = parser().parse_args(argv)
     try:
-        if args.command == "create":
+        if args.command == "self-test":
+            from .self_test import run_self_test
+            result = run_self_test(args.output)
+        elif args.command == "create":
             from .project import create_project
             result = create_project(args.excel, args.photos, args.project, mapping_file=args.mapping, use_ocr=args.ocr)
         elif args.command == "refresh":

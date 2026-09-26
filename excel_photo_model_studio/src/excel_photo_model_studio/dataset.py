@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import csv
 import json
+import math
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -31,8 +32,16 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
                     f"{current_project.name}: датасет заблокирован: " + "; ".join(blockers)
                     + ". Исправьте сопоставление и пересчитайте проект."
                 )
+            _verify_validation_snapshot(current_project, report)
+        elif (current_project / "project.json").is_file():
+            raise ValueError(f"{current_project.name}: нет отчёта проверки; пересчитайте проект.")
         with (current_project / "annotations.csv").open("r", encoding="utf-8-sig", newline="") as source:
-            for row in csv.DictReader(source, delimiter=";"):
+            project_rows = list(csv.DictReader(source, delimiter=";"))
+            if any(row.get("approved") != "1" for row in project_rows):
+                raise ValueError(f"{current_project.name}: есть неподтверждённые маски. Нельзя обучать на части скважины.")
+            if report_path.is_file() and len(project_rows) != int(report.get("annotations", len(project_rows))):
+                raise ValueError(f"{current_project.name}: число масок не совпадает с проверенным отчётом; пересчитайте проект.")
+            for row in project_rows:
                 if row.get("approved") != "1":
                     continue
                 key = (row.get("photo", ""), row.get("annotation_id", ""))
@@ -50,9 +59,13 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
         raise ValueError("Нужно минимум два разных фото: одно фото нельзя одновременно использовать для train и val.")
     labels = sorted({row["label"] for row in rows}, key=str.casefold)
     class_ids = {label: index for index, label in enumerate(labels)}
-    split_by_photo, strategy = _split_sources(by_photo)
+    content_ids = {}
+    for photo_name in by_photo:
+        with Path(photo_name).open("rb") as source:
+            content_ids[photo_name] = hashlib.file_digest(source, "sha256").hexdigest()
+    split_by_photo, strategy = _split_sources(by_photo, content_ids)
     if "val" not in split_by_photo.values():
-        raise ValueError("Не удалось выделить независимый val без удаления класса из train. Добавьте фото тех же классов.")
+        raise ValueError("Не удалось выделить независимый val без удаления класса из train. Добавьте разные фото тех же классов; копии одного фото не являются независимой проверкой.")
     for split in ("train", "val"):
         (destination / "images" / split).mkdir(parents=True, exist_ok=False)
         (destination / "labels" / split).mkdir(parents=True, exist_ok=False)
@@ -64,6 +77,8 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
         split = split_by_photo[photo_name]
         photo_bytes = photo.read_bytes()
         digest = hashlib.sha256(photo_bytes).hexdigest()
+        if digest != content_ids[photo_name]:
+            raise ValueError(f"Фото изменилось во время сборки датасета: {photo}")
         stem = f"sample_{photo_index:06d}_{digest[:10]}"
         target_image = destination / "images" / split / f"{stem}{photo.suffix.lower()}"
         target_image.write_bytes(photo_bytes)
@@ -74,6 +89,8 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
         for annotation_index, row in enumerate(annotations, start=1):
             polygon = json.loads(row["polygon_json"])
             width, height = float(row["image_width"]), float(row["image_height"])
+            if (int(height), int(width)) != source_image.shape[:2]:
+                raise ValueError(f"Размер фото изменился после создания масок: {photo}. Пересчитайте проект.")
             coords = " ".join(
                 f"{max(0.0, min(1.0, float(x) / width)):.6f} {max(0.0, min(1.0, float(y) / height)):.6f}"
                 for x, y in polygon
@@ -154,10 +171,38 @@ def _validate_annotation(row: dict[str, str]) -> None:
         )
     if any(len(point) != 2 or not (0 <= float(point[0]) <= width and 0 <= float(point[1]) <= height) for point in polygon):
         raise ValueError(f"Маска выходит за границы фото: {row.get('annotation_id', '')}.")
+    points = np.asarray(polygon, dtype=np.float32)
+    if not np.isfinite(points).all() or abs(cv2.contourArea(points)) < 0.5:
+        raise ValueError(f"Пустая или некорректная площадь маски: {row.get('annotation_id', '')}.")
+    top, base = float(row["depth_top"]), float(row["depth_base"])
+    if not math.isfinite(top) or not math.isfinite(base) or base <= top:
+        raise ValueError(f"Некорректный метраж маски: {row.get('annotation_id', '')}.")
+
+
+def _verify_validation_snapshot(project: Path, report: dict) -> None:
+    snapshot = report.get("validation_snapshot")
+    if not snapshot:
+        if (project / "project.json").is_file():
+            raise ValueError(f"{project.name}: проект проверен старой версией. Пересчитайте перед обучением.")
+        return
+    for name, expected in snapshot.get("files", {}).items():
+        path = Path(name)
+        if not path.is_file() or [path.stat().st_size, path.stat().st_mtime_ns] != expected:
+            raise ValueError(f"После проверки изменился файл {path.name}. Пересчитайте проект перед обучением.")
+    from .photos import IMAGE_EXTENSIONS
+    current_photos = sorted(
+        str(path.resolve()) for path in Path(snapshot["photos_dir"]).rglob("*")
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
+    if current_photos != snapshot.get("photos"):
+        raise ValueError("Состав папки фото изменился после проверки. Пересчитайте проект: нельзя пропускать новые фотографии.")
 
 
 def _report_blockers(report: dict) -> list[str]:
     values = (
+        ("projection_errors", int(report.get("projection_errors", 0) or 0), "ошибок наложения масок на керн"),
+        ("facies_rows_with_incomplete_masks", int(report.get("facies_rows_with_incomplete_masks", 0) or 0), "фаций не полностью покрытых масками"),
+        ("excel_facies_rows_without_photo_match", int(report.get("excel_facies_rows_without_photo_match", 0) or 0), "фаций Excel без фото"),
         (
             "photos_without_intervals",
             int(report.get("photos_without_intervals", report.get("unconfirmed_photos", 0)) or 0),
@@ -210,7 +255,7 @@ def _report_blockers(report: dict) -> list[str]:
     return blockers
 
 
-def _split_sources(by_photo: dict[str, list[dict[str, str]]]) -> tuple[dict[str, str], str]:
+def _split_sources(by_photo: dict[str, list[dict[str, str]]], content_ids: dict[str, str] | None = None) -> tuple[dict[str, str], str]:
     photo_labels = {photo: Counter(row["label"] for row in rows) for photo, rows in by_photo.items()}
     totals = sum(photo_labels.values(), Counter())
     by_well: dict[str, list[str]] = defaultdict(list)
@@ -224,8 +269,36 @@ def _split_sources(by_photo: dict[str, list[dict[str, str]]]) -> tuple[dict[str,
     strategy = "well" if can_group_by_well else "photo"
 
     def validation_candidates(grouped_photos: dict[str, list[str]]) -> list[tuple[tuple, list[str]]]:
+        # Connected components of well membership and identical-content links.
+        # Compute once, rather than rescanning thousands of photos per candidate.
+        parent = {photo: photo for photo in by_photo}
+
+        def find(photo):
+            while parent[photo] != photo:
+                parent[photo] = parent[parent[photo]]
+                photo = parent[photo]
+            return photo
+
+        def unite(left, right):
+            parent[find(right)] = find(left)
+
+        for photos in grouped_photos.values():
+            for photo in photos[1:]:
+                unite(photos[0], photo)
+        first_by_digest = {}
+        for photo, digest in (content_ids or {}).items():
+            if digest in first_by_digest:
+                unite(first_by_digest[digest], photo)
+            else:
+                first_by_digest[digest] = photo
+        components = defaultdict(list)
+        for photo in by_photo:
+            components[find(photo)].append(photo)
         candidates = []
-        for group_name, photos in grouped_photos.items():
+        for group_name, photos in components.items():
+            # Hold copies of an image on the same side even if filenames or
+            # project/well names differ. Otherwise validation memorizes train.
+            photos = sorted(photos)
             counts = sum((photo_labels[photo] for photo in photos), Counter())
             if any(totals[label] <= count for label, count in counts.items()):
                 continue

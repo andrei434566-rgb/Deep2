@@ -7,6 +7,14 @@ automatic pipeline and writes results beside the supplied data.
 """
 
 import sys
+from pathlib import Path
+
+
+# Share the trained description-network implementation with the standalone
+# studio in source checkouts. PyInstaller includes the package in its archive.
+studio_source = Path(__file__).resolve().parent / "excel_photo_model_studio" / "src"
+if studio_source.is_dir() and str(studio_source) not in sys.path:
+    sys.path.insert(0, str(studio_source))
 
 
 def _enable_command_console() -> None:

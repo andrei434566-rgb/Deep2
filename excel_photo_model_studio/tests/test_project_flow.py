@@ -107,7 +107,8 @@ class ProjectFlowTests(unittest.TestCase):
             workbook.save(excel)
             for well in ("W-1", "W-2"):
                 image = np.full((240, 160, 3), (20, 80, 150), dtype=np.uint8)
-                cv2.rectangle(image, (55, 20), (105, 220), (115, 115, 115), -1)
+                shade = 115 if well == "W-1" else 130
+                cv2.rectangle(image, (55, 20), (105, 220), (shade, shade, shade), -1)
                 ok, encoded = cv2.imencode(".jpg", image)
                 self.assertTrue(ok)
                 (photos / f"{well} 100-101.jpg").write_bytes(encoded.tobytes())

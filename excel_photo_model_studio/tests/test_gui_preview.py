@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -14,6 +15,8 @@ from openpyxl import Workbook
 from PySide6.QtWidgets import QApplication
 
 from excel_photo_model_studio.gui import MainWindow
+from excel_photo_model_studio.matching import read_photo_map, write_photo_map
+from excel_photo_model_studio.models import PhotoRecord
 from excel_photo_model_studio.project import create_project
 
 
@@ -69,6 +72,57 @@ class GuiPreviewTests(unittest.TestCase):
             report = json.loads((project / "report.json").read_text(encoding="utf-8"))
             self.assertTrue(any("длиннее вместимости найденного керна" in issue["message"] for issue in report["issues"]))
             window.close()
+
+    def test_recalculate_retains_ocr_coordinate_basis_unless_depth_is_edited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            photo = project / "core.jpg"
+            image = np.full((200, 200, 3), 255, dtype=np.uint8)
+            ok, encoded = cv2.imencode(".jpg", image)
+            self.assertTrue(ok)
+            photo.write_bytes(encoded.tobytes())
+            original = PhotoRecord(
+                photo, "W-1", 100.0, 101.0, "ocr_verified", True,
+                column_depths=((0.5, 100.0, 101.0),), column_ocr_checked=True,
+                depth_basis="gis",
+            )
+            write_photo_map(project / "photo_map.csv", [original])
+            window = MainWindow()
+            window.current_project = project
+            window._load_photo_map()
+            with patch.object(window, "_start_project_process"):
+                window._save_photo_map()
+            retained = read_photo_map(project / "photo_map.csv")[0]
+            self.assertEqual("gis", retained.depth_basis)
+            self.assertEqual(original.column_depths, retained.column_depths)
+            self.assertIn("по ГИС / с увязкой", window.matching_preview_title.text())
+
+            window.photo_table.item(0, 3).setText("99.9")
+            with patch.object(window, "_start_project_process"):
+                window._save_photo_map()
+            edited = read_photo_map(project / "photo_map.csv")[0]
+            self.assertEqual("unknown", edited.depth_basis)
+            self.assertEqual((), edited.column_depths)
+            self.assertEqual("manual", edited.source)
+            self.assertIn("Система глубин: не определена", window.matching_preview_title.text())
+            window.close()
+
+    def test_report_exposes_projection_failures_and_incomplete_facies(self):
+        window = MainWindow()
+        report = {
+            "project_dir": "example", "excel_rows": 1, "photos": 1,
+            "confirmed_photos": 1, "unconfirmed_photos": 0,
+            "annotations": 1, "approved_annotations": 0, "blocking_errors": 2,
+            "projection_errors": 1, "facies_rows_with_incomplete_masks": 1,
+            "issues": [{"severity": "error", "source": "core.jpg", "message": "Колонка керна не покрыта масками."}],
+        }
+        window._show_report(report)
+        message = window.project_log.toPlainText()
+        self.assertIn("Обучение заблокировано", message)
+        self.assertIn("Ошибок привязки масок к колонкам керна: 1", message)
+        self.assertIn("Фаций Excel с неполным покрытием масками: 1", message)
+        self.assertEqual(["Колонка керна не покрыта масками."], window.matching_photo_issues["core.jpg"])
+        window.close()
 
 
 if __name__ == "__main__":

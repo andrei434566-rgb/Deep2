@@ -26,7 +26,9 @@ class CatalogTests(unittest.TestCase):
                 (project / "report.json").write_text(json.dumps({
                     "photos": 1, "annotations": 1, "approved_annotations": 1,
                 }), encoding="utf-8")
-                photo = root / f"photo_{index}.jpg"
+                photo_folder = project / "photos"
+                photo_folder.mkdir()
+                photo = photo_folder / f"photo_{index}.jpg"
                 image = np.full((80, 60, 3), 100 + index * 20, dtype=np.uint8)
                 ok, encoded = cv2.imencode(".jpg", image)
                 self.assertTrue(ok)
@@ -44,6 +46,14 @@ class CatalogTests(unittest.TestCase):
                     writer = csv.DictWriter(target, fieldnames=row.keys(), delimiter=";")
                     writer.writeheader()
                     writer.writerow(row)
+                tracked = (photo, project / "annotations.csv")
+                (project / "report.json").write_text(json.dumps({
+                    "photos": 1, "annotations": 1, "approved_annotations": 1,
+                    "validation_snapshot": {
+                        "files": {str(path): [path.stat().st_size, path.stat().st_mtime_ns] for path in tracked},
+                        "photos_dir": str(photo_folder), "photos": [str(photo.resolve())],
+                    },
+                }), encoding="utf-8")
                 register_project(project, catalog)
                 register_project(project, catalog)
                 projects.append(project)

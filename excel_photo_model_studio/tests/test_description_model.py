@@ -4,12 +4,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
 import torch
 
-from excel_photo_model_studio.description_model import train_description_model
+from excel_photo_model_studio.description_model import DescriptionGenerator, train_description_model
 
 
 class DescriptionModelTests(unittest.TestCase):
@@ -41,8 +42,23 @@ class DescriptionModelTests(unittest.TestCase):
             info = train_description_model(
                 dataset, output, epochs=1, patience=1, max_text_length=48,
                 image_size=32, hidden_size=32, batch_size=2, progress=lambda _: None,
+                device="cpu",
             )
             checkpoint = torch.load(output / "description_best.pt", map_location="cpu", weights_only=False)
+            combined = output / "best.pt"
+            torch.save({"core_description_checkpoint": checkpoint}, combined)
+            original_load = torch.load
+            with patch("torch.load", wraps=original_load) as load:
+                generator = DescriptionGenerator(combined)
+                first = generator.generate(np.full((32, 32, 3), 130, dtype=np.uint8), "Tcr")
+                second = generator.generate(dataset / rows[0]["crop"], "Tcr")
+                self.assertEqual(1, load.call_count)
+                self.assertIsInstance(first, str)
+                self.assertIsInstance(second, str)
+                self.assertNotIn("<unk>", first)
+
+            with self.assertRaisesRegex(ValueError, "обрезано"):
+                train_description_model(dataset, output, max_text_length=8)
 
         self.assertEqual(22, checkpoint["target_column"])
         self.assertEqual("excel-photo-description-v2", checkpoint["schema"])
@@ -50,6 +66,7 @@ class DescriptionModelTests(unittest.TestCase):
         self.assertEqual(["interval_image", "facies_class"], checkpoint["conditioning"])
         self.assertEqual(5, info["train_samples"])
         self.assertEqual(1, info["val_samples"])
+        self.assertEqual("cpu", info["device"])
 
 
 if __name__ == "__main__":

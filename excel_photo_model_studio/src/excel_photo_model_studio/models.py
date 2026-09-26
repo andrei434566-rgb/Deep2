@@ -106,7 +106,9 @@ class DescriptionRow:
 
     @property
     def source_id(self) -> str:
-        prefix = f"{Path(self.source_file).name}:" if self.source_file else ""
+        # Many wells use identically named Excel files in different folders.
+        # A basename is not a source identity and would merge their facies.
+        prefix = f"{Path(self.source_file).expanduser().resolve()}:" if self.source_file else ""
         return f"{prefix}{self.sheet}!{self.row}"
 
 
@@ -119,12 +121,34 @@ class PhotoRecord:
     source: str = "not_found"
     mapping_confirmed: bool = False
     column_order: str = COLUMN_ORDER_AUTO
+    # OCR'd depth range for each physical column, stored as normalized x plus
+    # the upper/lower depth in metres.  Keeping these values with the photo
+    # prevents later mask projection from stretching a page-wide interval.
+    column_depths: tuple[tuple[float, float, float], ...] = ()
+    column_ocr_checked: bool = False
+    # Depth coordinates must not mix raw/core (drilling) and tied/log (GIS)
+    # values merely because their numerical ranges happen to overlap.
+    depth_basis: str = "unknown"
+    # Depth coordinates must not mix raw/core (drilling) and tied/log (GIS)
+    # values merely because their numerical ranges happen to overlap.
+    depth_basis: str = "unknown"
 
     def __post_init__(self) -> None:
         if self.top is not None:
             object.__setattr__(self, "top", normalize_depth(self.top))
         if self.base is not None:
             object.__setattr__(self, "base", normalize_depth(self.base))
+        normalized = []
+        for x_fraction, top, base in self.column_depths:
+            normalized.append((
+                min(1.0, max(0.0, float(x_fraction))),
+                normalize_depth(top), normalize_depth(base),
+            ))
+        object.__setattr__(self, "column_depths", tuple(normalized))
+        if self.depth_basis not in {"unknown", "drilling", "gis"}:
+            raise ValueError(f"Неизвестная система глубин фото: {self.depth_basis}")
+        if self.depth_basis not in {"unknown", "drilling", "gis"}:
+            raise ValueError(f"Неизвестная система глубин фото: {self.depth_basis}")
 
     @property
     def has_interval(self) -> bool:

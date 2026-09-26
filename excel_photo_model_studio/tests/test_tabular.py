@@ -12,6 +12,59 @@ from excel_photo_model_studio.tabular import read_table, save_mappings
 
 
 class TableReaderTests(unittest.TestCase):
+    def test_missing_drilling_cells_do_not_drop_valid_gis_facies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing_drilling.csv"
+            path.write_text(
+                "Скважина;Интервал фации по бурению Кровля;Интервал фации по бурению Подошва;"
+                "Интервал фации по ГИС Кровля;Интервал фации по ГИС Подошва;"
+                "Толщина фации;Код фации;Краткое описание\n"
+                "W-1;;;200;201;1;A;Песчаник.\n", encoding="utf-8",
+            )
+            rows, _, issues = read_table(path)
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual((200, 201), (rows[0].top, rows[0].base))
+        self.assertEqual("gis", rows[0].metadata["interval_source"])
+        self.assertEqual("Песчаник.", rows[0].target_text)
+        self.assertFalse(any(item.severity == "error" for item in issues))
+
+    def test_combined_drilling_interval_is_not_displaced_by_gis_pair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "combined.csv"
+            path.write_text(
+                "Скважина;Интервал фации по бурению;Интервал фации по ГИС Кровля;"
+                "Интервал фации по ГИС Подошва;Толщина фации;Код фации\n"
+                "W-1;100-101;200;201;1;A\n", encoding="utf-8",
+            )
+            rows, mappings, _ = read_table(path)
+
+        self.assertEqual(2, mappings[0].interval)
+        self.assertEqual((100, 101), (rows[0].top, rows[0].base))
+        self.assertEqual((200, 201), (rows[0].gis_top, rows[0].gis_base))
+
+    def test_merged_title_does_not_turn_facies_pair_into_core_sampling_pair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "reordered.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["Послойное описание керна"])
+            sheet.merge_cells("A1:H1")
+            sheet.append([
+                "Скважина", "Интервал фации по бурению Кровля", "Интервал фации по бурению Подошва",
+                "Код фации", "Интервал отбора керна Кровля", "Интервал отбора керна Подошва",
+                "Толщина фации", "Краткое описание",
+            ])
+            sheet.append(["W-1", 100, 101, "A", 100, 110, 1, "Песчаник."])
+            sheet.append(["W-2", 200, 201, "B", None, None, 1, "Алевролит."])
+            workbook.save(path)
+            rows, mappings, _ = read_table(path)
+
+        self.assertEqual((5, 6), (mappings[0].core_top, mappings[0].core_base))
+        self.assertEqual((2, 3), (mappings[0].top, mappings[0].base))
+        self.assertIsNone(rows[1].core_top)
+        self.assertIsNone(rows[1].core_base)
+
     def test_reads_reference_22_column_schema_and_target_text(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "reference.xlsx"

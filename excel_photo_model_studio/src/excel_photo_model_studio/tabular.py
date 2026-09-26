@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import re
 import unicodedata
 from dataclasses import replace
@@ -51,9 +52,11 @@ def as_float(value: Any) -> float | None:
     if value is None or str(value).strip() == "":
         return None
     if isinstance(value, (int, float)):
-        return float(value)
-    match = re.search(r"-?\d+(?:[.,]\d+)?", str(value).replace(" ", ""))
-    return float(match.group().replace(",", ".")) if match else None
+        return float(value) if math.isfinite(value) else None
+    text = re.sub(r"[\s\u00a0\u202f]+", "", str(value))
+    match = re.search(r"-?\d+(?:[.,]\d+)?", text)
+    parsed = float(match.group().replace(",", ".")) if match else None
+    return parsed if parsed is not None and math.isfinite(parsed) else None
 
 
 def parse_interval(value: Any) -> tuple[float | None, float | None]:
@@ -78,7 +81,7 @@ def _score(header: str, role: str) -> int:
         elif len(alias_normalized) > 3 and alias_normalized in text:
             score = max(score, 100 + len(alias_normalized))
     is_core = any(word in text for word in ("керн", "core"))
-    is_facies = any(word in text for word in ("фаци", "слоя", "layer"))
+    is_facies = any(word in text for word in ("фаци", "слоя", "facies", "layer"))
     is_drilling = any(word in text for word in ("по бурен", "буров", "drilling"))
     is_gis = any(word in text for word in ("по гис", "gis", "logging"))
     is_top = any(word in text for word in ("кровл", "верх", "начало", " from", " top", " start"))
@@ -98,6 +101,8 @@ def _score(header: str, role: str) -> int:
             score = max(score, 300)
         elif any(word in text for word in ("толщина слоя", "мощность слоя")):
             score = max(score, 220)
+    if score <= 0:
+        return 0
     if role in {"core_top", "core_base"}:
         score += 80 if is_core else -100
     if role in {"top", "base", "interval"}:
@@ -224,8 +229,14 @@ def detect_mapping(sheet: str, rows: list[list[Any]]) -> ColumnMapping:
     if not rows:
         return ColumnMapping(sheet=sheet, header_row=1)
     header_row = 1
+    first_header_row = 1
     header_started = False
     for index, row in enumerate(rows[:30], start=1):
+        nonempty = [normalize_text(value) for value in row if display_text(value)]
+        if len(nonempty) > 1 and len(set(nonempty)) == 1:
+            # A merged document title copied across the sheet must not add
+            # "керн" or "фация" to every otherwise unrelated column.
+            continue
         hits = {
             role
             for value in row
@@ -239,13 +250,15 @@ def detect_mapping(sheet: str, rows: list[list[Any]]) -> ColumnMapping:
         )
         continues_header = header_started and index <= header_row + 2 and len(structural) >= 2
         if starts_header or continues_header:
+            if not header_started:
+                first_header_row = index
             header_row = index
             header_started = True
     width = max((len(row) for row in rows[:header_row]), default=0)
     headers = []
     for column in range(width):
         parts: list[str] = []
-        for row in rows[:header_row]:
+        for row in rows[first_header_row - 1:header_row]:
             value = display_text(row[column]) if column < len(row) else ""
             if value and (not parts or normalize_text(parts[-1]) != normalize_text(value)):
                 parts.append(value)
@@ -265,10 +278,11 @@ def detect_mapping(sheet: str, rows: list[list[Any]]) -> ColumnMapping:
     values["top"], values["base"] = _best_facies_pair(
         headers, rows, header_row, used, values.get("facies_thickness"), "drilling",
     )
+    drilling_interval = _best_source_interval(headers, used, "drilling")
     # Some workbooks contain only GIS facies limits. Use those as the primary
     # limits only when no drilling limits exist; otherwise retain both systems
     # so matching can use GIS strictly as a fallback.
-    if not (values["top"] and values["base"]):
+    if not (values["top"] and values["base"]) and not drilling_interval:
         values["top"], values["base"] = _best_facies_pair(
             headers, rows, header_row, used, values.get("facies_thickness"),
         )
@@ -278,7 +292,7 @@ def detect_mapping(sheet: str, rows: list[list[Any]]) -> ColumnMapping:
         used.add(int(values["base"]))
     values["interval"] = None
     if not (values["top"] and values["base"]):
-        values["interval"] = _best_source_interval(headers, used, "drilling")
+        values["interval"] = drilling_interval
         if not values["interval"]:
             values["interval"] = _best(headers, "interval", used)
     values["gis_top"], values["gis_base"] = _best_facies_pair(
@@ -288,7 +302,7 @@ def detect_mapping(sheet: str, rows: list[list[Any]]) -> ColumnMapping:
         values["gis_top"] = values["gis_base"] = None
     if values["gis_top"] and values["gis_base"]:
         values["gis_interval"] = None
-    elif values["interval"] and "gis" in normalize_text(headers[values["interval"] - 1]):
+    elif values["interval"] and _is_gis_header(headers[values["interval"] - 1]):
         values["gis_interval"] = values["interval"]
     else:
         values["gis_interval"] = _best_source_interval(headers, used, "gis")
@@ -453,12 +467,25 @@ def _cell(row: list[Any], column: int | None) -> Any:
     return row[column - 1] if column and column <= len(row) else None
 
 
+def _is_gis_header(value: str) -> bool:
+    text = normalize_text(value)
+    return any(word in text for word in ("по гис", "gis", "logging")) and not any(
+        word in text for word in ("по бурен", "буров", "drilling")
+    )
+
+
 def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[DescriptionRow], list[Issue]]:
     output: list[DescriptionRow] = []
     issues: list[Issue] = []
     last_well = ""
     last_field = ""
     last_core_top = last_core_base = None
+    primary_headers = " ".join(
+        display_text(_cell(row, column))
+        for row in rows[:mapping.header_row]
+        for column in (mapping.top, mapping.base, mapping.interval) if column
+    )
+    primary_is_gis = _is_gis_header(primary_headers)
     sheet_well = "" if normalize_text(mapping.sheet) in {"лист1", "sheet1", "sheet", "данные", "data"} else mapping.sheet
     if not ((mapping.top and mapping.base) or mapping.interval):
         issues.append(Issue("error", mapping.sheet, "Не найдены столбцы интервала слоя."))
@@ -475,6 +502,16 @@ def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[De
         base = as_float(_cell(row, mapping.base))
         if top is None or base is None:
             top, base = parse_interval(_cell(row, mapping.interval))
+        gis_top = as_float(_cell(row, mapping.gis_top))
+        gis_base = as_float(_cell(row, mapping.gis_base))
+        if mapping.gis_interval:
+            gis_top, gis_base = parse_interval(_cell(row, mapping.gis_interval))
+        if gis_top is None or gis_base is None or gis_base <= gis_top:
+            gis_top = gis_base = None
+        row_source = "gis" if primary_is_gis else "drilling"
+        if (top is None or base is None or base <= top) and gis_top is not None and gis_base is not None:
+            top, base = gis_top, gis_base
+            row_source = "gis"
         if top is None or base is None or base <= top:
             continue
         top = normalize_depth(top)
@@ -485,13 +522,7 @@ def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[De
         thickness_declared = thickness is not None
         if thickness is not None:
             thickness = normalize_depth(thickness)
-        gis_top = as_float(_cell(row, mapping.gis_top))
-        gis_base = as_float(_cell(row, mapping.gis_base))
-        if mapping.gis_interval:
-            gis_top, gis_base = parse_interval(_cell(row, mapping.gis_interval))
-        if gis_top is None or gis_base is None or gis_base <= gis_top:
-            gis_top = gis_base = None
-        elif gis_top == top and gis_base == base:
+        if gis_top == top and gis_base == base:
             # If there was no drilling pair, GIS already became the primary
             # pair above and must not be counted twice as a fallback source.
             gis_top = gis_base = None
@@ -511,7 +542,7 @@ def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[De
                         f"Толщина фации {format_depth(thickness)} м не совпадает с интервалом по бурению "
                         f"{format_depth(top)}–{format_depth(base)} м "
                         f"({format_depth(span_cm / 100)} м); резервный интервал ГИС совпадает с толщиной "
-                        "и будет применяться только при отсутствии пересечения по бурению."
+                        "и может применяться при сопоставлении фото в системе глубин ГИС."
                         if gis_thickness_valid else
                         f"Толщина фации {format_depth(thickness)} м не совпадает с интервалом фации по бурению "
                         f"{format_depth(top)}–{format_depth(base)} м "
@@ -522,6 +553,11 @@ def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[De
         if not well:
             issues.append(Issue("error", f"{mapping.sheet}!{row_number}", "Не указана скважина."))
             continue
+        if last_well and well_key(well) != well_key(last_well):
+            # Forward-fill within one well only. Otherwise the first row of a
+            # new well inherits the previous well's sampling interval/field.
+            last_core_top = last_core_base = None
+            last_field = ""
         last_well = well
         field_name = display_text(_cell(row, mapping.field_name)) or last_field
         last_field = field_name
@@ -561,6 +597,7 @@ def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[De
             "association": association,
             "environment": environment,
             "source": f"{mapping.sheet}!{row_number}",
+            "interval_source": row_source,
         }
         output.append(DescriptionRow(
             well=well, top=top, base=base, label=label, sheet=mapping.sheet, row=row_number,

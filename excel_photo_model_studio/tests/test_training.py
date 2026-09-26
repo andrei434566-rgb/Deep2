@@ -46,6 +46,8 @@ class TrainingTests(unittest.TestCase):
 
         self.assertEqual("yolo11n-seg.yaml", calls["architecture"])
         self.assertFalse(calls["train"]["pretrained"])
+        self.assertFalse(calls["train"]["amp"])
+        self.assertEqual(0, calls["train"]["workers"])
         self.assertEqual("random_weights", info["initialization"])
         self.assertFalse(info["pretrained"])
 

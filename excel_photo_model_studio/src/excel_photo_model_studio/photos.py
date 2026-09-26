@@ -64,6 +64,60 @@ def discover_photos(
     return records
 
 
+def enrich_core_column_depths(
+    records: list[PhotoRecord],
+    expected_intervals: Iterable[tuple[float, float]] = (),
+) -> list[PhotoRecord]:
+    """Read per-column depth labels for an existing photo map once, then persist them."""
+    expected = tuple(expected_intervals)
+    output = []
+    for record in records:
+        if record.column_depths or record.column_ocr_checked or not record.path.is_file():
+            output.append(record)
+            continue
+        if record.source == "manual" and record.mapping_confirmed:
+            output.append(record)
+            continue
+        try:
+            import cv2
+            import numpy as np
+            import pytesseract
+
+            from .vision import detect_core_columns, extract_core_column_depths
+
+            if not _configure_tesseract(pytesseract):
+                output.append(record)
+                continue
+
+            image = cv2.imdecode(
+                np.frombuffer(record.path.read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR,
+            )
+            columns = detect_core_columns(image) if image is not None else []
+            depth_metadata = {}
+            depths = extract_core_column_depths(
+                image, columns,
+                reference_interval=(record.top, record.base) if record.has_interval else None,
+                expected_intervals=expected,
+                metadata=depth_metadata, preferred_basis=record.depth_basis,
+            ) if columns else ()
+        except Exception:
+            depths = ()
+        if not depths:
+            output.append(replace(record, column_ocr_checked=True))
+            continue
+        top = min(item[1] for item in depths)
+        base = max(item[2] for item in depths)
+        if base <= top:
+            output.append(replace(record, column_ocr_checked=True))
+            continue
+        output.append(replace(
+            record, top=top, base=base, source="ocr_verified",
+            mapping_confirmed=True, column_depths=depths, column_ocr_checked=True,
+            depth_basis=depth_metadata.get("depth_basis", record.depth_basis),
+        ))
+    return output
+
+
 def _with_ocr(
     record: PhotoRecord,
     *,
@@ -102,16 +156,44 @@ def _with_ocr(
         text = "\n".join(text_parts)
     except Exception:
         return replace(record, source="ocr_not_found")
-    interval = extract_depth_interval(text, expected_intervals)
+    depth_metadata = {}
+    interval = extract_depth_interval(text, expected_intervals, metadata=depth_metadata)
+    well = extract_well(text) or record.well
+    column_depths = ()
+    try:
+        from .vision import detect_core_columns, extract_core_column_depths
+
+        columns = detect_core_columns(image)
+        if columns:
+            column_depths = extract_core_column_depths(
+                image, columns, reference_interval=interval,
+                expected_intervals=expected_intervals,
+                metadata=depth_metadata,
+            )
+    except Exception:
+        column_depths = ()
+    if column_depths:
+        interval = (
+            min(item[1] for item in column_depths),
+            max(item[2] for item in column_depths),
+        )
+        if interval[1] <= interval[0]:
+            column_depths = ()
     if interval is None:
         return replace(record, source="ocr_not_found")
-    well = extract_well(text) or record.well
-    return PhotoRecord(record.path, well, interval[0], interval[1], "ocr", False)
+    verified_by_columns = bool(column_depths and expected_intervals)
+    return PhotoRecord(
+        record.path, well, interval[0], interval[1],
+        "ocr_verified" if verified_by_columns else "ocr", verified_by_columns,
+        column_depths=column_depths, column_ocr_checked=True,
+        depth_basis=depth_metadata.get("depth_basis", "unknown"),
+    )
 
 
 def extract_depth_interval(
     text: str,
     expected_intervals: Iterable[tuple[float, float]] = (),
+    *, metadata: dict[str, str] | None = None,
 ) -> tuple[float, float] | None:
     """Extract the full photographed-core interval from an OCR transcript."""
     # Keep OCR line boundaries. Previously display_text flattened every line,
@@ -132,10 +214,20 @@ def extract_depth_interval(
         for label_index in label_lines
         for line_index in range(max(0, label_index - 1), min(len(lines), label_index + 3))
     }
-    candidates: list[tuple[int, float, float]] = []
+    candidates: list[tuple[int, float, float, str]] = []
     number = r"\d{2,6}(?:\.\d{1,4})?"
     explicit_range = re.compile(rf"(?<!\d)({number})\s*(?:-|\bдо\b|\bto\b)\s*({number})(?!\d)", re.IGNORECASE)
     plain_number = re.compile(rf"(?<!\d)({number})(?!\d)")
+    adjustment = re.compile(
+        r"(?:после\s+увязк\w*|по\s+увязк\w*|с\s+уч[её]том\s+увязк\w*)",
+        re.IGNORECASE,
+    )
+    adjusted_context: set[int] = set()
+    for index, line in enumerate(lines):
+        if adjustment.search(line):
+            # Captions are sometimes split over multiple OCR lines.
+            if not plain_number.search(line):
+                adjusted_context.update(range(index + 1, min(len(lines), index + 3)))
 
     for line_index, line in enumerate(lines):
         if not line:
@@ -144,13 +236,25 @@ def extract_depth_interval(
         priority = 1200 if labelled else 100
         for match in explicit_range.finditer(line):
             has_depth_unit = re.search(r"(?:\sм\.?(?:\s|$)|\bметр)", line, re.IGNORECASE) is not None
-            candidates.append((priority + 100 + (100 if has_depth_unit else 0), float(match.group(1)), float(match.group(2))))
+            is_adjusted = line_index in adjusted_context or any(
+                cue.end() <= match.start() for cue in adjustment.finditer(line)
+            )
+            range_priority = priority + 100 + (100 if has_depth_unit else 0)
+            if is_adjusted:
+                range_priority += 1000
+            basis = "gis" if is_adjusted else ("drilling" if label_pattern.search(line[:match.start()]) else "unknown")
+            candidates.append((range_priority, float(match.group(1)), float(match.group(2)), basis))
 
-        values = [float(value) for value in plain_number.findall(line)]
+        number_matches = list(plain_number.finditer(line))
         # Adjacent OCR values on the same line cover captions where the dash
         # was lost, without constructing pairs across unrelated rows.
-        for top, base in zip(values, values[1:]):
-            candidates.append((priority, top, base))
+        for top_match, base_match in zip(number_matches, number_matches[1:]):
+            is_adjusted = line_index in adjusted_context or any(
+                cue.end() <= top_match.start() for cue in adjustment.finditer(line)
+            )
+            pair_priority = priority + (1000 if is_adjusted else 0)
+            basis = "gis" if is_adjusted else ("drilling" if label_pattern.search(line[:top_match.start()]) else "unknown")
+            candidates.append((pair_priority, float(top_match.group(1)), float(base_match.group(1)), basis))
 
     candidates = [
         item for item in candidates
@@ -161,18 +265,27 @@ def extract_depth_interval(
         return None
     expected = tuple(expected_intervals)
     if expected:
-        aligned: list[tuple[float, int, float, float]] = []
-        for priority, top, base in candidates:
+        aligned: list[tuple[int, float, float, float, float, str]] = []
+        for priority, top, base, basis in candidates:
             for expected_top, expected_base in expected:
-                error = abs(top - expected_top) + abs(base - expected_base)
-                # A generous multi-metre tolerance allowed column-header and
-                # ruler numbers to masquerade as the caption interval. OCR
-                # may differ by a few tenths, but both endpoints must remain
-                # close to one of the actual Excel core intervals.
-                if abs(top - expected_top) <= 0.5 and abs(base - expected_base) <= 0.5:
-                    aligned.append((error, -priority, top, base))
+                tolerance = 0.5
+                # A report page can show only a part of a longer Excel core
+                # interval. Accept a contained page range while still
+                # rejecting unrelated ruler numbers and captions outside the
+                # selected core interval.
+                if (
+                    top >= expected_top - tolerance
+                    and base <= expected_base + tolerance
+                    and base > expected_top
+                    and top < expected_base
+                    and base - top <= expected_base - expected_top + 2 * tolerance
+                ):
+                    outside_error = max(0.0, expected_top - top) + max(0.0, base - expected_base)
+                    aligned.append((-priority, outside_error, -(base - top), top, base, basis))
         if aligned:
-            _, _, top, base = min(aligned)
+            _, _, _, top, base, basis = min(aligned)
+            if metadata is not None:
+                metadata["depth_basis"] = basis
             return top, base
         return None
     # Without Excel core intervals, require either an interval caption or an
@@ -181,7 +294,9 @@ def extract_depth_interval(
     candidates = [item for item in candidates if item[0] >= 200]
     if not candidates:
         return None
-    _, top, base = max(candidates, key=lambda item: (item[0], item[2] - item[1]))
+    _, top, base, basis = max(candidates, key=lambda item: (item[0], item[2] - item[1]))
+    if metadata is not None:
+        metadata["depth_basis"] = basis
     return top, base
 
 

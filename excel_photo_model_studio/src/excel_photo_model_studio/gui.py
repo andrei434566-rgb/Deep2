@@ -185,6 +185,7 @@ class MainWindow(QMainWindow):
         self.matching_column_orders: dict[str, str] = {}
         self.matching_column_counts: dict[str, int] = {}
         self.matching_column_depths: dict[str, list[str]] = {}
+        self.matching_photo_issues: dict[str, list[str]] = {}
         self.tabs = QTabWidget(self)
         self.setCentralWidget(self.tabs)
         self._build_project_tab()
@@ -205,7 +206,7 @@ class MainWindow(QMainWindow):
         form = QFormLayout()
         self.excel = PathField(file_filter="Таблицы (*.xlsx *.xlsm *.xltx *.xltm *.xls *.csv *.tsv)")
         self.photos = PathField(directory=True)
-        self.ocr = QCheckBox("Автоматически читать интервал из подписи фото (Tesseract)")
+        self.ocr = QCheckBox("Автоматически читать глубину фото и колонок керна (Tesseract)")
         self.ocr.setChecked(True)
         form.addRow("Файл Excel/CSV:", self.excel)
         form.addRow("Папка фотографий:", self.photos)
@@ -590,6 +591,8 @@ class MainWindow(QMainWindow):
                 "" if record.top is None else format_depth(record.top),
                 "" if record.base is None else format_depth(record.base),
             ))
+            source.setData(Qt.ItemDataRole.UserRole + 1, record)
+            source.setToolTip(f"Система глубин: {self._depth_basis_label(record.depth_basis)}")
             self.photo_table.setItem(row, 6, source)
         self.photo_table.setUpdatesEnabled(True)
         self.photo_table.blockSignals(False)
@@ -610,25 +613,39 @@ class MainWindow(QMainWindow):
                 return self._error(f"{path.name}: для подтверждения нужны скважина и корректный интервал.")
             source_item = self.photo_table.item(row, 6)
             original = source_item.data(Qt.ItemDataRole.UserRole) if source_item else None
+            original_record = source_item.data(Qt.ItemDataRole.UserRole + 1) if source_item else None
             current = (
                 well,
                 "" if top is None else format_depth(top),
                 "" if base is None else format_depth(base),
             )
             source = source_item.text().strip() if source_item else "not_found"
-            if original is not None and current != tuple(original):
+            interval_edited = original is not None and current != tuple(original)
+            if interval_edited:
                 source = "manual"
             records.append(PhotoRecord(
                 path=path, well=well, top=top, base=base,
                 source=source or "manual",
                 mapping_confirmed=confirmed,
                 column_order=column_order,
+                column_depths=(
+                    original_record.column_depths
+                    if isinstance(original_record, PhotoRecord) and not interval_edited else ()
+                ),
+                column_ocr_checked=(
+                    original_record.column_ocr_checked if isinstance(original_record, PhotoRecord) else False
+                ),
+                depth_basis=(
+                    original_record.depth_basis
+                    if isinstance(original_record, PhotoRecord) and not interval_edited else "unknown"
+                ),
             ))
         try:
             project_dir = self._project_dir()
             write_photo_map(project_dir / "photo_map.csv", records)
         except Exception as exc:
             return self._error(str(exc))
+        self._show_matching_preview()
         self._start_project_process(["refresh", "--project", str(project_dir)], project_dir, "refresh")
 
     def _start_project_process(self, command: list[str], project_dir: Path, action: str) -> None:
@@ -689,7 +706,10 @@ class MainWindow(QMainWindow):
         self._update_catalog_status()
 
     def _show_report(self, report: dict) -> None:
+        self._set_photo_issues(report)
         lines = [
+            "Обучение заблокировано: сопоставление содержит ошибки."
+            if report.get("blocking_errors", 0) else "Проверка сопоставления пройдена.",
             f"Служебная папка создана автоматически: {report['project_dir']}",
             f"Excel/CSV-файлов: {report.get('excel_files', 1)}", f"Строк Excel: {report['excel_rows']}", f"Фото: {report['photos']}",
             f"Подтверждены интервалы фото: {report['confirmed_photos']}",
@@ -702,6 +722,8 @@ class MainWindow(QMainWindow):
             f"Автоматически восстановлено интервалов фото: "
             f"{report.get('auto_sequenced_photos', report.get('ocr_verified_photos', 0))}",
             f"Спроецировано масок: {report['annotations']}",
+            f"Ошибок привязки масок к колонкам керна: {report.get('projection_errors', 0)}",
+            f"Фаций Excel с неполным покрытием масками: {report.get('facies_rows_with_incomplete_masks', 0)}",
             f"Непокрытых фациями участков: {report.get('uncovered_facies_intervals', 0)}",
             f"Участков без «Краткого описания»: "
             f"{report.get('uncovered_description_intervals', 0)}",
@@ -740,18 +762,33 @@ class MainWindow(QMainWindow):
         if report.get("issues"):
             lines.append("\nПроверить:")
             lines.extend(f"- {item['source']}: {item['message']}" for item in report["issues"])
-        lines.append("\nНеизвестные интервалы исправьте прямо в таблице выше, отметьте OK и нажмите «Пересчитать после исправлений».")
+        if report.get("unconfirmed_photos", 0):
+            lines.append("\nНеизвестные интервалы можно исправить в таблице выше, отметить OK и нажать «Пересчитать после исправлений». Изменённые вручную глубины проверяются заново; их система глубин больше не считается определённой OCR.")
         lines.append(
             "Порядок колонок определяется автоматически по отметкам «Верх/Низ» или крайним цифрам. "
             "Если направление определено неверно, выберите его в таблице вручную и нажмите «Пересчитать»."
         )
         self.project_log.setPlainText("\n".join(lines))
 
+    def _set_photo_issues(self, report: dict) -> None:
+        self.matching_photo_issues.clear()
+        for issue in report.get("issues", []):
+            if issue.get("severity") == "error" and issue.get("source") and issue.get("message"):
+                self.matching_photo_issues.setdefault(str(issue["source"]), []).append(str(issue["message"]))
+
+    @staticmethod
+    def _depth_basis_label(basis: str) -> str:
+        return {"drilling": "по бурению / керну", "gis": "по ГИС / с увязкой"}.get(basis, "не определена")
+
     def _load_review(self) -> None:
         try:
             rows = load_annotations(self._project_dir())
         except Exception as exc:
             return self._error(str(exc))
+        try:
+            self._set_photo_issues(json.loads((self._project_dir() / "report.json").read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            self.matching_photo_issues.clear()
         self.matching_preview_paths.clear()
         self.matching_preview_details.clear()
         self.matching_preview_regions.clear()
@@ -857,6 +894,23 @@ class MainWindow(QMainWindow):
         effective_order = self.matching_column_orders.get(photo_key)
         column_count = self.matching_column_counts.get(photo_key)
         column_depths = self.matching_column_depths.get(photo_key, [])
+        source_item = self.photo_table.item(row, 6)
+        original_record = source_item.data(Qt.ItemDataRole.UserRole + 1) if source_item else None
+        basis = original_record.depth_basis if isinstance(original_record, PhotoRecord) else "unknown"
+        original_values = source_item.data(Qt.ItemDataRole.UserRole) if source_item else None
+        if original_values and (
+            as_float(self.photo_table.item(row, 3).text()) != as_float(original_values[1])
+            or as_float(self.photo_table.item(row, 4).text()) != as_float(original_values[2])
+        ):
+            basis = "unknown"
+        basis_text = f"\nСистема глубин: {self._depth_basis_label(basis)}"
+        photo_issues = list(dict.fromkeys(
+            issue for source in (photo_path, str(Path(photo_path).resolve()), Path(photo_path).name)
+            for issue in self.matching_photo_issues.get(source, [])
+        ))
+        issue_text = "\nПроверка не пройдена: " + " ".join(photo_issues[:2]) if photo_issues else ""
+        if len(photo_issues) > 2:
+            issue_text += f" Ещё ошибок: {len(photo_issues) - 2}; подробности в журнале."
         columns_text = f"Колонок керна найдено: {column_count}" if column_count else "Колонки керна ещё не определены"
         depth_text = f"\nИнтервалы колонок: {'; '.join(column_depths)}" if column_depths else ""
         if requested_order == COLUMN_ORDER_AUTO:
@@ -875,7 +929,7 @@ class MainWindow(QMainWindow):
             visible_details = "\n".join(details[:4])
             suffix = f"\nЕщё интервалов: {len(details) - 4}" if len(details) > 4 else ""
             self.matching_preview_title.setText(
-                f"{columns_text}{depth_text}\n{order_text}\nНайдено интервалов: {len(details)}\n"
+                f"{columns_text}{depth_text}{basis_text}\n{order_text}{issue_text}\nНайдено интервалов: {len(details)}\n"
                 f"{visible_details}{suffix}\nНаведите курсор на маску — появится краткое описание."
             )
             self._set_preview_pixmap(self.matching_preview, preview_path, "Не удалось открыть фото с масками.")
@@ -888,13 +942,15 @@ class MainWindow(QMainWindow):
                     "Маски пока не построены: заполните начало и конец интервала, отметьте OK "
                     "и нажмите «Пересчитать после исправлений»."
                 )
+            elif photo_issues:
+                reason = "Маски не построены." + issue_text
             else:
                 reason = (
-                    f"Для интервала {format_depth(top)}–{format_depth(base)} м совпадающие фации Excel не найдены. "
-                    "Проверьте скважину и интервалы фаций."
+                    f"Маски для интервала {format_depth(top)}–{format_depth(base)} м не построены. "
+                    "Проверьте привязку глубин, геометрию колонок и фации Excel; подробности в журнале."
                 )
             self.matching_preview_title.setText(
-                f"{columns_text}{depth_text}\n{order_text}\n{reason}\n"
+                f"{columns_text}{depth_text}{basis_text}\n{order_text}\n{reason}\n"
                 "Бирюзовый контур показывает найденную колонку керна."
             )
             self._set_preview_pixmap(self.matching_preview, photo_path, "Не удалось открыть исходную фотографию.")

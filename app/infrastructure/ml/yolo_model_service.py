@@ -32,6 +32,16 @@ class YoloModelService:
         from ultralytics import YOLO
 
         self.model = YOLO(str(model_path))
+        self._description_generator = None
+        self._description_facies: set[str] = set()
+        checkpoint = getattr(self.model, "ckpt", None)
+        embedded = checkpoint.get("core_description_checkpoint") if isinstance(checkpoint, dict) else None
+        standalone = Path(model_path).with_name("description_best.pt")
+        if embedded is not None or standalone.is_file():
+            from excel_photo_model_studio.description_model import DescriptionGenerator
+
+            self._description_generator = DescriptionGenerator(embedded if embedded is not None else standalone)
+            self._description_facies = set(self._description_generator.checkpoint.get("facies_names", []))
         self.device, self.device_label = self._best_device()
         self._facies_catalog = self._load_facies_catalog(model_path)
         self.fallback_facies_label = UNRECOGNIZED_FACIES
@@ -131,7 +141,53 @@ class YoloModelService:
             detections,
         )
         detections.extend(interval_detections)
-        return complete_core_column_coverage(detections, coverage_columns, self.fallback_facies_label)
+        completed = complete_core_column_coverage(detections, coverage_columns, self.fallback_facies_label)
+        self._attach_generated_descriptions(image_path, target_size, coverage_columns, completed)
+        return completed
+
+    def _attach_generated_descriptions(
+        self,
+        image_path: str,
+        target_size: tuple[int, int] | None,
+        columns: list[dict[str, float]],
+        detections: list[FaciesDetection],
+    ) -> None:
+        """Use the embedded text head only on final, classified physical-core bands."""
+        generator = getattr(self, "_description_generator", None)
+        if generator is None or not columns:
+            return
+        source = cv2.imdecode(np.frombuffer(Path(image_path).read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
+        if source is None or not source.size:
+            raise ValueError(f"Не удалось прочитать керн для краткого описания: {image_path}")
+        source_height, source_width = source.shape[:2]
+        display_width, display_height = target_size or (source_width, source_height)
+        x_scale = source_width / max(1, display_width)
+        y_scale = source_height / max(1, display_height)
+        for detection in detections:
+            if detection.label == UNRECOGNIZED_FACIES or self._is_excluded_label(detection.label):
+                continue
+            # The catalogue may canonicalize Tcr -> Tcr@19. The text head was
+            # trained on the exact dataset class, so retain that original ID.
+            facies = detection.attributes.get("__source_model_class", detection.attributes.get("Класс модели", detection.label))
+            if self._description_facies and facies not in self._description_facies:
+                detection.attributes["Статус описания"] = "нет обученного текстового класса для этой фации"
+                continue
+            polygon = self._clip_polygon_to_rectangles(detection.polygon, columns)
+            if len(polygon) < 3:
+                continue
+            bounds = QPolygonF(polygon).boundingRect()
+            left, right = max(0, int(np.floor(bounds.left() * x_scale))), min(source_width, int(np.ceil(bounds.right() * x_scale)))
+            top, bottom = max(0, int(np.floor(bounds.top() * y_scale))), min(source_height, int(np.ceil(bounds.bottom() * y_scale)))
+            crop = source[top:bottom, left:right]
+            if not crop.size:
+                continue
+            description = generator.generate(crop, facies=facies).strip()
+            if not description:
+                detection.attributes["Статус описания"] = "модель выдала пустой текст, требуется проверка"
+                continue
+            detection.attributes["Краткое описание"] = description
+            detection.attributes["Источник описания"] = "нейросеть best.pt: фото интервала и прогноз фации"
+            detection.attributes["Статус описания"] = "сгенерированный черновик, требуется проверка геолога"
 
     def _predict_structure_intervals(
         self,
@@ -325,6 +381,7 @@ class YoloModelService:
         resolved = resolve_facies_class(label) if "@" in label else resolve_facies_class(label, trained.get("Индекс фации"))
         values = dict(resolved["metadata"]) if resolved else {}
         values["Класс модели"] = resolved["model_label"] if resolved else label
+        values["__source_model_class"] = label
         values["Статус фации"] = "прогноз, требуется проверка" if resolved else "не сопоставлена со справочником"
         values["Источник описания"] = "справочник фаций; гипотеза по прогнозу модели, не наблюдение"
         return values

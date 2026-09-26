@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -200,15 +202,39 @@ def _fallback_component_boxes(candidate: np.ndarray) -> list[tuple[int, int, int
 
 def calibrate_core_columns(
     columns: list[tuple[int, int, int, int]], photo_top: float, photo_base: float,
+    image: np.ndarray | None = None,
+    column_depths: tuple[tuple[float, float, float], ...] = (),
 ) -> list[tuple[tuple[int, int, int, int], float, float]]:
-    """Assign consecutive centimetres to ordered one-metre physical columns."""
+    """Project the photo interval onto ordered columns using the printed ruler when available."""
     if not columns or photo_base <= photo_top:
         return []
     photo_top_cm = meters_to_centimeters(photo_top)
     photo_base_cm = meters_to_centimeters(photo_base)
     total_cm = photo_base_cm - photo_top_cm
-    capacities = _core_column_capacities_cm(columns)
+    explicit = _column_depths_by_box(
+        columns, column_depths, image.shape[1] if image is not None else None,
+    )
+    if len(explicit) == len(columns):
+        return [
+            (box, explicit[index][0], explicit[index][1])
+            for index, box in enumerate(columns)
+        ]
+    if column_depths:
+        # Persisted labels belong to a different/ambiguous geometry. Guessing
+        # an even allocation here would silently turn stale OCR into masks.
+        return []
+    grid_scale = _depth_grid_pixels_per_centimeter(image) if image is not None else None
+    capacities = (
+        _scaled_column_capacities_cm(columns, grid_scale)
+        if grid_scale is not None else _core_column_capacities_cm(columns)
+    )
     capacity_sum = sum(capacities)
+    if grid_scale is not None and abs(total_cm - capacity_sum) > 2:
+        # The printed centimetre ruler is independent evidence of physical
+        # length. Do not squeeze five full 1 m columns into, e.g., a 4.1 m
+        # caption or stretch a 20 cm fragment into a metre. The project must
+        # resolve this contradiction before producing training masks.
+        return []
     cursor_cm = photo_top_cm
     calibrated: list[tuple[tuple[int, int, int, int], float, float]] = []
     if total_cm <= capacity_sum + 2:
@@ -248,21 +274,376 @@ def calibrate_core_columns(
     return calibrated
 
 
-def core_photo_capacity_centimeters(columns: list[tuple[int, int, int, int]]) -> int:
-    return sum(_core_column_capacities_cm(columns))
+def core_photo_capacity_centimeters(
+    columns: list[tuple[int, int, int, int]], image: np.ndarray | None = None,
+    column_depths: tuple[tuple[float, float, float], ...] = (),
+) -> int:
+    explicit = _column_depths_by_box(columns, column_depths, image.shape[1] if image is not None else None)
+    if len(explicit) == len(columns):
+        return sum(max(0, meters_to_centimeters(base) - meters_to_centimeters(top)) for top, base in explicit.values())
+    if column_depths:
+        return 0
+    return sum(_core_column_capacities_cm(columns, image))
 
 
-def _core_column_capacities_cm(columns: list[tuple[int, int, int, int]]) -> list[int]:
+def extract_core_column_depths(
+    image: np.ndarray,
+    columns: list[tuple[int, int, int, int]],
+    *,
+    reference_interval: tuple[float, float] | None = None,
+    expected_intervals: tuple[tuple[float, float], ...] = (),
+    metadata: dict[str, str] | None = None,
+    preferred_basis: str = "unknown",
+) -> tuple[tuple[float, float, float], ...]:
+    """Read the printed upper/lower depths beside each core column.
+
+    Report captions sometimes describe the whole sampled interval while one
+    page shows only a subset. The per-column ruler labels are more precise for
+    masks, especially for short partial columns. OCR is best-effort: if a
+    coherent set of labels cannot be recovered, callers retain the existing
+    page-interval/ruler calibration.
+    """
+    if image is None or image.size == 0 or not columns or image.ndim != 3:
+        return ()
+    try:
+        import pytesseract
+        from pytesseract import Output
+
+        from .photos import _configure_tesseract
+
+        if not _configure_tesseract(pytesseract):
+            return ()
+        height, width = image.shape[:2]
+        top_edge = min(box[1] for box in columns)
+        bottom_edge = max(box[3] for box in columns)
+        header_y0 = max(0, top_edge - max(40, round(height * 0.16)))
+        header_y1 = min(height, top_edge + max(2, round(height * 0.015)))
+        # A short physical fragment can end halfway down the page while its
+        # bottom-depth labels remain in the standard footer below the 0–100 cm
+        # ruler. Search the page footer, not merely a few pixels below the rock.
+        footer_y0 = max(0, min(
+            bottom_edge - max(2, round(height * 0.015)), round(height * 0.70),
+        ))
+        footer_y1 = min(height, max(round(height * 0.98), bottom_edge + round(height * 0.16)))
+        if header_y1 <= header_y0 or footer_y1 <= footer_y0:
+            return ()
+
+        token_rows = []
+        label_tokens = []
+        for y0, y1 in ((header_y0, header_y1), (footer_y0, footer_y1)):
+            region = cv2.cvtColor(image[y0:y1], cv2.COLOR_BGR2GRAY)
+            if region.size == 0:
+                continue
+            scale = min(2.0, max(1.0, 1000.0 / max(1, region.shape[1])))
+            if scale > 1.0:
+                region = cv2.resize(
+                    region, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC,
+                )
+            try:
+                data = pytesseract.image_to_data(
+                    region, lang="rus+eng", config="--psm 11", output_type=Output.DICT,
+                )
+            except Exception:
+                data = pytesseract.image_to_data(
+                    region, lang="eng", config="--psm 11", output_type=Output.DICT,
+                )
+            for index, raw in enumerate(data.get("text", [])):
+                value = _depth_label_value(raw)
+                try:
+                    confidence = float(data["conf"][index])
+                    x = (float(data["left"][index]) + float(data["width"][index]) / 2) / scale
+                    y = y0 + (float(data["top"][index]) + float(data["height"][index]) / 2) / scale
+                except (KeyError, IndexError, TypeError, ValueError):
+                    continue
+                if value is not None and confidence >= 5:
+                    token_rows.append((value, x, y, confidence))
+                elif confidence >= 5 and str(raw).strip():
+                    label_tokens.append((str(raw), x, y))
+        candidate_bases = {}
+        candidate_ranges = _pair_column_depth_rows(
+            token_rows, columns, width, height,
+            label_tokens=label_tokens, candidate_bases=candidate_bases,
+        )
+        if not candidate_ranges:
+            return ()
+
+        valid = []
+        for candidate_index, ranges in enumerate(candidate_ranges):
+            if len(ranges) != len(columns):
+                continue
+            ordered = sorted((top, base) for top, base in ranges.values())
+            # Overlapping column ranges would duplicate centimetres of core.
+            if any(meters_to_centimeters(next_top) < meters_to_centimeters(previous_base)
+                   for (_, previous_base), (next_top, _) in zip(ordered, ordered[1:])):
+                continue
+            spatial = [ranges[index][0] for index in sorted(ranges)]
+            if len(spatial) > 1 and not (
+                all(a < b for a, b in zip(spatial, spatial[1:]))
+                or all(a > b for a, b in zip(spatial, spatial[1:]))
+            ):
+                continue
+            gaps = [abs(next_top - previous_base) for (_, previous_base), (next_top, _) in zip(ordered, ordered[1:])]
+            if gaps and max(gaps) > 0.50:
+                continue
+            page_top, page_base = ordered[0][0], ordered[-1][1]
+            if expected_intervals and not any(
+                page_top >= expected_top - 0.5 and page_base <= expected_base + 0.5
+                and page_base > expected_top and page_top < expected_base
+                for expected_top, expected_base in expected_intervals
+            ):
+                continue
+            reference_error = (
+                abs(page_top - reference_interval[0]) + abs(page_base - reference_interval[1])
+                if reference_interval is not None else 0.0
+            )
+            basis = candidate_bases.get(candidate_index, "unknown")
+            if preferred_basis in {"drilling", "gis"} and basis not in {preferred_basis, "unknown"}:
+                continue
+            # Labelled drilling values are the default for facies-by-drilling.
+            # A caption/reference alone must not silently change coordinates.
+            basis_preference = 0 if basis == "drilling" else (1 if basis == "gis" else 2)
+            valid.append((basis_preference, sum(gaps), reference_error, ranges, basis))
+        if not valid:
+            return ()
+        selected_entry = min(valid, key=lambda item: item[:3])
+        selected = selected_entry[3]
+        if metadata is not None:
+            metadata["depth_basis"] = selected_entry[4]
+        return tuple(
+            (center / width, selected[index][0], selected[index][1])
+            for index, center in sorted(
+                enumerate((box[0] + box[2]) / 2 for box in columns), key=lambda item: item[1],
+            )
+            if index in selected
+        )
+    except Exception:
+        # OCR is an optional enhancement; detection and ruler-only depth
+        # calibration must still work when Tesseract is missing or fails.
+        return ()
+
+
+def _depth_label_value(raw: str) -> float | None:
+    text = str(raw or "").strip().replace(",", ".")
+    text = text.translate(str.maketrans({"O": "0", "o": "0", "I": "1", "l": "1"}))
+    # Values below 1000 m are real depths too. Only parse complete numeric
+    # tokens, so page/figure identifiers cannot supply a numeric substring.
+    match = re.fullmatch(r"[\[\](){}|:;]*\s*(\d{1,5})(?:\.(\d{1,3}))?\s*[mм]?[\[\](){}|:;]*", text)
+    if match is None:
+        compact = text
+        if len(compact) == 6 and compact.isdigit():
+            value = float(f"{compact[:4]}.{compact[4:]}")
+            return value
+        return None
+    value = float(match.group(1) + ("." + match.group(2) if match.group(2) else ""))
+    return value if 0 <= value < 100000 else None
+
+
+def _pair_column_depth_rows(
+    token_rows, columns, width: int, height: int, *, label_tokens=(), candidate_bases=None,
+):
+    centers = [(box[0] + box[2]) / 2 for box in columns]
+    minimum_count = max(1, math.ceil(len(columns) * 0.6))
+    tolerance = max(3.0, height * 0.006)
+    grouped: list[list[tuple[float, float, float, float]]] = []
+    for token in sorted(token_rows, key=lambda item: item[2]):
+        if not grouped or token[2] - float(np.median([item[2] for item in grouped[-1]])) > tolerance:
+            grouped.append([token])
+        else:
+            grouped[-1].append(token)
+
+    header_limit = min(box[1] for box in columns) + height * 0.015
+    footer_limit = max(max(box[3] for box in columns) - height * 0.015, height * 0.70)
+    header_rows = []
+    footer_rows = []
+    for group in grouped:
+        row_center = float(np.median([item[2] for item in group]))
+        assigned: dict[int, tuple[float, float]] = {}
+        for value, x, _y, confidence in group:
+            index = min(range(len(centers)), key=lambda item: abs(x - centers[item]))
+            lane = columns[index][2] - columns[index][0]
+            nearest_gap = min((abs(centers[index] - center) for other, center in enumerate(centers) if other != index), default=lane)
+            if abs(x - centers[index]) > max(lane * 1.25, nearest_gap * 0.48):
+                continue
+            old = assigned.get(index)
+            if old is None or confidence > old[1]:
+                assigned[index] = (value, confidence)
+        vector = {index: item[0] for index, item in assigned.items()}
+        if len(vector) < minimum_count:
+            continue
+        label = " ".join(
+            text for text, x, y in sorted(label_tokens, key=lambda item: item[1])
+            if abs(y - row_center) <= tolerance * 1.5 and x < min(centers)
+        )
+        basis = _depth_row_basis(label)
+        row = (row_center, vector, basis)
+        if row_center <= header_limit:
+            header_rows.append(row)
+        if row_center >= footer_limit:
+            footer_rows.append(row)
+
+    ranges = []
+    for top_index, (_top_y, tops, top_basis) in enumerate(header_rows):
+        for bottom_index, (_bottom_y, bases, bottom_basis) in enumerate(footer_rows):
+            # Report tables print raw and adjusted depths on separate rows.
+            # Never take the roof from one coordinate system and the sole
+            # from the other (the old Cartesian product did exactly that).
+            if top_basis != "unknown" and bottom_basis != "unknown":
+                if top_basis != bottom_basis:
+                    continue
+            elif len(header_rows) != len(footer_rows) or top_index != bottom_index:
+                continue
+            matched = {
+                index: (tops[index], bases[index])
+                for index in tops.keys() & bases.keys()
+                if 1 <= meters_to_centimeters(bases[index]) - meters_to_centimeters(tops[index]) <= 150
+            }
+            if len(matched) >= minimum_count:
+                if candidate_bases is not None:
+                    candidate_bases[len(ranges)] = top_basis if top_basis != "unknown" else bottom_basis
+                ranges.append(matched)
+    return ranges
+
+
+def _depth_row_basis(label: str) -> str:
+    label = str(label).casefold().replace("ё", "е")
+    if re.search(r"увяз|гис|adjust|tied|log depth", label):
+        return "gis"
+    if re.search(r"по\s+керну|бурен|core depth|depth.*core|drill", label):
+        return "drilling"
+    return "unknown"
+
+
+def _column_depths_by_box(columns, column_depths, image_width: int | None):
+    if not column_depths or not columns or not image_width or len(column_depths) != len(columns):
+        return {}
+    result = {}
+    if len({item[0] for item in column_depths}) != len(column_depths):
+        return {}
+    # A one-to-one spatial assignment prevents a single OCR label from being
+    # reused for two neighbouring core boxes after a detector change.
+    ordered_boxes = sorted(enumerate(columns), key=lambda item: (item[1][0] + item[1][2]) / 2)
+    for (index, (left, _top, right, _bottom)), (x_fraction, top, base) in zip(ordered_boxes, sorted(column_depths)):
+        center = (left + right) / 2 / image_width
+        if abs(x_fraction - center) <= max(0.03, (right - left) / image_width):
+            span = meters_to_centimeters(base) - meters_to_centimeters(top)
+            if 1 <= span <= 150:
+                result[index] = (top, base)
+    if len(result) != len(columns):
+        return {}
+    ranges = sorted(result.values())
+    if any(meters_to_centimeters(top) < meters_to_centimeters(previous_base)
+           for (_, previous_base), (top, _) in zip(ranges, ranges[1:])):
+        return {}
+    spatial = [result[index][0] for index, _box in ordered_boxes]
+    if len(spatial) > 1 and not (
+        all(a < b for a, b in zip(spatial, spatial[1:]))
+        or all(a > b for a, b in zip(spatial, spatial[1:]))
+    ):
+        return {}
+    return result
+
+
+def _core_column_capacities_cm(
+    columns: list[tuple[int, int, int, int]], image: np.ndarray | None = None,
+) -> list[int]:
     if not columns:
         return []
     heights = [max(1, bottom - top) for _, top, _, bottom in columns]
+    pixels_per_cm = _depth_grid_pixels_per_centimeter(image) if image is not None else None
+    if pixels_per_cm is not None:
+        measured = _scaled_column_capacities_cm(columns, pixels_per_cm)
+        # The printed 0–100 cm ruler is the only reliable reference when the
+        # page contains one short or partial core column. Without it, normalizing
+        # that lone fragment to itself incorrectly assigns it a full metre.
+        if measured and all(1 <= value <= 100 for value in measured):
+            return measured
     # The upper median keeps a half-height final lane at 50 cm even when a
     # photograph contains only one full and one partial lane.
     reference_height = max(1, sorted(heights)[len(heights) // 2])
     return [max(1, min(100, round(height * 100 / reference_height))) for height in heights]
 
 
-def project_matches(matches: list[Match]) -> tuple[
+def _scaled_column_capacities_cm(columns, pixels_per_cm: float) -> list[int]:
+    return [
+        max(1, min(100, round(max(1, bottom - top) / pixels_per_cm)))
+        for _left, top, _right, bottom in columns
+    ]
+
+
+def _depth_grid_pixels_per_centimeter(image: np.ndarray | None) -> float | None:
+    """Estimate centimetres from the repeated 10 cm horizontal ruler lines."""
+    if image is None or image.size == 0 or image.ndim != 3:
+        return None
+    height, width = image.shape[:2]
+    if height < 100 or width < 100:
+        return None
+    scale = min(1.0, 2200.0 / max(height, width))
+    if scale < 1.0:
+        image = cv2.resize(
+            image, (max(1, round(width * scale)), max(1, round(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+        height, width = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 45, 145)
+    minimum_length = max(40, round(width * 0.12))
+    segments = cv2.HoughLinesP(
+        edges, rho=1, theta=np.pi / 180,
+        threshold=max(20, round(minimum_length * 0.22)),
+        minLineLength=minimum_length,
+        maxLineGap=max(8, round(width * 0.025)),
+    )
+    if segments is None:
+        return None
+    y_positions: list[float] = []
+    for line in segments.reshape(-1, 4):
+        x0, y0, x1, y1 = (float(value) for value in line)
+        if x1 < x0:
+            x0, y0, x1, y1 = x1, y1, x0, y0
+        dx, dy = x1 - x0, y1 - y0
+        length = float(np.hypot(dx, dy))
+        if length < minimum_length or dx <= 0 or abs(dy / dx) > 0.18:
+            continue
+        center_x = width / 2
+        if x0 <= center_x <= x1:
+            y = y0 + (center_x - x0) * dy / dx
+        else:
+            y = (y0 + y1) / 2
+        if height * 0.05 <= y <= height * 0.95:
+            y_positions.append(y)
+    if len(y_positions) < 6:
+        return None
+
+    # Hough returns several segments per printed line. Collapse nearby y
+    # coordinates before measuring the regular depth-grid spacing.
+    y_positions.sort()
+    tolerance = max(3.0, height * 0.004)
+    clusters: list[list[float]] = []
+    for y in y_positions:
+        if not clusters or y - clusters[-1][-1] > tolerance:
+            clusters.append([y])
+        else:
+            clusters[-1].append(y)
+    centers = [float(np.median(cluster)) for cluster in clusters]
+    if len(centers) < 6 or centers[-1] - centers[0] < height * 0.40:
+        return None
+
+    gaps = np.diff(centers)
+    # Main report grids mark each ten centimetres. Exclude duplicate Hough
+    # edges and page-sized gaps before taking the robust repeated spacing.
+    plausible = gaps[(gaps >= height * 0.018) & (gaps <= height * 0.18)]
+    if len(plausible) < 5:
+        return None
+    pixels_per_cm = float(np.median(plausible)) / 10.0 / scale
+    return pixels_per_cm if 1.0 <= pixels_per_cm <= height * 0.15 else None
+
+
+def project_matches(
+    matches: list[Match],
+    *,
+    capacities_by_photo: dict[Path, int] | None = None,
+    depth_ranges_by_photo: dict[Path, list[tuple[tuple[int, int, int, int], float, float]]] | None = None,
+) -> tuple[
     list[Annotation],
     dict[Path, list[tuple[int, int, int, int]]],
     dict[Path, str],
@@ -285,6 +666,10 @@ def project_matches(matches: list[Match]) -> tuple[
         )
         if not columns:
             columns_by_photo[photo_path] = []
+            if capacities_by_photo is not None:
+                capacities_by_photo[photo_path] = 0
+            if depth_ranges_by_photo is not None:
+                depth_ranges_by_photo[photo_path] = []
             requested_order = normalize_column_order(photo_matches[0].photo.column_order)
             orders_by_photo[photo_path] = (
                 requested_order if requested_order != COLUMN_ORDER_AUTO else COLUMN_ORDER_LEFT_TO_RIGHT
@@ -297,9 +682,20 @@ def project_matches(matches: list[Match]) -> tuple[
             columns.reverse()
         columns_by_photo[photo_path] = columns
         orders_by_photo[photo_path] = effective_order
+        if capacities_by_photo is not None:
+            capacities_by_photo[photo_path] = core_photo_capacity_centimeters(
+                columns, image, photo.column_depths,
+            )
         if not photo.has_interval:
+            if depth_ranges_by_photo is not None:
+                depth_ranges_by_photo[photo_path] = []
             continue
-        calibrated = calibrate_core_columns(columns, float(photo.top), float(photo.base))
+        calibrated = calibrate_core_columns(
+            columns, float(photo.top), float(photo.base), image=image,
+            column_depths=photo.column_depths,
+        )
+        if depth_ranges_by_photo is not None:
+            depth_ranges_by_photo[photo_path] = calibrated
         for column_index, (box, column_top, column_base) in enumerate(calibrated):
             left, pixel_top, right, pixel_bottom = box
             for match in photo_matches:
@@ -553,6 +949,7 @@ def _select_core_boxes(
     height, width = candidate.shape
     plausible: list[tuple[int, int, int, int]] = []
     for box in _deduplicate(boxes):
+        box = _trim_column_caption_rows(box, candidate)
         left, top, right, bottom = box
         box_width, box_height = right - left, bottom - top
         if box_width < max(12, int(width * 0.026)) or box_height < max(35, int(height * 0.10)):
@@ -578,6 +975,34 @@ def _select_core_boxes(
             continue
         plausible.append(box)
     return _filter_width_outliers(plausible)
+
+
+def _trim_column_caption_rows(box, candidate):
+    """Trim sparse printed numbers joined to the filled rock by morphology.
+
+    Use unsmoothed occupancy, not the dilated component/projection used for
+    discovery. Even a 1-pixel header gap must not move the depth origin above
+    the physical core. Only trim a short edge region and only when the bulk
+    of the lane is dense, so naturally sparse/fragmented rock is preserved.
+    """
+    left, top, right, bottom = box
+    height, width = candidate.shape
+    region = candidate[max(0, top):min(height, bottom), max(0, left):min(width, right)]
+    if region.size == 0:
+        return box
+    occupancy = region.mean(axis=1)
+    if float(np.median(occupancy)) < 0.65:
+        return box
+    dense = occupancy >= 0.68
+    minimum_run = max(6, min(20, round(len(occupancy) * 0.025)))
+    solid = [(start, end) for start, end in _runs(dense) if end - start >= minimum_run]
+    if not solid:
+        return box
+    first, last = solid[0][0], solid[-1][1]
+    maximum_trim = max(12, min(round(height * 0.05), round(len(occupancy) * 0.15)))
+    new_top = top + first if first <= maximum_trim else top
+    new_bottom = top + last if len(occupancy) - last <= maximum_trim else bottom
+    return left, new_top, right, new_bottom
 
 
 def _filter_width_outliers(boxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:

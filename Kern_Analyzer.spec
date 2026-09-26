@@ -22,6 +22,7 @@ hiddenimports = [
     'PySide6.QtWidgets',
     # run.py imports this only when a BAT invokes the no-dialog pipeline.
     'build_core_tape',
+    'excel_photo_model_studio.description_model',
 ]
 binaries += collect_dynamic_libs('shiboken6')
 hiddenimports += collect_submodules('app')
@@ -49,7 +50,7 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 a = Analysis(
     ['run.py'],
-    pathex=['.'],
+    pathex=['.', 'excel_photo_model_studio/src'],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,

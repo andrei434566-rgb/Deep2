@@ -13,6 +13,8 @@ def meters_to_centimeters(value: Any) -> int:
         decimal_value = Decimal(str(value).strip().replace(",", "."))
     except (InvalidOperation, ValueError, AttributeError) as exc:
         raise ValueError(f"Некорректная глубина: {value}") from exc
+    if not decimal_value.is_finite():
+        raise ValueError(f"Некорректная глубина: {value}")
     return int((decimal_value * CENTIMETERS_PER_METER).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 

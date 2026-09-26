@@ -22,6 +22,75 @@ from excel_photo_model_studio.photos import parse_filename
 
 
 class MatchingTests(unittest.TestCase):
+    def test_explicit_gis_photo_is_not_rewritten_by_drilling_sequence(self):
+        row = DescriptionRow("W-1", 100, 102, "A", "Data", 2, core_top=100, core_base=102)
+        record = PhotoRecord(Path("page.jpg"), "W-1", 99.9, 101.9, "ocr_verified", True, depth_basis="gis")
+
+        with patch("excel_photo_model_studio.matching._photo_core_capacity_cm", return_value=200):
+            resolved = suggest_missing_intervals([record], [row])
+
+        self.assertEqual((99.9, 101.9), (resolved[0].top, resolved[0].base))
+        self.assertEqual("gis", resolved[0].depth_basis)
+
+    def test_trusted_page_ocr_must_agree_with_sequential_position(self):
+        row = DescriptionRow("W-1", 100, 102, "A", "Data", 2, core_top=100, core_base=102)
+        records = [
+            PhotoRecord(Path("page-1.jpg"), "W-1", 101, 102, "ocr_verified", True),
+            PhotoRecord(Path("page-2.jpg"), "W-1"),
+        ]
+
+        with patch("excel_photo_model_studio.matching._photo_core_capacity_cm", return_value=100):
+            resolved = suggest_missing_intervals(records, [row])
+
+        self.assertEqual((101, 102), (resolved[0].top, resolved[0].base))
+        self.assertFalse(resolved[1].mapping_confirmed)
+
+    def test_does_not_mix_shifted_gis_neighbour_with_drilling_facies(self):
+        rows = [
+            DescriptionRow("W-1", 100, 101, "A", "Data", 2, gis_top=99.5, gis_base=100.5),
+            DescriptionRow("W-1", 101, 102, "B", "Data", 3, gis_top=100.5, gis_base=101.5),
+        ]
+        photo = PhotoRecord(Path("core.jpg"), "W-1", 100, 101, "manual", True)
+
+        matches, _ = match_photos([photo], rows)
+
+        self.assertEqual([("A", 100, 101)], [
+            (item.description.label, item.overlap_top, item.overlap_base) for item in matches
+        ])
+
+    def test_explicit_photo_gis_basis_uses_gis_for_every_facies(self):
+        rows = [
+            DescriptionRow("W-1", 100, 101, "A", "Data", 2, gis_top=99.5, gis_base=100.5),
+            DescriptionRow("W-1", 101, 102, "B", "Data", 3, gis_top=100.5, gis_base=101.5),
+        ]
+        photo = PhotoRecord(Path("core.jpg"), "W-1", 100, 101, "manual", True, depth_basis="gis")
+
+        matches, _ = match_photos([photo], rows)
+
+        self.assertEqual([("A", 100, 100.5), ("B", 100.5, 101)], [
+            (item.description.label, item.overlap_top, item.overlap_base) for item in matches
+        ])
+        self.assertTrue(all(item.description.metadata["interval_source"] == "gis" for item in matches))
+
+    def test_unknown_well_cannot_match_two_wells_at_the_same_depth(self):
+        photo = PhotoRecord(Path("core.jpg"), top=100, base=101)
+        rows = [DescriptionRow(well, 100, 101, "A", "Data", i) for i, well in enumerate(("W-1", "W-2"))]
+
+        matches, unresolved = match_photos([photo], rows)
+
+        self.assertEqual([], matches)
+        self.assertEqual([photo], unresolved)
+
+    def test_sequence_cannot_squeeze_a_three_meter_photo_into_three_centimeters(self):
+        row = DescriptionRow("W-1", 100, 103.03, "A", "Data", 2, core_top=100, core_base=103.03)
+        records = [PhotoRecord(Path(f"page-{i}.jpg"), "W-1") for i in range(2)]
+
+        with patch("excel_photo_model_studio.matching._photo_core_capacity_cm", return_value=300):
+            resolved = suggest_missing_intervals(records, [row])
+
+        self.assertTrue(all(not item.mapping_confirmed for item in resolved))
+        self.assertTrue(all(not item.has_interval for item in resolved))
+
     def test_uses_gis_limits_only_when_drilling_does_not_match_that_facies(self):
         row = DescriptionRow(
             well="W-1", top=100.0, base=101.0, gis_top=200.0, gis_base=201.0,
@@ -200,7 +269,7 @@ class MatchingTests(unittest.TestCase):
         )
         self.assertTrue(all(item.mapping_confirmed for item in sequenced))
 
-    def test_partial_ocr_group_gets_page_ranges_not_the_full_well_range(self):
+    def test_partial_ocr_group_suggests_page_ranges_but_cannot_confirm_their_start(self):
         rows = [DescriptionRow(
             well="W-1", top=100.0, base=110.0, label="Sand", sheet="Data", row=2,
             core_top=100.0, core_base=110.0, target_text="Песчаник.",
@@ -213,11 +282,43 @@ class MatchingTests(unittest.TestCase):
         with patch("excel_photo_model_studio.matching._photo_core_capacity_cm", return_value=100):
             sequenced = suggest_missing_intervals(records, rows)
 
-        self.assertTrue(all(item.mapping_confirmed for item in sequenced))
+        self.assertTrue(all(not item.mapping_confirmed for item in sequenced))
         self.assertEqual([(100.0, 101.0), (101.0, 102.0)], [
             (item.top, item.base) for item in sequenced
         ])
         self.assertTrue(all(item.source == "ocr_sequenced" for item in sequenced))
+
+    def test_short_core_fragment_is_not_assigned_a_full_meter_excel_interval(self):
+        rows = [DescriptionRow(
+            well="W-1", top=4144.0, base=4145.0, label="Sand", sheet="Data", row=2,
+            core_top=4144.0, core_base=4145.0,
+        )]
+        photo = PhotoRecord(Path("W-1 photo.jpg"), "W-1", source="not_found")
+
+        with patch("excel_photo_model_studio.matching._photo_core_capacity_cm", return_value=20):
+            resolved = suggest_missing_intervals([photo], rows)
+
+        self.assertEqual(1, len(resolved))
+        self.assertFalse(resolved[0].has_interval)
+        self.assertFalse(resolved[0].mapping_confirmed)
+
+    def test_partial_photos_are_packed_by_measured_capacity_into_excel_core_range(self):
+        rows = [DescriptionRow(
+            well="W-1", top=4144.0, base=4145.0, label="Sand", sheet="Data", row=2,
+            core_top=4144.0, core_base=4145.0,
+        )]
+        photos = [
+            PhotoRecord(Path(f"W-1 page-{index}.jpg"), "W-1", source="not_found")
+            for index in range(2)
+        ]
+
+        with patch("excel_photo_model_studio.matching._photo_core_capacity_cm", return_value=50):
+            resolved = suggest_missing_intervals(photos, rows)
+
+        self.assertEqual([(4144.0, 4144.5), (4144.5, 4145.0)], [
+            (record.top, record.base) for record in resolved
+        ])
+        self.assertTrue(all(record.source == "excel_sequenced" for record in resolved))
 
     def test_dataset_reports_photos_without_masks_as_a_blocker(self):
         self.assertEqual(
@@ -243,7 +344,9 @@ class MatchingTests(unittest.TestCase):
             resolved = suggest_missing_intervals([good, false_pair], rows)
 
         self.assertEqual("67ПО", resolved[0].well)
-        self.assertTrue(resolved[0].mapping_confirmed)
+        # A sampling interval in a caption does not establish that this is
+        # its first page when the folder's measured capacity is incomplete.
+        self.assertFalse(resolved[0].mapping_confirmed)
         self.assertEqual("ocr_sequenced", resolved[0].source)
         self.assertEqual((4104.9, 4109.9), (resolved[0].top, resolved[0].base))
         self.assertFalse(resolved[1].mapping_confirmed)
@@ -259,7 +362,7 @@ class MatchingTests(unittest.TestCase):
             for suffix in ("0003", "0001", "0005")
         ]
 
-        with patch("excel_photo_model_studio.matching._photo_core_capacity_cm", return_value=300):
+        with patch("excel_photo_model_studio.matching._photo_core_capacity_cm", side_effect=lambda path: 3 if path.stem.endswith("0005") else 300):
             sequenced = suggest_missing_intervals(records, rows)
         matches, _ = match_photos(sequenced, rows)
 
@@ -378,12 +481,17 @@ class MatchingTests(unittest.TestCase):
             record = PhotoRecord(
                 Path(directory) / "photo.jpg", "W-1", 100.0, 101.0,
                 "manual", True, COLUMN_ORDER_RIGHT_TO_LEFT,
+                column_depths=((0.25, 100.0, 100.4),), column_ocr_checked=True,
+                depth_basis="gis",
             )
             write_photo_map(path, [record])
 
             loaded = read_photo_map(path)
 
         self.assertEqual(COLUMN_ORDER_RIGHT_TO_LEFT, loaded[0].column_order)
+        self.assertEqual(((0.25, 100.0, 100.4),), loaded[0].column_depths)
+        self.assertTrue(loaded[0].column_ocr_checked)
+        self.assertEqual("gis", loaded[0].depth_basis)
 
     def test_filename_and_overlap_matching(self):
         photo = parse_filename(Path("Р-31 3002,00–3004,96 (1).jpg"))
