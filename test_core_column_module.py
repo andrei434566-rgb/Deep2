@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
+import cv2
 import numpy as np
 from PySide6.QtCore import QPointF
 from PySide6.QtGui import QPolygonF
 
 from app.domain.models import FaciesDetection
 from app.infrastructure.facies_postprocess import UNRECOGNIZED_FACIES, complete_core_column_coverage
-from app.infrastructure.ml.core_column_service import assemble_core_tape, normalize_columns
+from app.infrastructure.ml.core_column_service import CoreColumnRecognizer, assemble_core_tape, normalize_columns
 from app.infrastructure.ml.rule_based_facies import RuleBasedFaciesDetector
 
 
@@ -91,6 +93,76 @@ class CoreColumnModuleTests(unittest.TestCase):
         self.assertEqual(400, intervals[-1].bottom)
         for previous, current in zip(intervals[:-1], intervals[1:]):
             self.assertEqual(previous.bottom, current.top)
+
+    def test_column_detector_finds_narrow_short_half_core(self):
+        image = np.full((1000, 900, 3), 255, dtype=np.uint8)
+        for left in (180, 350, 520):
+            cv2.rectangle(image, (left, 100), (left + 95, 900), (125, 125, 125), -1)
+        # A narrow half-column only covers part of the usual one-metre height.
+        cv2.rectangle(image, (710, 350), (722, 720), (125, 125, 125), -1)
+
+        boxes = RuleBasedFaciesDetector._find_core_columns(image)
+
+        self.assertEqual(4, len(boxes))
+        self.assertTrue(any(left <= 710 and right >= 722 and bottom - top >= 350
+                            for left, top, right, bottom in boxes))
+
+    def test_column_detector_keeps_searching_after_partial_component_result(self):
+        image = np.full((1000, 900, 3), 255, dtype=np.uint8)
+        expected_lefts = (160, 340, 520, 700)
+        for left in expected_lefts:
+            cv2.rectangle(image, (left, 100), (left + 100, 900), (125, 125, 125), -1)
+
+        with patch.object(RuleBasedFaciesDetector, "_core_component_boxes", return_value=[(160, 100, 261, 901)]):
+            boxes = RuleBasedFaciesDetector._find_core_columns(image)
+
+        self.assertEqual(4, len(boxes))
+        self.assertTrue(all(any(abs(left - expected) <= 4 for left, _, _, _ in boxes)
+                            for expected in expected_lefts))
+
+    def test_horizontal_grid_lines_do_not_merge_lanes_or_add_a_fake_column(self):
+        image = np.full((1200, 1000, 3), 255, dtype=np.uint8)
+        expected_lefts = (270, 420, 570, 720)
+        for index, left in enumerate(expected_lefts):
+            cv2.rectangle(image, (left, 150), (left + 92, 1040), (247, 247, 247), -1)
+            for y in range(185 + index * 7, 1020, 73):
+                cv2.line(image, (left, y), (left + 91, y + 12), (185, 185, 185), 2)
+        for y in range(250, 1000, 180):
+            cv2.line(image, (145, y), (900, y), (80, 80, 80), 2)
+
+        boxes = RuleBasedFaciesDetector._find_core_columns(image)
+
+        self.assertEqual(4, len(boxes))
+        self.assertTrue(all(left > 230 for left, _, _, _ in boxes))
+
+    def test_depth_caption_above_core_is_not_included_in_column_start(self):
+        image = np.full((1000, 700, 3), 255, dtype=np.uint8)
+        cv2.putText(image, "4130.00", (275, 195), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (25, 25, 25), 2, cv2.LINE_AA)
+        cv2.rectangle(image, (275, 210), (410, 850), (242, 242, 242), -1)
+        for y in range(235, 830, 47):
+            cv2.line(image, (275, y), (410, y + 9), (160, 160, 160), 2)
+
+        boxes = RuleBasedFaciesDetector._find_core_columns(image)
+
+        self.assertEqual(1, len(boxes))
+        self.assertGreaterEqual(boxes[0][1], 200)
+
+    def test_neural_partial_result_is_completed_by_heuristic_search(self):
+        image = np.full((1000, 900, 3), 255, dtype=np.uint8)
+        model_box = (160, 100, 261, 520)
+        heuristic_boxes = [(160, 100, 261, 901), (340, 100, 441, 901),
+                           (520, 100, 621, 901), (700, 100, 801, 901)]
+        recognizer = CoreColumnRecognizer.__new__(CoreColumnRecognizer)
+        recognizer.model = object()
+        recognizer.model_path = None
+        recognizer.source_label = "test model"
+        with patch.object(recognizer, "_model_boxes", return_value=[model_box]), \
+                patch.object(RuleBasedFaciesDetector, "_find_core_columns", return_value=heuristic_boxes):
+            boxes = recognizer.recognize(image)
+
+        self.assertEqual(4, len(boxes))
+        self.assertEqual("модель + резервный поиск", recognizer.source_label)
+        self.assertGreaterEqual(boxes[0]["bottom"] - boxes[0]["top"], 800)
 
     def test_interval_classification_has_priority_over_whole_photo_mask(self):
         whole = FaciesDetection(

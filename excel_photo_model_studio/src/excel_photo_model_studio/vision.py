@@ -114,12 +114,14 @@ def _projection_core_boxes(candidate: np.ndarray) -> list[tuple[int, int, int, i
     high = float(np.quantile(column_score, 0.95))
     threshold = float(np.clip(background + (high - background) * 0.34, 0.16, 0.46))
     active_columns = column_score >= threshold
-    min_width = max(12, int(width * 0.026))
+    # Core boxes vary substantially in apparent width; a real half-core can be
+    # much narrower than the ordinary four- or five-lane layout.
+    min_width = max(6, int(width * 0.008))
     boxes: list[tuple[int, int, int, int]] = []
     for left, right in _runs(active_columns):
         # A cropped photograph may contain only one core lane occupying much of
         # the frame; page-style reports still produce separate narrow x-runs.
-        if right - left < min_width or right - left > width * 0.72:
+        if right - left < min_width or right - left > width * 0.76:
             continue
         row_score = _smooth(candidate[:, left:right].mean(axis=1).astype(np.float32), 15)
         active_rows = (row_score >= 0.20).astype(np.uint8)
@@ -138,7 +140,7 @@ def _projection_core_boxes(candidate: np.ndarray) -> list[tuple[int, int, int, i
         if not row_runs:
             continue
         top, bottom = max(row_runs, key=lambda run: run[1] - run[0])
-        if bottom - top < max(35, height * 0.10):
+        if bottom - top < max(24, height * 0.045):
             continue
         boxes.append((
             max(0, left - 1), max(0, top - 1),
@@ -164,13 +166,13 @@ def _core_component_boxes(candidate: np.ndarray) -> list[tuple[int, int, int, in
         center_x = left + box_width / 2
         filled_fraction = area / max(1, box_width * box_height)
         if (
-            box_width >= max(12, int(width * 0.026))
-            and box_width <= width * 0.30
-            and box_height >= max(40, int(height * 0.08))
-            and 1.00 <= aspect <= 35.0
-            and filled_fraction >= 0.15
-            and width * 0.06 < center_x < width * 0.94
-            and top < height * 0.75
+            box_width >= max(6, int(width * 0.008))
+            and box_width <= width * 0.76
+            and box_height >= max(20, int(height * 0.035))
+            and 0.45 <= aspect <= 45.0
+            and filled_fraction >= 0.045
+            and width * 0.035 < center_x < width * 0.965
+            and top < height * 0.94
         ):
             boxes.append((left, top, left + box_width, top + box_height))
     return sorted(boxes, key=lambda item: item[0])
@@ -190,11 +192,11 @@ def _fallback_component_boxes(candidate: np.ndarray) -> list[tuple[int, int, int
         left, top, box_width, box_height, area = (int(value) for value in stats[component])
         aspect = box_height / max(box_width, 1)
         if (
-            box_width >= max(12, int(width * 0.026))
-            and box_width <= width * 0.30
-            and box_height >= height * 0.10
-            and 1.0 <= aspect <= 35.0
-            and area >= box_width * box_height * 0.20
+            box_width >= max(6, int(width * 0.008))
+            and box_width <= width * 0.76
+            and box_height >= max(24, height * 0.045)
+            and 0.45 <= aspect <= 45.0
+            and area >= box_width * box_height * 0.055
         ):
             boxes.append((left, top, left + box_width, top + box_height))
     return sorted(boxes, key=lambda item: item[0])
@@ -1008,7 +1010,7 @@ def _select_core_boxes(
         box = _trim_column_caption_rows(box, candidate)
         left, top, right, bottom = box
         box_width, box_height = right - left, bottom - top
-        if box_width < max(12, int(width * 0.026)) or box_height < max(35, int(height * 0.10)):
+        if box_width < max(6, int(width * 0.008)) or box_height < max(24, int(height * 0.045)):
             continue
         center_x = (left + right) / 2.0
         if not width * 0.04 < center_x < width * 0.96:
@@ -1019,7 +1021,8 @@ def _select_core_boxes(
         fill = float(region.mean())
         dense_rows = float((region.mean(axis=1) >= 0.35).mean())
         dense_columns = float((region.mean(axis=0) >= 0.22).mean())
-        if fill < 0.12 or dense_rows < 0.16 or dense_columns < 0.22:
+        aspect = box_height / max(1, box_width)
+        if fill < 0.035 or dense_rows < 0.12 or dense_columns < 0.16 or aspect < 0.42:
             continue
 
         narrow = box_width < width * 0.075
@@ -1027,10 +1030,22 @@ def _select_core_boxes(
         sparse_scale = fill < 0.48 or dense_rows < 0.45 or dense_columns < 0.55
         if narrow and near_page_edge and sparse_scale:
             continue
-        if box_width < width * 0.045 and fill < 0.45:
-            continue
         plausible.append(box)
-    return _filter_width_outliers(plausible)
+    # Do not remove a narrow lane merely because its neighbours are full-width
+    # cores: half-core pieces are legitimate and common in the source set. The
+    # exception is a thin extreme-left lane beside several real columns, which
+    # is the page's depth ruler rather than a core lane.
+    broad = [box for box in plausible if box[2] - box[0] >= max(20, width * 0.04)]
+    if len(broad) >= 2:
+        median_width = float(np.median([box[2] - box[0] for box in broad]))
+        plausible = [
+            box for box in plausible
+            if not (
+                (box[0] + box[2]) / 2 < width * 0.18
+                and box[2] - box[0] < median_width * 0.45
+            )
+        ]
+    return plausible
 
 
 def _trim_column_caption_rows(box, candidate):

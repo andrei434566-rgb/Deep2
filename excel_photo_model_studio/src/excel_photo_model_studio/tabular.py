@@ -392,6 +392,11 @@ def read_many_tables(
     return all_rows, all_mappings, all_issues, files
 
 
+def read_workbook_sheets(path: Path) -> list[tuple[str, list[list[Any]]]]:
+    """Return source cell values for the GUI's highlighted mapping preview."""
+    return _read_sheets(Path(path))
+
+
 def save_mappings(path: Path, mappings: Iterable[ColumnMapping]) -> None:
     payload = {
         (f"{item.source_file}::{item.sheet}" if item.source_file else item.sheet): item.to_dict()

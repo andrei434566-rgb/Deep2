@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import cv2
 import numpy as np
+import excel_photo_model_studio.vision as vision
 
 from excel_photo_model_studio.models import (
     Annotation, COLUMN_ORDER_LEFT_TO_RIGHT, COLUMN_ORDER_RIGHT_TO_LEFT,
@@ -121,6 +122,31 @@ class VisionTests(unittest.TestCase):
         self.assertLess(top, 420)
         self.assertGreater(right, 420)
         self.assertGreater(bottom - top, 250)
+
+    def test_detects_narrow_half_core_lane(self):
+        image = np.full((1000, 900, 3), 255, dtype=np.uint8)
+        for left in (180, 350, 520):
+            cv2.rectangle(image, (left, 100), (left + 95, 900), (125, 125, 125), -1)
+        cv2.rectangle(image, (710, 350), (722, 720), (125, 125, 125), -1)
+
+        boxes = detect_core_columns(image)
+
+        self.assertEqual(4, len(boxes))
+        self.assertTrue(any(left <= 712 and right >= 722 and bottom - top >= 350
+                            for left, top, right, bottom in boxes))
+
+    def test_projection_recovers_columns_when_components_are_partial(self):
+        image = np.full((1000, 900, 3), 255, dtype=np.uint8)
+        expected_lefts = (160, 340, 520, 700)
+        for left in expected_lefts:
+            cv2.rectangle(image, (left, 100), (left + 100, 900), (125, 125, 125), -1)
+
+        with patch.object(vision, "_core_component_boxes", return_value=[(160, 100, 261, 901)]):
+            boxes = detect_core_columns(image)
+
+        self.assertEqual(4, len(boxes))
+        self.assertTrue(all(any(abs(left - expected) <= 4 for left, _, _, _ in boxes)
+                            for expected in expected_lefts))
 
     def test_does_not_treat_a_depth_ruler_as_a_single_core(self):
         image = np.full((900, 700, 3), 255, dtype=np.uint8)

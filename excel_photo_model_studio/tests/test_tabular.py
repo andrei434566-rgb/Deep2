@@ -9,10 +9,27 @@ from pathlib import Path
 from openpyxl import Workbook
 
 from excel_photo_model_studio.depth import meters_to_centimeters
-from excel_photo_model_studio.tabular import as_float, parse_interval, read_table, save_mappings
+from excel_photo_model_studio.tabular import (
+    as_float, parse_interval, read_table, read_workbook_sheets, save_mappings,
+)
 
 
 class TableReaderTests(unittest.TestCase):
+    def test_source_sheet_preview_preserves_excel_cells_for_mapping_highlight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "preview.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "седимент"
+            sheet.append(["Интервал фации", "Краткое описание"])
+            sheet.append(["4105,00–4106,00", "Песчаник"])
+            workbook.save(path)
+            sheets = read_workbook_sheets(path)
+
+        self.assertEqual(["седимент"], [name for name, _rows in sheets])
+        self.assertEqual("Интервал фации", sheets[0][1][0][0])
+        self.assertEqual("Песчаник", sheets[0][1][1][1])
+
     def test_excel_depths_accept_comma_dot_and_grouped_decimal_formats(self):
         expected = 4105.25
         for value in (4105.25, "4105.25", "4105,25", "4.105,25", "4,105.25", "4 105,25"):

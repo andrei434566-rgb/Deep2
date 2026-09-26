@@ -68,46 +68,85 @@ class RuleBasedFaciesDetector:
 
     @staticmethod
     def _find_core_columns(image: np.ndarray) -> list[tuple[int, int, int, int]]:
-        """Detect grey, elongated core objects while rejecting a bright background."""
+        """Fuse independent core-column proposals instead of trusting one detector.
+
+        A single partial result used to short-circuit the remaining strategies.
+        That is especially harmful for a narrow/short half-core, which may be
+        missed by connected components but visible in the vertical projection.
+        """
         height, width = image.shape[:2]
+        candidate = RuleBasedFaciesDetector._core_candidate_mask(image)
+
+        # Always run all three independent strategies. A result from one strategy
+        # is evidence, not proof that the rest of the page has been searched.
+        projections = RuleBasedFaciesDetector._projection_core_boxes(candidate)
+        components = RuleBasedFaciesDetector._core_component_boxes(candidate)
+        fallback = RuleBasedFaciesDetector._fallback_component_boxes(candidate.astype(np.uint8) * 255)
+        boxes = list(projections)
+        for candidate_box in (*components, *fallback):
+            box_width = candidate_box[2] - candidate_box[0]
+            compound = any(
+                min(candidate_box[2], projection[2]) - max(candidate_box[0], projection[0])
+                >= (projection[2] - projection[0]) * 0.70
+                and box_width > (projection[2] - projection[0]) * 1.45
+                for projection in projections
+            )
+            if compound:
+                # Horizontal printed grid lines can connect several physical
+                # columns into one component. Keep the independently projected
+                # lanes instead of adding that all-columns rectangle as a box.
+                continue
+            if not any(RuleBasedFaciesDetector._same_horizontal_lane(candidate_box, item) for item in boxes):
+                boxes.append(candidate_box)
+        boxes = RuleBasedFaciesDetector._merge_same_lane_boxes(boxes)
+        return RuleBasedFaciesDetector._select_core_boxes(boxes, candidate)
+
+    @staticmethod
+    def _core_candidate_mask(image: np.ndarray) -> np.ndarray:
+        """Keep pale rock on scanned pages while suppressing the white page."""
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         saturation = hsv[:, :, 1]
         value = hsv[:, :, 2]
+        pale_page_fraction = float(((saturation < 45) & (value > 235)).mean())
+        if pale_page_fraction >= 0.20:
+            page_level = float(np.quantile(value, 0.90))
+            value_limit = int(np.clip(round(page_level - 3.0), 232, 252))
+            return value < value_limit
+        return (saturation < 95) & (value < 242)
 
-        # In standard core-box photography, rocks are usually much less saturated
-        # than the brown tray. Projection is more reliable than connected components:
-        # black tray edges otherwise connect all columns into one large component.
-        candidate = (saturation < 70) & (value < 235)
-
-        # Prefer compact connected components before the full-height projection.
-        # This is important for short core samples: their column occupies only a
-        # small part of a page and therefore cannot reach the global 48% x-axis
-        # projection threshold.  The deliberately short closing kernel bridges
-        # fractures within a core, but does not bridge the "Верх" title above it.
-        component_boxes = RuleBasedFaciesDetector._core_component_boxes(candidate)
-        if component_boxes:
-            return component_boxes
-
-        column_score = RuleBasedFaciesDetector._smooth(candidate.mean(axis=0).astype(np.float32), 7)
-        active_columns = column_score >= 0.48
-        min_width = max(10, int(width * 0.018))
+    @staticmethod
+    def _projection_core_boxes(candidate: np.ndarray) -> list[tuple[int, int, int, int]]:
+        """Find vertical lanes, allowing a short or narrow half-core."""
+        height, width = candidate.shape
+        vertical_start = max(0, int(height * 0.025))
+        vertical_end = min(height, max(vertical_start + 1, int(height * 0.95)))
+        work = candidate[vertical_start:vertical_end]
+        score = RuleBasedFaciesDetector._smooth(work.mean(axis=0).astype(np.float32), 5)
+        background = float(np.quantile(score, 0.35))
+        high = float(np.quantile(score, 0.95))
+        threshold = float(np.clip(background + (high - background) * 0.32, 0.12, 0.44))
+        min_width = max(6, int(width * 0.008))
         boxes: list[tuple[int, int, int, int]] = []
-        for left, right in RuleBasedFaciesDetector._runs(active_columns):
-            if right - left < min_width or right - left > width * 0.30:
+        for left, right in RuleBasedFaciesDetector._runs(score >= threshold):
+            if right - left < min_width or right - left > width * 0.76:
                 continue
-            row_score = RuleBasedFaciesDetector._smooth(candidate[:, left:right].mean(axis=1).astype(np.float32), 15)
-            row_runs = RuleBasedFaciesDetector._runs(row_score >= 0.24)
+            row_score = RuleBasedFaciesDetector._smooth(
+                candidate[:, left:right].mean(axis=1).astype(np.float32), 9,
+            )
+            active_rows = (row_score >= 0.18).astype(np.uint8)
+            join_gap = max(3, int(height * 0.008))
+            active_rows = cv2.morphologyEx(
+                active_rows.reshape(-1, 1), cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_RECT, (1, join_gap)),
+            ).reshape(-1).astype(bool)
+            row_runs = RuleBasedFaciesDetector._runs(active_rows)
             if not row_runs:
                 continue
             top, bottom = max(row_runs, key=lambda run: run[1] - run[0])
-            if bottom - top < height * 0.25:
+            if bottom - top < max(24, int(height * 0.045)):
                 continue
-            # Preserve a 1-pixel margin so a natural edge is still visible in output.
             boxes.append((max(0, left - 1), max(0, top - 1), min(width, right + 1), min(height, bottom + 1)))
-
-        if boxes:
-            return boxes
-        return RuleBasedFaciesDetector._fallback_component_boxes(candidate.astype(np.uint8) * 255)
+        return boxes
 
     @staticmethod
     def _core_component_boxes(candidate: np.ndarray) -> list[tuple[int, int, int, int]]:
@@ -118,7 +157,7 @@ class RuleBasedFaciesDetector:
         oriented component located in the central working area of the frame.
         """
         height, width = candidate.shape
-        kernel_height = max(9, min(25, round(height * 0.006)))
+        kernel_height = max(5, min(19, round(height * 0.004)))
         connected = cv2.morphologyEx(
             candidate.astype(np.uint8) * 255,
             cv2.MORPH_CLOSE,
@@ -132,15 +171,13 @@ class RuleBasedFaciesDetector:
             center_x = left + box_width / 2
             filled_fraction = area / max(1, box_width * box_height)
             if (
-                box_width >= max(10, int(width * 0.018))
-                and box_width <= width * 0.30
-                and box_height >= max(50, int(height * 0.012))
-                and 0.70 <= aspect <= 35.0
-                and filled_fraction >= 0.15
-                # Core trays are in the central field; arrows and the ruler
-                # lie outside it.  This also rejects footer lettering.
-                and width * 0.18 < center_x < width * 0.82
-                and top < height * 0.75
+                box_width >= max(6, int(width * 0.008))
+                and box_width <= width * 0.76
+                and box_height >= max(20, int(height * 0.035))
+                and 0.45 <= aspect <= 45.0
+                and filled_fraction >= 0.045
+                and width * 0.035 < center_x < width * 0.965
+                and top < height * 0.94
             ):
                 boxes.append((int(left), int(top), int(left + box_width), int(top + box_height)))
         return sorted(boxes, key=lambda item: item[0])
@@ -159,9 +196,91 @@ class RuleBasedFaciesDetector:
         for component in range(1, count):
             left, top, box_width, box_height, area = stats[component]
             aspect = box_height / max(box_width, 1)
-            if box_width >= max(10, int(width * 0.018)) and box_width <= width * 0.30 and box_height >= height * 0.25 and 2.0 <= aspect <= 35.0 and area >= box_width * box_height * 0.20:
+            if (
+                box_width >= max(6, int(width * 0.008))
+                and box_width <= width * 0.76
+                and box_height >= max(24, height * 0.045)
+                and 0.45 <= aspect <= 45.0
+                and area >= box_width * box_height * 0.055
+            ):
                 boxes.append((int(left), int(top), int(left + box_width), int(top + box_height)))
         return sorted(boxes, key=lambda item: item[0])
+
+    @staticmethod
+    def _same_horizontal_lane(first: tuple[int, int, int, int], second: tuple[int, int, int, int]) -> bool:
+        overlap = min(first[2], second[2]) - max(first[0], second[0])
+        min_width = min(first[2] - first[0], second[2] - second[0])
+        if min_width <= 0 or overlap < min_width * 0.55:
+            return False
+        first_center = (first[0] + first[2]) / 2
+        second_center = (second[0] + second[2]) / 2
+        return abs(first_center - second_center) <= max(5, min_width * 0.48)
+
+    @staticmethod
+    def _merge_same_lane_boxes(boxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+        """Fuse different strategies' partial boxes for the same physical lane."""
+        merged: list[tuple[int, int, int, int]] = []
+        for box in sorted(boxes, key=lambda item: ((item[0] + item[2]) / 2, item[1])):
+            match = next((index for index, current in enumerate(merged)
+                          if RuleBasedFaciesDetector._same_horizontal_lane(box, current)), None)
+            if match is None:
+                merged.append(box)
+                continue
+            current = merged[match]
+            merged[match] = (
+                min(current[0], box[0]), min(current[1], box[1]),
+                max(current[2], box[2]), max(current[3], box[3]),
+            )
+        return sorted(merged, key=lambda item: (item[0], item[1]))
+
+    @staticmethod
+    def _select_core_boxes(boxes: list[tuple[int, int, int, int]], candidate: np.ndarray) -> list[tuple[int, int, int, int]]:
+        """Reject rulers/text using shape and occupancy, not a fixed page center."""
+        height, width = candidate.shape
+        selected = []
+        for original in boxes:
+            box = RuleBasedFaciesDetector._trim_column_caption_rows(original, candidate)
+            left, top, right, bottom = box
+            box_width, box_height = right - left, bottom - top
+            if box_width < max(6, int(width * 0.008)) or box_height < max(24, int(height * 0.045)):
+                continue
+            region = candidate[max(0, top):min(height, bottom), max(0, left):min(width, right)]
+            if region.size == 0:
+                continue
+            fill = float(region.mean())
+            dense_rows = float((region.mean(axis=1) >= 0.28).mean())
+            dense_columns = float((region.mean(axis=0) >= 0.18).mean())
+            aspect = box_height / max(1, box_width)
+            if fill < 0.035 or dense_rows < 0.12 or dense_columns < 0.16 or aspect < 0.42:
+                continue
+            # A thin object at the extreme left is likely the depth ruler.
+            center_x = (left + right) / 2
+            if box_width < width * 0.04 and (center_x < width * 0.14 or center_x > width * 0.97):
+                continue
+            selected.append(box)
+        return sorted(selected, key=lambda item: (item[0], item[1]))
+
+    @staticmethod
+    def _trim_column_caption_rows(box: tuple[int, int, int, int], candidate: np.ndarray) -> tuple[int, int, int, int]:
+        """Avoid extending the top/bottom of dense core into nearby depth digits."""
+        left, top, right, bottom = box
+        height, width = candidate.shape
+        region = candidate[max(0, top):min(height, bottom), max(0, left):min(width, right)]
+        if region.size == 0:
+            return box
+        occupancy = region.mean(axis=1)
+        if float(np.median(occupancy)) < 0.62:
+            return box
+        dense = occupancy >= 0.66
+        minimum_run = max(5, min(18, round(len(occupancy) * 0.025)))
+        solid = [(start, end) for start, end in RuleBasedFaciesDetector._runs(dense) if end - start >= minimum_run]
+        if not solid:
+            return box
+        first, last = solid[0][0], solid[-1][1]
+        maximum_trim = max(10, min(round(height * 0.05), round(len(occupancy) * 0.15)))
+        new_top = top + first if first <= maximum_trim else top
+        new_bottom = top + last if len(occupancy) - last <= maximum_trim else bottom
+        return left, new_top, right, new_bottom
 
     @staticmethod
     def _merge_nearby_boxes(boxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:

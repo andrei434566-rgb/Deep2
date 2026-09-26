@@ -88,6 +88,48 @@ def normalize_columns(
     return sorted(boxes, key=lambda item: (item["left"], item["top"]))
 
 
+def _merge_column_candidates(
+    columns: Iterable[dict[str, float] | tuple[int, int, int, int]],
+    image_size: tuple[int, int],
+) -> list[dict[str, float]]:
+    """Fuse overlapping detector proposals that refer to the same x-lane.
+
+    The neural detector and image heuristics often return different portions of
+    the same half/fragment. Plain IoU suppression incorrectly keeps both boxes
+    (or drops one); lane-based fusion takes their envelope before deduplication.
+    """
+    width, height = image_size
+    normalized = normalize_columns(columns, image_size)
+    merged: list[dict[str, float]] = []
+    for box in normalized:
+        box_width = box["right"] - box["left"]
+        box_center = (box["left"] + box["right"]) / 2
+        match_index = None
+        for index, current in enumerate(merged):
+            current_width = current["right"] - current["left"]
+            overlap = min(box["right"], current["right"]) - max(box["left"], current["left"])
+            smaller_width = min(box_width, current_width)
+            current_center = (current["left"] + current["right"]) / 2
+            if (
+                smaller_width > 0
+                and overlap >= smaller_width * 0.55
+                and abs(box_center - current_center) <= max(5.0, smaller_width * 0.48)
+            ):
+                match_index = index
+                break
+        if match_index is None:
+            merged.append(dict(box))
+            continue
+        current = merged[match_index]
+        current.update({
+            "left": max(0.0, min(current["left"], box["left"])),
+            "top": max(0.0, min(current["top"], box["top"])),
+            "right": min(float(width), max(current["right"], box["right"])),
+            "bottom": min(float(height), max(current["bottom"], box["bottom"])),
+        })
+    return normalize_columns(merged, image_size)
+
+
 def assemble_core_tape(
     image: np.ndarray,
     columns: Iterable[dict[str, float] | tuple[int, int, int, int]],
@@ -131,7 +173,7 @@ def assemble_core_tape(
 class CoreColumnRecognizer:
     """Recognize physical core columns independently of facies inference."""
 
-    def __init__(self, model_path: str | Path | None = None, confidence: float = 0.35, image_size: int = 640):
+    def __init__(self, model_path: str | Path | None = None, confidence: float = 0.25, image_size: int = 768):
         selected_model = Path(model_path) if model_path else self.default_model_path()
         self.model_path = selected_model.expanduser().resolve() if selected_model else None
         self.confidence = max(0.01, min(0.99, float(confidence)))
@@ -168,9 +210,14 @@ class CoreColumnRecognizer:
         if image is None or image.size == 0:
             raise ValueError("Пустое изображение.")
         source_height, source_width = image.shape[:2]
-        boxes = self._model_boxes(image) if self.model is not None else []
-        if not boxes:
-            boxes = RuleBasedFaciesDetector._find_core_columns(image)
+        model_boxes = self._model_boxes(image) if self.model is not None else []
+        heuristic_boxes = RuleBasedFaciesDetector._find_core_columns(image)
+        boxes = _merge_column_candidates((*model_boxes, *heuristic_boxes), (source_width, source_height))
+        if model_boxes and heuristic_boxes:
+            self.source_label = f"{self.model_path.name if self.model_path else 'модель'} + резервный поиск"
+        elif model_boxes:
+            self.source_label = f"модель {self.model_path.name if self.model_path else ''}".strip()
+        else:
             self.source_label = "детерминированный детектор"
         normalized = normalize_columns(boxes, (source_width, source_height))
         if target_size is None:
@@ -210,10 +257,10 @@ class CoreColumnRecognizer:
                 left, top, right, bottom = box.xyxy[0].tolist()
                 box_width, box_height = right - left, bottom - top
                 if (
-                    box_width >= max(8, width * 0.01)
-                    and box_width <= width * 0.45
-                    and box_height >= max(20, height * 0.01)
-                    and box_height / max(1.0, box_width) >= 0.55
+                    box_width >= max(5, width * 0.006)
+                    and box_width <= width * 0.76
+                    and box_height >= max(16, height * 0.008)
+                    and box_height / max(1.0, box_width) >= 0.38
                 ):
                     boxes.append((round(left), round(top), round(right), round(bottom)))
         return boxes
