@@ -623,6 +623,11 @@ class MainWindow(QMainWindow):
             interval_edited = original is not None and current != tuple(original)
             if interval_edited:
                 source = "manual"
+            retry_column_ocr = interval_edited or (
+                source == "manual" and confirmed
+                and isinstance(original_record, PhotoRecord)
+                and not original_record.column_depths
+            )
             records.append(PhotoRecord(
                 path=path, well=well, top=top, base=base,
                 source=source or "manual",
@@ -633,7 +638,9 @@ class MainWindow(QMainWindow):
                     if isinstance(original_record, PhotoRecord) and not interval_edited else ()
                 ),
                 column_ocr_checked=(
-                    original_record.column_ocr_checked if isinstance(original_record, PhotoRecord) else False
+                    False if retry_column_ocr else (
+                        original_record.column_ocr_checked if isinstance(original_record, PhotoRecord) else False
+                    )
                 ),
                 depth_basis=(
                     original_record.depth_basis

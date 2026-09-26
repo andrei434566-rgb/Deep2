@@ -8,10 +8,25 @@ from pathlib import Path
 
 from openpyxl import Workbook
 
-from excel_photo_model_studio.tabular import read_table, save_mappings
+from excel_photo_model_studio.depth import meters_to_centimeters
+from excel_photo_model_studio.tabular import as_float, parse_interval, read_table, save_mappings
 
 
 class TableReaderTests(unittest.TestCase):
+    def test_excel_depths_accept_comma_dot_and_grouped_decimal_formats(self):
+        expected = 4105.25
+        for value in (4105.25, "4105.25", "4105,25", "4.105,25", "4,105.25", "4 105,25"):
+            with self.subTest(value=value):
+                self.assertEqual(expected, as_float(value))
+                self.assertEqual(410525, meters_to_centimeters(value))
+        self.assertEqual(0.96, as_float(".96"))
+        self.assertEqual(0.96, as_float(",96"))
+
+    def test_interval_parser_does_not_split_decimal_comma_or_dot(self):
+        for value in ("4105.00-4108.65", "4105,00–4108,65", "4.105,00-4.108,65"):
+            with self.subTest(value=value):
+                self.assertEqual((4105.0, 4108.65), parse_interval(value))
+
     def test_missing_drilling_cells_do_not_drop_valid_gis_facies(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "missing_drilling.csv"

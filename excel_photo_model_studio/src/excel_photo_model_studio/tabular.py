@@ -9,7 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable
 
-from .depth import format_depth, meters_to_centimeters, normalize_depth
+from .depth import decimal_tokens, format_depth, meters_to_centimeters, normalize_depth, parse_decimal_value
 from .models import ColumnMapping, DescriptionRow, Issue
 
 
@@ -51,17 +51,16 @@ def well_key(value: str) -> str:
 def as_float(value: Any) -> float | None:
     if value is None or str(value).strip() == "":
         return None
-    if isinstance(value, (int, float)):
-        return float(value) if math.isfinite(value) else None
-    text = re.sub(r"[\s\u00a0\u202f]+", "", str(value))
-    match = re.search(r"-?\d+(?:[.,]\d+)?", text)
-    parsed = float(match.group().replace(",", ".")) if match else None
-    return parsed if parsed is not None and math.isfinite(parsed) else None
+    decimal_value = parse_decimal_value(value)
+    if decimal_value is None:
+        return None
+    parsed = float(decimal_value)
+    return parsed if math.isfinite(parsed) else None
 
 
 def parse_interval(value: Any) -> tuple[float | None, float | None]:
     text = display_text(value).replace("−", "-").replace("–", "-").replace("—", "-")
-    values = re.findall(r"\d+(?:[.,]\d+)?", text)
+    values = decimal_tokens(text)
     if len(values) < 2:
         return None, None
     return as_float(values[0]), as_float(values[1])

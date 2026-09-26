@@ -261,6 +261,8 @@ class VisionTests(unittest.TestCase):
 
     def test_depth_label_parser_handles_decimal_comma_and_ocr_zeros(self):
         self.assertAlmostEqual(4114.65, _depth_label_value("4I14,65"))
+        self.assertAlmostEqual(4114.65, _depth_label_value("4114.65"))
+        self.assertAlmostEqual(4114.65, _depth_label_value("4.114,65"))
 
     def test_depth_label_parser_accepts_shallow_and_deep_wells(self):
         for text, depth in (("12,03", 12.03), ("100.01", 100.01), ("0.20", 0.2), ("12345.67", 12345.67)):
@@ -275,15 +277,18 @@ class VisionTests(unittest.TestCase):
             columns, ((0.32, 100.0, 101.0), (0.32, 101.0, 102.0)), 500,
         ))
 
-    def test_stale_or_overlapping_column_labels_cannot_fall_back_to_guessed_masks(self):
+    def test_partial_column_labels_can_fall_back_only_when_they_match_measured_lane_depths(self):
         columns = [(100, 100, 160, 900), (260, 100, 320, 900)]
         image = np.full((1000, 500, 3), 255, dtype=np.uint8)
-        for labels in (
-            ((0.26, 100.0, 101.0),),
-            ((0.26, 100.0, 101.0), (0.58, 100.5, 101.5)),
-        ):
-            self.assertEqual([], calibrate_core_columns(columns, 100.0, 102.0, image, labels))
-            self.assertEqual(0, core_photo_capacity_centimeters(columns, image, labels))
+        partial_labels = ((0.26, 100.0, 101.0),)
+        calibrated = calibrate_core_columns(columns, 100.0, 102.0, image, partial_labels)
+        self.assertEqual([(100.0, 101.0), (101.0, 102.0)], [item[1:] for item in calibrated])
+        self.assertEqual(200, core_photo_capacity_centimeters(columns, image, partial_labels))
+
+        overlapping_labels = (
+            (0.26, 100.0, 101.0), (0.58, 100.5, 101.5),
+        )
+        self.assertEqual([], calibrate_core_columns(columns, 100.0, 102.0, image, overlapping_labels))
 
     def test_source_identity_distinguishes_same_workbook_name_in_different_wells(self):
         first = DescriptionRow("W", 100, 101, "Sand", "Data", 2, source_file="well_a/description.xlsx")

@@ -46,7 +46,17 @@ def match_photos(records: list[PhotoRecord], rows: list[DescriptionRow]) -> tupl
             ))
         photo_matches = by_basis[basis]
         if photo_matches:
-            matches.extend(photo_matches)
+            # Keep the selected coordinate system with the photo. Otherwise a
+            # later project refresh reverts to "unknown" and can project the
+            # same masks against a different (shifted) facies interval system.
+            selected_photo = (
+                replace(photo, depth_basis=basis)
+                if photo.depth_basis == "unknown" else photo
+            )
+            matches.extend(
+                item if item.photo is selected_photo else replace(item, photo=selected_photo)
+                for item in photo_matches
+            )
         else:
             unresolved.append(photo)
     return matches, unresolved

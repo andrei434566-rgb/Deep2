@@ -93,12 +93,22 @@ def refresh_project(project_dir: Path) -> dict:
         }))
         photo_records = enrich_core_column_depths(photo_records, core_intervals)
     photos = suggest_missing_intervals(photo_records, rows)
-    # This also migrates projects made by 0.3.3, where every OCR page could
-    # incorrectly contain the same full core-sampling interval.
-    write_photo_map(project_dir / "photo_map.csv", photos)
     old_approvals = _existing_approvals(project_dir / "annotations.csv")
     confirmed = [photo for photo in photos if photo.mapping_confirmed]
     matches, unresolved_confirmed = match_photos(confirmed, rows)
+    # Persist an automatically selected drilling/GIS coordinate system. The
+    # choice is made by the interval with coherent Excel facies coverage and
+    # must survive subsequent refreshes and dataset builds.
+    selected_photos = {
+        match.photo.path: match.photo for match in matches
+        if match.photo.depth_basis != "unknown"
+    }
+    if selected_photos:
+        photos = [selected_photos.get(photo.path, photo) for photo in photos]
+        confirmed = [photo for photo in photos if photo.mapping_confirmed]
+    # This also migrates projects made by 0.3.3, where every OCR page could
+    # incorrectly contain the same full core-sampling interval.
+    write_photo_map(project_dir / "photo_map.csv", photos)
     unconfirmed = [photo for photo in photos if not photo.mapping_confirmed]
     capacity_by_path: dict[Path, int] = {}
     depth_ranges_by_path: dict[Path, list[tuple[tuple[int, int, int, int], float, float]]] = {}

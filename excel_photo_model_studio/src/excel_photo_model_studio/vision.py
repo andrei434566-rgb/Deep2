@@ -10,7 +10,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .depth import centimeters_to_meters, meters_to_centimeters
+from .depth import centimeters_to_meters, meters_to_centimeters, parse_decimal_value
 from .models import (
     Annotation, COLUMN_ORDER_AUTO, COLUMN_ORDER_LEFT_TO_RIGHT,
     COLUMN_ORDER_RIGHT_TO_LEFT, Match, normalize_column_order,
@@ -219,16 +219,40 @@ def calibrate_core_columns(
             (box, explicit[index][0], explicit[index][1])
             for index, box in enumerate(columns)
         ]
-    if column_depths:
-        # Persisted labels belong to a different/ambiguous geometry. Guessing
-        # an even allocation here would silently turn stale OCR into masks.
-        return []
     grid_scale = _depth_grid_pixels_per_centimeter(image) if image is not None else None
     capacities = (
         _scaled_column_capacities_cm(columns, grid_scale)
         if grid_scale is not None else _core_column_capacities_cm(columns)
     )
     capacity_sum = sum(capacities)
+    if column_depths:
+        # A partial/stale OCR map must not block mask creation forever. Fall
+        # back only when independently measured capacity agrees with the
+        # photo interval and every label that did parse agrees with its exact
+        # physical lane. Conflicting OCR remains a hard blocker.
+        if abs(total_cm - capacity_sum) > 2:
+            return []
+        cursor_cm = photo_top_cm
+        calibrated = []
+        for index, (box, capacity_cm) in enumerate(zip(columns, capacities)):
+            column_base_cm = (
+                photo_base_cm if index == len(columns) - 1 else cursor_cm + capacity_cm
+            )
+            calibrated.append((
+                box, centimeters_to_meters(cursor_cm), centimeters_to_meters(column_base_cm),
+            ))
+            cursor_cm = column_base_cm
+        partial = _partial_column_depths_by_box(
+            columns, column_depths, image.shape[1] if image is not None else None,
+        )
+        if not partial or any(
+            abs(meters_to_centimeters(partial[index][0]) - meters_to_centimeters(top)) > 2
+            or abs(meters_to_centimeters(partial[index][1]) - meters_to_centimeters(base)) > 2
+            for index, (_box, top, base) in enumerate(calibrated)
+            if index in partial
+        ):
+            return []
+        return calibrated
     if grid_scale is not None and abs(total_cm - capacity_sum) > 2:
         # The printed centimetre ruler is independent evidence of physical
         # length. Do not squeeze five full 1 m columns into, e.g., a 4.1 m
@@ -281,8 +305,6 @@ def core_photo_capacity_centimeters(
     explicit = _column_depths_by_box(columns, column_depths, image.shape[1] if image is not None else None)
     if len(explicit) == len(columns):
         return sum(max(0, meters_to_centimeters(base) - meters_to_centimeters(top)) for top, base in explicit.values())
-    if column_depths:
-        return 0
     return sum(_core_column_capacities_cm(columns, image))
 
 
@@ -402,7 +424,10 @@ def extract_core_column_depths(
             # Labelled drilling values are the default for facies-by-drilling.
             # A caption/reference alone must not silently change coordinates.
             basis_preference = 0 if basis == "drilling" else (1 if basis == "gis" else 2)
-            valid.append((basis_preference, sum(gaps), reference_error, ranges, basis))
+            # When the user has entered a page interval, its nearest complete
+            # set of physical labels is the best evidence of the coordinate
+            # system. Use the drilling-first preference only to break ties.
+            valid.append((reference_error, basis_preference, sum(gaps), ranges, basis))
         if not valid:
             return ()
         selected_entry = min(valid, key=lambda item: item[:3])
@@ -423,19 +448,22 @@ def extract_core_column_depths(
 
 
 def _depth_label_value(raw: str) -> float | None:
-    text = str(raw or "").strip().replace(",", ".")
+    text = str(raw or "").strip()
     text = text.translate(str.maketrans({"O": "0", "o": "0", "I": "1", "l": "1"}))
-    # Values below 1000 m are real depths too. Only parse complete numeric
-    # tokens, so page/figure identifiers cannot supply a numeric substring.
-    match = re.fullmatch(r"[\[\](){}|:;]*\s*(\d{1,5})(?:\.(\d{1,3}))?\s*[mм]?[\[\](){}|:;]*", text)
-    if match is None:
-        compact = text
-        if len(compact) == 6 and compact.isdigit():
-            value = float(f"{compact[:4]}.{compact[4:]}")
-            return value
-        return None
-    value = float(match.group(1) + ("." + match.group(2) if match.group(2) else ""))
-    return value if 0 <= value < 100000 else None
+    # Values below 1000 m are real depths too. Only accept a complete token;
+    # parse_decimal_value handles Excel/OCR comma and dot decimal marks alike.
+    token = text.strip("[](){}|:;").strip()
+    token = re.sub(r"\s*[mм]\s*$", "", token, flags=re.IGNORECASE).strip()
+    value = parse_decimal_value(token) if re.fullmatch(
+        r"(?:\d[\d.,\s\u00a0\u202f'’]*|[.,]\d+)", token,
+    ) else None
+    if value is not None and 0 <= value < 100000:
+        return float(value)
+    compact = re.sub(r"\D", "", token)
+    if len(compact) == 6 and compact.isdigit():
+        value = float(f"{compact[:4]}.{compact[4:]}")
+        return value if value < 100000 else None
+    return None
 
 
 def _pair_column_depth_rows(
@@ -540,6 +568,34 @@ def _column_depths_by_box(columns, column_depths, image_width: int | None):
         or all(a > b for a, b in zip(spatial, spatial[1:]))
     ):
         return {}
+    return result
+
+
+def _partial_column_depths_by_box(columns, column_depths, image_width: int | None):
+    """Map any coherent subset of OCR depth labels to unique physical lanes."""
+    if not column_depths or not columns or not image_width:
+        return {}
+    ordered_boxes = sorted(enumerate(columns), key=lambda item: (item[1][0] + item[1][2]) / 2)
+    result = {}
+    for x_fraction, top, base in column_depths:
+        if not 1 <= meters_to_centimeters(base) - meters_to_centimeters(top) <= 150:
+            return {}
+        center_x = float(x_fraction) * image_width
+        index, box = min(
+            ordered_boxes,
+            key=lambda item: abs(center_x - (item[1][0] + item[1][2]) / 2),
+        )
+        left, _top, right, _bottom = box
+        lane = right - left
+        nearest_gap = min((
+            abs((left + right) / 2 - (other[0] + other[2]) / 2)
+            for other_index, other in ordered_boxes if other_index != index
+        ), default=lane)
+        if abs(center_x - (left + right) / 2) > max(lane * 1.25, nearest_gap * 0.48):
+            return {}
+        if index in result:
+            return {}
+        result[index] = (top, base)
     return result
 
 

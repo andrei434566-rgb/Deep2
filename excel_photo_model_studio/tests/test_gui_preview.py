@@ -103,6 +103,7 @@ class GuiPreviewTests(unittest.TestCase):
             edited = read_photo_map(project / "photo_map.csv")[0]
             self.assertEqual("unknown", edited.depth_basis)
             self.assertEqual((), edited.column_depths)
+            self.assertFalse(edited.column_ocr_checked)
             self.assertEqual("manual", edited.source)
             self.assertIn("Система глубин: не определена", window.matching_preview_title.text())
             window.close()

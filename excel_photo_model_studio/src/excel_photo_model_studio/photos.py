@@ -20,7 +20,8 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 def parse_filename(path: Path) -> PhotoRecord:
     """Parse names such as `Р-31 3002,00–3004,96 (1).jpg`."""
     stem = path.stem.replace("−", "-").replace("–", "-").replace("—", "-")
-    matches = list(re.finditer(r"(?P<top>\d{2,6}(?:[.,]\d{1,4})?)\s*-\s*(?P<base>\d{2,6}(?:[.,]\d{1,4})?)", stem))
+    number = r"\d{2,6}(?:[.,]\d{1,4}){0,2}"
+    matches = list(re.finditer(rf"(?P<top>{number})\s*-\s*(?P<base>{number})", stem))
     for match in reversed(matches):
         if _is_figure_number(stem, match.start()):
             continue
@@ -73,9 +74,6 @@ def enrich_core_column_depths(
     output = []
     for record in records:
         if record.column_depths or record.column_ocr_checked or not record.path.is_file():
-            output.append(record)
-            continue
-        if record.source == "manual" and record.mapping_confirmed:
             output.append(record)
             continue
         try:

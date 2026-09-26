@@ -3,10 +3,14 @@ from __future__ import annotations
 import unittest
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
 
 from excel_photo_model_studio.photos import (
-    discover_photos, extract_depth_interval, extract_well, parse_filename,
+    discover_photos, enrich_core_column_depths, extract_depth_interval, extract_well, parse_filename,
 )
+from excel_photo_model_studio.models import PhotoRecord
 
 
 class PhotoOcrParsingTests(unittest.TestCase):
@@ -78,6 +82,33 @@ class PhotoOcrParsingTests(unittest.TestCase):
         ))
 
         self.assertEqual((4104.9, 4105.9), (record.top, record.base))
+
+    def test_manual_photo_retries_column_ocr_and_uses_complete_physical_depth_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "core.jpg"
+            path.write_bytes(b"image")
+            record = PhotoRecord(
+                path, "W-1", 4105.0, 4109.84, "manual", True,
+                column_ocr_checked=False,
+            )
+            image = np.zeros((100, 100, 3), dtype=np.uint8)
+
+            def extract(_image, _columns, *, metadata, **_kwargs):
+                metadata["depth_basis"] = "gis"
+                return ((0.5, 4104.9, 4109.84),)
+
+            with (
+                patch("excel_photo_model_studio.photos._configure_tesseract", return_value=True),
+                patch("cv2.imdecode", return_value=image),
+                patch("excel_photo_model_studio.vision.detect_core_columns", return_value=[(40, 10, 60, 90)]),
+                patch("excel_photo_model_studio.vision.extract_core_column_depths", side_effect=extract),
+            ):
+                resolved = enrich_core_column_depths([record], ((4104.9, 4116.9),))[0]
+
+        self.assertEqual((4104.9, 4109.84), (resolved.top, resolved.base))
+        self.assertEqual("gis", resolved.depth_basis)
+        self.assertTrue(resolved.column_ocr_checked)
+        self.assertEqual(((0.5, 4104.9, 4109.84),), resolved.column_depths)
 
     def test_rejects_numbers_from_ruler_and_figure_caption_as_depth_pair(self):
         self.assertIsNone(extract_depth_interval(

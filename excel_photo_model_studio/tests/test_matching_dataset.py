@@ -72,6 +72,19 @@ class MatchingTests(unittest.TestCase):
         ])
         self.assertTrue(all(item.description.metadata["interval_source"] == "gis" for item in matches))
 
+    def test_inferred_photo_coordinate_basis_is_attached_to_match(self):
+        row = DescriptionRow(
+            well="W-1", top=100.0, base=101.0, gis_top=200.0, gis_base=201.0,
+            thickness=1.0, label="Sand", sheet="Data", row=2,
+        )
+        photo = PhotoRecord(Path("core.jpg"), "W-1", 200.0, 201.0, "manual", True)
+
+        matches, unresolved = match_photos([photo], [row])
+
+        self.assertEqual([], unresolved)
+        self.assertEqual(1, len(matches))
+        self.assertEqual("gis", matches[0].photo.depth_basis)
+
     def test_unknown_well_cannot_match_two_wells_at_the_same_depth(self):
         photo = PhotoRecord(Path("core.jpg"), top=100, base=101)
         rows = [DescriptionRow(well, 100, 101, "A", "Data", i) for i, well in enumerate(("W-1", "W-2"))]

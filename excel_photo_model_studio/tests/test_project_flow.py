@@ -12,6 +12,7 @@ import numpy as np
 from openpyxl import Workbook
 
 from excel_photo_model_studio.dataset import build_dataset
+from excel_photo_model_studio.matching import read_photo_map
 from excel_photo_model_studio.models import DescriptionRow, Match, PhotoRecord
 from excel_photo_model_studio.project import (
     _write_facies_inventory, create_project, load_annotations,
@@ -114,6 +115,8 @@ class ProjectFlowTests(unittest.TestCase):
                 (photos / f"{well} 100-101.jpg").write_bytes(encoded.tobytes())
 
             report = create_project(excel, photos, root / "project")
+            photo_map = read_photo_map(root / "project" / "photo_map.csv")
+            self.assertTrue(all(photo.depth_basis == "drilling" for photo in photo_map))
             self.assertTrue((root / "project" / "table_cache.json").is_file())
             self.assertTrue((root / "project" / "photo_inventory.csv").is_file())
             self.assertTrue((root / "project" / "facies_inventory.csv").is_file())
