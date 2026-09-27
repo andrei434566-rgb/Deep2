@@ -92,7 +92,7 @@ def train_bundle(
     dataset_dir = Path(dataset_dir).expanduser().resolve(strict=True)
     manifest = json.loads((dataset_dir / "dataset_manifest.json").read_text(encoding="utf-8"))
     if manifest.get("train_caption_count", 0) < 5 or manifest.get("val_caption_count", 0) < 1:
-        raise ValueError("Недостаточно целей из столбца 22 для обучения полного комплекта модели.")
+        raise ValueError("Недостаточно строк с кратким описанием для обучения полного комплекта модели.")
     visual = train_model(
         dataset_dir, output_dir, architecture=architecture, epochs=epochs,
         patience=patience, image_size=image_size, device=device,
@@ -103,7 +103,7 @@ def train_bundle(
     )
     facies_reference = _facies_reference(dataset_dir)
     contract = {
-        "schema": "kern-unified-model-bundle-v2",
+        "schema": "kern-unified-model-bundle-v4",
         "status": "candidate_requires_geologist_review",
         "initialization": "random_weights",
         "pretrained": False,
@@ -112,19 +112,22 @@ def train_bundle(
         "description_embedded_in_best_pt": True,
         "description_checkpoint_key": "core_description_checkpoint",
         "standalone_description_model": "description_best.pt",
-        "target_column": 22,
-        "target_header": "Краткое описание",
-        "facies_interval_columns": [13, 14],
-        "core_interval_columns": [4, 5],
-        "facies_name_column": 19,
-        "association_column": 20,
-        "environment_column": 21,
+        "target_fields": ["facies_index", "facies_name", "target_text"],
+        "target_headers": {
+            "facies_index": "Индекс фации",
+            "facies_name": "Название фации",
+            "target_text": "Краткое описание",
+        },
         "facies_classes": manifest.get("class_names", []),
+        "facies_statistics": manifest.get("facies_statistics", []),
+        "source_target_headers": manifest.get("source_target_headers", []),
+        "facies_class_key": "facies_index",
+        "facies_taxonomy_policy": "fresh_per_dataset_from_source_excel",
+        "description_target_header": "Краткое описание",
         "description_conditioning": ["interval_image", "facies_class"],
         "facies_reference": facies_reference,
         "dataset_manifest": "dataset_manifest.json",
-        "excel_output_columns": 22,
-        "note": "best.pt contains facies segmentation and the embedded column-22 description checkpoint; the standalone text file remains for compatibility.",
+        "note": "Excel fields are resolved by semantic header names per workbook and sheet; model class index/name mappings are derived afresh from this dataset.",
     }
     embed_description_checkpoint(
         Path(output_dir) / "best.pt", Path(output_dir) / "description_best.pt", contract,
@@ -136,7 +139,7 @@ def train_bundle(
 
 
 def embed_description_checkpoint(visual_model: Path, description_model: Path, contract: dict) -> Path:
-    """Embed the column-22 checkpoint and contract without breaking Ultralytics loading."""
+    """Embed description and facies-index/name metadata without breaking Ultralytics loading."""
     try:
         import torch
     except ImportError as exc:
@@ -147,9 +150,15 @@ def embed_description_checkpoint(visual_model: Path, description_model: Path, co
     description_checkpoint = torch.load(description_model, map_location="cpu", weights_only=False)
     if not isinstance(visual_checkpoint, dict):
         raise ValueError("best.pt не содержит ожидаемый checkpoint Ultralytics.")
-    if not isinstance(description_checkpoint, dict) or description_checkpoint.get("target_column") != 22:
-        raise ValueError("description_best.pt не является моделью столбца 22.")
-    visual_checkpoint["core_model_schema"] = "kern-unified-best-v2"
+    if not isinstance(description_checkpoint, dict):
+        raise ValueError("description_best.pt не является checkpoint модели описания.")
+    target_header = description_checkpoint.get("target_header") or description_checkpoint.get(
+        "target_headers", {},
+    ).get("target_text")
+    legacy_column = description_checkpoint.get("target_column")
+    if target_header != "Краткое описание" and legacy_column != 23:
+        raise ValueError("description_best.pt не указывает целевое поле по заголовку «Краткое описание».")
+    visual_checkpoint["core_model_schema"] = "kern-unified-best-v3"
     visual_checkpoint["core_description_checkpoint"] = description_checkpoint
     visual_checkpoint["core_model_contract"] = contract
     temporary = visual_model.with_name(visual_model.name + ".tmp")
@@ -169,9 +178,12 @@ def _facies_reference(dataset_dir: Path) -> dict[str, dict[str, str]]:
         if not line.strip():
             continue
         row = json.loads(line)
-        facies = str(row.get("facies", "")).strip()
+        facies = str(row.get("facies_index") or row.get("facies", "")).strip()
         if not facies:
             continue
+        name = str(row.get("facies_name", "")).strip()
+        if name:
+            values[facies]["facies_name"][name] += 1
         for key in ("association", "environment", "field_name"):
             value = str(row.get(key, "")).strip()
             if value:

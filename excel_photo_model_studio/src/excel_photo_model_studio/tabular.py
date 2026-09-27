@@ -133,17 +133,27 @@ def _best(headers: list[str], role: str, used: set[int]) -> int | None:
     return ranked[0][0] if ranked and ranked[0][1] > 0 else None
 
 
-def _best_facies_pair(
-    headers: list[str], rows: list[list[Any]], header_row: int,
-    used: set[int], thickness_column: int | None,
-    interval_source: str | None = None,
-) -> tuple[int | None, int | None]:
-    """Choose drilling facies limits together and verify them by facies thickness.
+def _interval_header_group(value: str) -> str:
+    """Return the parent interval name after removing its roof/base subheader."""
+    text = normalize_text(value)
+    text = re.sub(
+        r"\b(?:кровля|подошва|верх|низ|начало|конец|top|base|bottom|start|end|from|to)\b",
+        " ", text,
+    )
+    text = re.sub(r"\b(?:м|m|meter|meters)\b", " ", text)
+    return " ".join(re.sub(r"[^\w]+", " ", text).split())
 
-    Wide field forms contain several almost identical pairs named ``Кровля`` /
-    ``Подошва``. Header meaning is primary, while the row-level equality
-    ``Подошва - Кровля == Толщина фации`` is an independent safeguard against
-    accidentally selecting the much wider core-sampling interval.
+
+def _best_facies_pair(
+    headers: list[str], used: set[int], interval_source: str | None = None,
+) -> tuple[int | None, int | None]:
+    """Map ``Кровля`` to interval start and ``Подошва`` to interval end.
+
+    For drilling/GIS mappings, both cells must belong to the same parent header
+    group. The thickness column is deliberately not used to choose a different
+    pair: it validates each row after the drilling interval has been read.
+    This prevents a neighboring core-sampling or logging interval from winning
+    simply because its span happens to resemble the facies thickness.
     """
     def belongs_to_source(header: str) -> bool:
         text = normalize_text(header)
@@ -173,28 +183,11 @@ def _best_facies_pair(
         for base_column, base_score in bases:
             if top_column == base_column:
                 continue
-            valid_pairs = 0
-            thickness_checks = 0
-            thickness_matches = 0
-            for row in rows[header_row:]:
-                top = as_float(_cell(row, top_column))
-                base = as_float(_cell(row, base_column))
-                if top is None or base is None or base <= top:
-                    continue
-                valid_pairs += 1
-                thickness = as_float(_cell(row, thickness_column))
-                if thickness is None:
-                    continue
-                thickness_checks += 1
-                span_cm = meters_to_centimeters(base) - meters_to_centimeters(top)
-                if abs(meters_to_centimeters(thickness) - span_cm) <= 1:
-                    thickness_matches += 1
-            score = float(top_score + base_score + min(valid_pairs, 20))
+            if interval_source and _interval_header_group(headers[top_column - 1]) != _interval_header_group(headers[base_column - 1]):
+                continue
+            score = float(top_score + base_score)
             if base_column == top_column + 1:
                 score += 25
-            if thickness_checks:
-                match_ratio = thickness_matches / thickness_checks
-                score += 500 * match_ratio - 400 * (1.0 - match_ratio)
             candidates.append((score, top_column, base_column))
     if not candidates:
         return None, None
@@ -274,17 +267,13 @@ def detect_mapping(sheet: str, rows: list[list[Any]]) -> ColumnMapping:
         values[role] = _best(headers, role, used)
         if values[role]:
             used.add(int(values[role]))
-    values["top"], values["base"] = _best_facies_pair(
-        headers, rows, header_row, used, values.get("facies_thickness"), "drilling",
-    )
+    values["top"], values["base"] = _best_facies_pair(headers, used, "drilling")
     drilling_interval = _best_source_interval(headers, used, "drilling")
     # Some workbooks contain only GIS facies limits. Use those as the primary
     # limits only when no drilling limits exist; otherwise retain both systems
     # so matching can use GIS strictly as a fallback.
     if not (values["top"] and values["base"]) and not drilling_interval:
-        values["top"], values["base"] = _best_facies_pair(
-            headers, rows, header_row, used, values.get("facies_thickness"),
-        )
+        values["top"], values["base"] = _best_facies_pair(headers, used)
     if values["top"]:
         used.add(int(values["top"]))
     if values["base"]:
@@ -294,9 +283,7 @@ def detect_mapping(sheet: str, rows: list[list[Any]]) -> ColumnMapping:
         values["interval"] = drilling_interval
         if not values["interval"]:
             values["interval"] = _best(headers, "interval", used)
-    values["gis_top"], values["gis_base"] = _best_facies_pair(
-        headers, rows, header_row, used, values.get("facies_thickness"), "gis",
-    )
+    values["gis_top"], values["gis_base"] = _best_facies_pair(headers, used, "gis")
     if not (values["gis_top"] and values["gis_base"]):
         values["gis_top"] = values["gis_base"] = None
     if values["gis_top"] and values["gis_base"]:
@@ -305,7 +292,14 @@ def detect_mapping(sheet: str, rows: list[list[Any]]) -> ColumnMapping:
         values["gis_interval"] = values["interval"]
     else:
         values["gis_interval"] = _best_source_interval(headers, used, "gis")
-    return ColumnMapping(sheet=sheet, header_row=header_row, **values)
+    source_headers = {
+        role: headers[int(column) - 1]
+        for role, column in values.items()
+        if column and 0 < int(column) <= len(headers)
+    }
+    return ColumnMapping(
+        sheet=sheet, header_row=header_row, source_headers=source_headers, **values,
+    )
 
 
 def read_table(path: Path, mapping_file: Path | None = None) -> tuple[list[DescriptionRow], list[ColumnMapping], list[Issue]]:
@@ -336,8 +330,18 @@ def read_table(path: Path, mapping_file: Path | None = None) -> tuple[list[Descr
             else:
                 gis_top, gis_base = override.gis_top, override.gis_base
             gis_interval = None if gis_top and gis_base else (override.gis_interval or detected.gis_interval)
+            # Saved mappings contain positions for reading a particular sheet,
+            # but semantic target columns must follow the current header names.
+            # If a workbook has been reordered, refresh these positions from
+            # the headers rather than silently reading the old columns.
+            named_targets = {
+                role: getattr(detected, role) or getattr(override, role)
+                for role in ("class_index", "label", "target_text", "description")
+            }
             mapping = replace(
                 override,
+                **named_targets,
+                source_headers=detected.source_headers,
                 gis_interval=gis_interval,
                 gis_top=gis_top,
                 gis_base=gis_base,
@@ -471,6 +475,16 @@ def _cell(row: list[Any], column: int | None) -> Any:
     return row[column - 1] if column and column <= len(row) else None
 
 
+def _thickness_matches_interval(top: float, base: float, thickness: float) -> bool:
+    """Check that interval end minus start equals the declared thickness.
+
+    Values are normalized to exact centimetres (a missing fractional part is
+    .00); even a one-centimetre difference is a real mismatch.
+    """
+    span_cm = meters_to_centimeters(base) - meters_to_centimeters(top)
+    return base > top and meters_to_centimeters(thickness) == span_cm
+
+
 def _is_gis_header(value: str) -> bool:
     text = normalize_text(value)
     return any(word in text for word in ("по гис", "gis", "logging")) and not any(
@@ -532,12 +546,11 @@ def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[De
             gis_top = gis_base = None
         gis_thickness_valid = False
         if thickness is not None and gis_top is not None and gis_base is not None:
-            gis_span_cm = meters_to_centimeters(gis_base) - meters_to_centimeters(gis_top)
-            gis_thickness_valid = abs(meters_to_centimeters(thickness) - gis_span_cm) <= 1
+            gis_thickness_valid = _thickness_matches_interval(gis_top, gis_base, thickness)
         thickness_valid = True
         if thickness is not None:
             span_cm = meters_to_centimeters(base) - meters_to_centimeters(top)
-            thickness_valid = abs(meters_to_centimeters(thickness) - span_cm) <= 1
+            thickness_valid = _thickness_matches_interval(top, base, thickness)
             if not thickness_valid:
                 issues.append(Issue(
                     "warning" if gis_thickness_valid else "error",
@@ -582,10 +595,12 @@ def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[De
         name = display_text(_cell(row, mapping.label))
         code = display_text(_cell(row, mapping.class_code))
         index = display_text(_cell(row, mapping.class_index))
-        if code and index:
-            label = f"{code}@{index}"
-        else:
-            label = code or index or name
+        # Build fresh model classes from the workbook's facies-index column.
+        # The separate full name remains attached as readable class metadata;
+        # legacy workbooks without one of the columns fall back safely.
+        facies_index = index or code or name
+        facies_name = name or code or index
+        label = facies_index
         if not label:
             issues.append(Issue("error", f"{mapping.sheet}!{row_number}", "Нет метки класса; строка пропущена."))
             continue
@@ -613,5 +628,6 @@ def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[De
             metadata={key: value for key, value in metadata.items() if value},
             gis_top=gis_top, gis_base=gis_base,
             thickness_declared=thickness_declared,
+            facies_index=facies_index, facies_name=facies_name,
         ))
     return output, issues

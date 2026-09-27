@@ -130,6 +130,11 @@ def run_automatic_training(
             f"Датасет: фото — {dataset.get('photo_count', 0)}, маски — {dataset.get('annotation_count', 0)}, "
             f"классы фаций — {len(dataset.get('class_names', []))}."
         )
+        for facies in dataset.get("facies_statistics", []):
+            emit(
+                f"Фация {facies.get('facies_index', '')} — {facies.get('facies_name', '')}: "
+                f"масок {facies.get('mask_count', 0)}, описаний {facies.get('description_count', 0)}."
+            )
         emit("Обучаю визуальную сегментацию и модель краткого описания…")
         trained = train_bundle(
             dataset_dir, model_dir, architecture=architecture,

@@ -34,7 +34,7 @@ def normalize_column_order(value: str | None) -> str:
 
 @dataclass(frozen=True)
 class ColumnMapping:
-    """One sheet's semantic column mapping. Column numbers are one-based."""
+    """One sheet's semantic mapping, resolved from that sheet's own headers."""
 
     sheet: str
     header_row: int
@@ -57,6 +57,7 @@ class ColumnMapping:
     gis_interval: int | None = None
     gis_top: int | None = None
     gis_base: int | None = None
+    source_headers: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -64,7 +65,7 @@ class ColumnMapping:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ColumnMapping":
         allowed = cls.__dataclass_fields__.keys()
-        return cls(**{key: data.get(key) for key in allowed})
+        return cls(**{key: data[key] for key in allowed if key in data})
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,8 @@ class DescriptionRow:
     gis_top: float | None = None
     gis_base: float | None = None
     thickness_declared: bool = True
+    facies_index: str = ""
+    facies_name: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "top", normalize_depth(self.top))
@@ -194,6 +197,8 @@ class Annotation:
     environment: str = ""
     field_name: str = ""
     approved: bool = False
+    facies_index: str = ""
+    facies_name: str = ""
 
 
 @dataclass(frozen=True)

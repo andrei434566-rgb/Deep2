@@ -10,7 +10,10 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from excel_photo_model_studio.dataset import _report_blockers, _split_sources, build_dataset
+from excel_photo_model_studio.dataset import (
+    _fresh_facies_statistics, _report_blockers, _restore_facies_targets_from_excel,
+    _split_sources, build_dataset,
+)
 from excel_photo_model_studio.matching import (
     match_photos, read_photo_map, suggest_missing_intervals,
     uncovered_photo_description_intervals, uncovered_photo_intervals, write_photo_map,
@@ -19,9 +22,51 @@ from excel_photo_model_studio.models import (
     COLUMN_ORDER_RIGHT_TO_LEFT, DescriptionRow, PhotoRecord,
 )
 from excel_photo_model_studio.photos import parse_filename
+from openpyxl import Workbook
 
 
 class MatchingTests(unittest.TestCase):
+    def test_legacy_approved_masks_get_fresh_index_and_name_from_source_excel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            excel = root / "description.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "Data"
+            sheet.append([
+                "Скважина", "Интервал фации по бурению Кровля",
+                "Интервал фации по бурению Подошва", "Индекс фации",
+                "Название фации", "Краткое описание",
+            ])
+            sheet.append(["W-1", 100, 101, "Dch", "Каналы распределительные", "Песчаник"])
+            workbook.save(excel)
+            (project / "project.json").write_text(
+                json.dumps({"excel_paths": [str(excel)]}), encoding="utf-8",
+            )
+            annotation = {
+                "source_file": str(excel), "source_sheet": "Data", "source_row": "2",
+                "label": "old-hardcoded-class", "facies_index": "", "facies_name": "",
+            }
+
+            source_columns = _restore_facies_targets_from_excel(project, [annotation])
+
+        self.assertEqual("Dch", annotation["facies_index"])
+        self.assertEqual("Каналы распределительные", annotation["facies_name"])
+        self.assertEqual("Dch", annotation["label"])
+        self.assertEqual("Индекс фации", source_columns[0]["facies_index"])
+        self.assertEqual("Название фации", source_columns[0]["facies_name"])
+        self.assertEqual("Краткое описание", source_columns[0]["target_text"])
+
+    def test_dataset_class_index_cannot_silently_map_to_two_names(self):
+        rows = [
+            {"annotation_id": "a", "facies_index": "Dch", "facies_name": "Каналы"},
+            {"annotation_id": "b", "facies_index": "Dch", "facies_name": "Заливы"},
+        ]
+        with self.assertRaisesRegex(ValueError, "связан с разными названиями"):
+            _fresh_facies_statistics(rows)
+
     def test_explicit_gis_photo_is_not_rewritten_by_drilling_sequence(self):
         row = DescriptionRow("W-1", 100, 102, "A", "Data", 2, core_top=100, core_base=102)
         record = PhotoRecord(Path("page.jpg"), "W-1", 99.9, 101.9, "ocr_verified", True, depth_basis="gis")
@@ -545,7 +590,8 @@ class MatchingTests(unittest.TestCase):
                 annotations.append({
                     "annotation_id": f"a{index}", "photo": str(image_path), "preview": "", "well": f"W-{index}",
                     "photo_top": "100", "photo_base": "101", "depth_top": "100", "depth_base": "101",
-                    "label": "Sand", "polygon_json": json.dumps([[5, 5], [50, 5], [50, 70], [5, 70]]),
+                    "label": "Sand", "facies_index": "Dch", "facies_name": "Каналы распределительные",
+                    "polygon_json": json.dumps([[5, 5], [50, 5], [50, 70], [5, 70]]),
                     "image_width": "60", "image_height": "80", "source_sheet": "Data", "source_row": str(index + 2),
                     "approved": "1",
                     "target_text": "Песчаник светло-серый, слоистый.",
@@ -559,10 +605,16 @@ class MatchingTests(unittest.TestCase):
             result = build_dataset(project, root / "dataset")
 
             manifest = json.loads((root / "dataset" / "dataset_manifest.json").read_text(encoding="utf-8"))
+            caption = json.loads((root / "dataset" / "caption_dataset.jsonl").read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(3, result["photo_count"])
         self.assertEqual(1, manifest["val_photo_count"])
-        self.assertEqual(["Sand"], manifest["class_names"])
+        self.assertEqual(["Dch"], manifest["class_names"])
         self.assertEqual(3, manifest["caption_count"])
+        self.assertEqual(1, manifest["facies_count"])
+        self.assertEqual({"Dch": 3}, manifest["class_counts"])
+        self.assertEqual("Каналы распределительные", manifest["facies_statistics"][0]["facies_name"])
+        self.assertEqual("Dch", caption["facies_index"])
+        self.assertEqual("Каналы распределительные", caption["facies_name"])
 
 
 class DatasetSplitTests(unittest.TestCase):

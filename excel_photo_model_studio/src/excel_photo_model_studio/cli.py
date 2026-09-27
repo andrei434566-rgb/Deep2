@@ -52,7 +52,7 @@ def parser() -> argparse.ArgumentParser:
     discovery = commands.add_parser("discover-wells", help="Найти пары Excel + фото в архивной папке")
     discovery.add_argument("--root", type=Path, required=True)
 
-    analyze = commands.add_parser("analyze", help="Применить единый best.pt и создать стандартный Excel из 22 столбцов")
+    analyze = commands.add_parser("analyze", help="Применить единый best.pt и создать стандартный Excel с полями индекса, названия и описания фации")
     analyze.add_argument("--model", type=Path, required=True)
     analyze.add_argument("--photos", type=Path, required=True)
     analyze.add_argument("--output-excel", type=Path, required=True)

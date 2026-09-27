@@ -68,6 +68,7 @@ def train_description_model(
     pad_id, bos_id, eos_id, unk_id = (token_to_id[token] for token in SPECIAL_TOKENS)
     facies_names = sorted({str(row.get("facies", "")).strip() for row in train_rows if str(row.get("facies", "")).strip()})
     facies_to_id = {name: index + 1 for index, name in enumerate(facies_names)}
+    facies_catalog = _facies_catalog(dataset_dir, train_rows + val_rows, facies_names)
 
     class CaptionDataset(Dataset):
         def __init__(self, items: list[dict]):
@@ -135,14 +136,21 @@ def train_description_model(
             best_epoch = epoch
             stale_epochs = 0
             torch.save({
-                "schema": "excel-photo-description-v2",
+                "schema": "excel-photo-description-v4",
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "model_state": model.state_dict(), "tokens": tokens,
                 "max_text_length": max_text_length, "image_size": image_size,
-                "hidden_size": hidden_size, "target_column": 22,
+                "hidden_size": hidden_size,
                 "facies_names": facies_names,
+                "facies_catalog": facies_catalog,
+                "target_fields": ["facies_index", "facies_name", "target_text"],
+                "target_headers": {
+                    "facies_index": "Индекс фации",
+                    "facies_name": "Название фации",
+                    "target_text": "Краткое описание",
+                },
                 "conditioning": ["interval_image", "facies_class"],
-                "target_header": "Краткое описание", "best_epoch": best_epoch,
+                "best_epoch": best_epoch,
                 "best_val_loss": best_loss,
                 "train_samples": len(train_rows), "val_samples": len(val_rows),
             }, output_path)
@@ -155,11 +163,18 @@ def train_description_model(
         raise RuntimeError("Обучение текста завершилось без description_best.pt.")
     info = {
         "schema": "excel-photo-description-training-v1", "model": str(output_path),
-        "target_column": 22, "target_header": "Краткое описание",
+        "target_header": "Краткое описание",
+        "target_headers": {
+            "facies_index": "Индекс фации",
+            "facies_name": "Название фации",
+            "target_text": "Краткое описание",
+        },
         "train_samples": len(train_rows), "val_samples": len(val_rows),
         "best_epoch": best_epoch, "best_val_loss": best_loss,
         "device": str(device), "max_text_length": max_text_length,
         "facies_classes": facies_names,
+        "facies_statistics": facies_catalog,
+        "target_fields": ["facies_index", "facies_name", "target_text"],
         "warning": "Модель формирует текст только по визуально различимым признакам; факты, не видимые на фото, требуют проверки геолога.",
     }
     (output_dir / "description_training_info.json").write_text(
@@ -171,6 +186,34 @@ def train_description_model(
 def generate_description(model_path: Path, image_path: Path, facies: str = "") -> str:
     """Generate a short-description draft from one segmented interval crop."""
     return DescriptionGenerator(model_path).generate(image_path, facies)
+
+
+def _facies_catalog(dataset_dir: Path, rows: list[dict], facies_indices: list[str]) -> list[dict[str, str]]:
+    names = {}
+    for row in rows:
+        index = str(row.get("facies_index") or row.get("facies") or "").strip()
+        name = str(row.get("facies_name") or index).strip()
+        if index:
+            names.setdefault(index.casefold(), (index, name))
+    statistics_path = dataset_dir / "dataset_manifest.json"
+    if statistics_path.is_file():
+        manifest = json.loads(statistics_path.read_text(encoding="utf-8"))
+        manifest_statistics = manifest.get("facies_statistics", [])
+        if manifest_statistics:
+            return [
+                {
+                    "facies_index": str(item["facies_index"]),
+                    "facies_name": str(item.get("facies_name", item["facies_index"])),
+                    "mask_count": int(item.get("mask_count", 0)),
+                    "description_count": int(item.get("description_count", 0)),
+                }
+                for item in manifest_statistics
+            ]
+    return [
+        {"facies_index": names.get(index.casefold(), (index, index))[0],
+         "facies_name": names.get(index.casefold(), (index, index))[1]}
+        for index in facies_indices
+    ]
 
 
 class DescriptionGenerator:
@@ -197,7 +240,7 @@ class DescriptionGenerator:
         model = self.model
         with torch.inference_mode():
             image_state = model.encoder(image_tensor)
-            if checkpoint["schema"] == "excel-photo-description-v2":
+            if checkpoint["schema"] in {"excel-photo-description-v2", "excel-photo-description-v3", "excel-photo-description-v4"}:
                 facies_to_id = {name: index + 1 for index, name in enumerate(checkpoint.get("facies_names", []))}
                 facies_id = torch.tensor([facies_to_id.get(str(facies).strip(), 0)], dtype=torch.long)
                 image_state = torch.tanh(image_state + model.facies_embedding(facies_id))
@@ -223,7 +266,7 @@ def _load_description_network(checkpoint: dict):
     except ImportError as exc:
         raise RuntimeError("Для применения модели установите PyTorch.") from exc
     schema = checkpoint.get("schema") if isinstance(checkpoint, dict) else None
-    if schema not in {"excel-photo-description-v1", "excel-photo-description-v2"}:
+    if schema not in {"excel-photo-description-v1", "excel-photo-description-v2", "excel-photo-description-v3", "excel-photo-description-v4"}:
         raise ValueError("Неизвестный формат модели описания.")
     tokens = checkpoint["tokens"]
     token_to_id = {token: index for index, token in enumerate(tokens)}
@@ -239,7 +282,7 @@ def _load_description_network(checkpoint: dict):
                 _conv_block(nn, 64, 128), _conv_block(nn, 128, 256),
                 nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten(), nn.Linear(256, hidden_size), nn.Tanh(),
             )
-            if schema == "excel-photo-description-v2":
+            if schema in {"excel-photo-description-v2", "excel-photo-description-v3", "excel-photo-description-v4"}:
                 self.facies_embedding = nn.Embedding(len(facies_names) + 1, hidden_size)
             self.embedding = nn.Embedding(len(tokens), hidden_size, padding_idx=pad_id)
             self.decoder = nn.GRU(hidden_size, hidden_size, batch_first=True)

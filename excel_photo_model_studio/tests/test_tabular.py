@@ -39,6 +39,36 @@ class TableReaderTests(unittest.TestCase):
         self.assertEqual(0.96, as_float(".96"))
         self.assertEqual(0.96, as_float(",96"))
 
+    def test_facies_thickness_is_exact_to_one_centimetre_without_tolerance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "exact_thickness.csv"
+            path.write_text(
+                "Скважина;Интервал фации по бурению Кровля;Интервал фации по бурению Подошва;"
+                "Толщина фации;Индекс фации;Название фации;Краткое описание\n"
+                "W-1;100;103,03;3.03;Dch;Каналы;Описание\n"
+                "W-1;103,03;106,03;3;Inbay;Заливы;Описание\n"
+                "W-1;106,03;109,06;3.02;Mstf;Устья;Описание\n", encoding="utf-8",
+            )
+            rows, _, _ = read_table(path)
+
+        self.assertTrue(rows[0].thickness_valid)
+        self.assertTrue(rows[1].thickness_valid)
+        self.assertFalse(rows[2].thickness_valid)
+
+    def test_facies_index_and_name_are_kept_as_separate_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "facies_targets.csv"
+            path.write_text(
+                "Скважина;Интервал фации по бурению Кровля;Интервал фации по бурению Подошва;"
+                "Индекс фации;Название фации;Краткое описание\n"
+                "W-1;100;101;Dch;Каналы распределительные;Песчаник\n", encoding="utf-8",
+            )
+            rows, _, _ = read_table(path)
+
+        self.assertEqual("Dch", rows[0].facies_index)
+        self.assertEqual("Каналы распределительные", rows[0].facies_name)
+        self.assertEqual("Dch", rows[0].label)
+
     def test_interval_parser_does_not_split_decimal_comma_or_dot(self):
         for value in ("4105.00-4108.65", "4105,00–4108,65", "4.105,00-4.108,65"):
             with self.subTest(value=value):
@@ -152,8 +182,50 @@ class TableReaderTests(unittest.TestCase):
         self.assertEqual([], [item for item in issues if item.severity == "error"])
         self.assertEqual(2, len(rows))
         self.assertEqual("Р-31", rows[1].well)
-        self.assertEqual("DWCh@80", rows[1].label)
+        self.assertEqual("80", rows[1].label)
+        self.assertEqual("80", rows[1].facies_index)
+        self.assertEqual("DWCh", rows[1].facies_name)
         self.assertEqual(2, mappings[0].header_row)
+
+    def test_facies_targets_follow_header_names_after_source_columns_are_reordered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "reordered.xlsx"
+            mapping_file = Path(directory) / "column_mapping.json"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "Описание"
+            sheet.append([
+                "Скважина", "Интервал фации по бурению Кровля",
+                "Интервал фации по бурению Подошва", "Индекс фации",
+                "Название фации", "Краткое описание", "Толщина фации, м",
+            ])
+            sheet.append(["W-1", 100.00, 101.25, "Dch", "Каналы", "Гравийный песчаник.", 1.25])
+            workbook.save(path)
+            _rows, detected, _issues = read_table(path)
+            save_mappings(mapping_file, detected)
+
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "Описание"
+            sheet.append([
+                "Краткое описание", "Скважина", "Интервал фации по бурению Подошва",
+                "Название фации", "Толщина фации, м", "Интервал фации по бурению Кровля",
+                "Индекс фации",
+            ])
+            sheet.append(["Гравийный песчаник.", "W-1", 101.25, "Каналы", 1.25, 100.00, "Dch"])
+            workbook.save(path)
+
+            rows, mappings, issues = read_table(path, mapping_file)
+
+        self.assertFalse([issue for issue in issues if issue.severity == "error"])
+        self.assertEqual(7, mappings[0].class_index)
+        self.assertEqual(4, mappings[0].label)
+        self.assertEqual(1, mappings[0].target_text)
+        self.assertEqual("Dch", rows[0].facies_index)
+        self.assertEqual("Каналы", rows[0].facies_name)
+        self.assertEqual("Гравийный песчаник.", rows[0].target_text)
+        self.assertEqual("Индекс фации", mappings[0].source_headers["class_index"])
+        self.assertEqual("Краткое описание", mappings[0].source_headers["target_text"])
 
     def test_finds_drilling_interval_and_short_description_by_header_not_position(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -203,8 +275,38 @@ class TableReaderTests(unittest.TestCase):
         self.assertEqual(30, mappings[0].target_text)
         self.assertEqual("Песчаник светло-серый, слоистый.", rows[0].target_text)
         self.assertEqual((4105.0, 4108.65), (rows[0].top, rows[0].base))
-        self.assertEqual((4104.9, 4108.55), (rows[0].gis_top, rows[0].gis_base))
         self.assertTrue(rows[0].thickness_valid)
+        self.assertEqual("drilling", rows[0].metadata["interval_source"])
+        self.assertEqual((4104.9, 4108.55), (rows[0].gis_top, rows[0].gis_base))
+        self.assertEqual("Dch", rows[0].facies_index)
+        self.assertEqual("Каналы распределительные", rows[0].facies_name)
+        self.assertEqual("Dch", rows[0].label)
+
+    def test_drilling_roof_and_base_must_share_parent_group_thickness_validates_their_span(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "interval_groups.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append([
+                "Скважина",
+                "Интервал фации по бурению Кровля",
+                "Интервал фации по ГИС Подошва",
+                "Интервал фации по ГИС Кровля",
+                "Интервал фации по бурению Подошва",
+                "Толщина фации, м",
+                "Код фации",
+            ])
+            sheet.append(["W-1", 100.0, 201.0, 200.0, 102.0, 2.0, "Dch"])
+            workbook.save(path)
+
+            rows, mappings, issues = read_table(path)
+
+        self.assertEqual((2, 5), (mappings[0].top, mappings[0].base))
+        self.assertEqual((4, 3), (mappings[0].gis_top, mappings[0].gis_base))
+        self.assertEqual((100.0, 102.0), (rows[0].top, rows[0].base))
+        self.assertTrue(rows[0].thickness_valid)
+        self.assertEqual("drilling", rows[0].metadata["interval_source"])
+        self.assertEqual([], [issue for issue in issues if issue.severity == "error"])
 
     def test_thickness_mismatch_blocks_row_from_masking(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -222,6 +324,7 @@ class TableReaderTests(unittest.TestCase):
 
         self.assertEqual((2, 3, 4), (mappings[0].top, mappings[0].base, mappings[0].facies_thickness))
         self.assertEqual(1, len(rows))
+        self.assertEqual((100.0, 112.0), (rows[0].top, rows[0].base))
         self.assertFalse(rows[0].thickness_valid)
         self.assertTrue(any("не будет использована для маски" in item.message for item in issues))
 

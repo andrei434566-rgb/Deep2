@@ -51,21 +51,46 @@ class TrainingTests(unittest.TestCase):
         self.assertEqual("random_weights", info["initialization"])
         self.assertFalse(info["pretrained"])
 
-    def test_embeds_column_22_checkpoint_and_contract_into_best_pt(self):
+    def test_embeds_index_name_and_description_checkpoint_and_contract_into_best_pt(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             visual = root / "best.pt"
             description = root / "description_best.pt"
             torch.save({"model": "segmentation"}, visual)
-            torch.save({"schema": "excel-photo-description-v2", "target_column": 22}, description)
-            contract = {"facies_classes": ["Tcr"], "target_column": 22}
+            target_headers = {
+                "facies_index": "Индекс фации",
+                "facies_name": "Название фации",
+                "target_text": "Краткое описание",
+            }
+            torch.save({
+                "schema": "excel-photo-description-v4",
+                "target_headers": target_headers,
+            }, description)
+            contract = {
+                "facies_classes": ["Tcr"],
+                "target_fields": ["facies_index", "facies_name", "target_text"],
+                "target_headers": target_headers,
+            }
 
             embed_description_checkpoint(visual, description, contract)
             checkpoint = torch.load(visual, map_location="cpu", weights_only=False)
 
-        self.assertEqual("kern-unified-best-v2", checkpoint["core_model_schema"])
-        self.assertEqual(22, checkpoint["core_description_checkpoint"]["target_column"])
+        self.assertEqual("kern-unified-best-v3", checkpoint["core_model_schema"])
+        self.assertEqual(target_headers, checkpoint["core_description_checkpoint"]["target_headers"])
         self.assertEqual(["Tcr"], checkpoint["core_model_contract"]["facies_classes"])
+
+    def test_still_embeds_legacy_description_checkpoint_with_old_column_number(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            visual = root / "best.pt"
+            description = root / "description_best.pt"
+            torch.save({"model": "segmentation"}, visual)
+            torch.save({"schema": "excel-photo-description-v3", "target_column": 23}, description)
+
+            embed_description_checkpoint(visual, description, {})
+            embedded = torch.load(visual, map_location="cpu", weights_only=False)
+
+        self.assertEqual(23, embedded["core_description_checkpoint"]["target_column"])
 
 
 if __name__ == "__main__":

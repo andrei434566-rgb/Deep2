@@ -317,6 +317,7 @@ def refresh_project(project_dir: Path) -> dict:
             {
                 "sheet": item.sheet, "facies_top": item.top, "facies_base": item.base,
                 "facies_thickness": item.facies_thickness, "target_text": item.target_text,
+                "facies_index": item.class_index, "facies_name": item.label,
                 "gis_facies_top": item.gis_top, "gis_facies_base": item.gis_base,
                 "gis_facies_interval": item.gis_interval,
             }
@@ -553,6 +554,7 @@ def _annotation_revision(item) -> str:
         data = item
     values = {key: str(data.get(key, "")) for key in (
         "annotation_id", "target_text", "association", "environment", "field_name",
+        "facies_index", "facies_name",
         "image_width", "image_height", "label", "source_file",
     )}
     values["polygon"] = json.loads(data["polygon_json"])
@@ -598,12 +600,14 @@ def _write_annotations(path: Path, annotations: list[Annotation], previews: dict
             "source_file": item.source_file, "target_text": item.target_text,
             "association": item.association, "environment": item.environment,
             "field_name": item.field_name,
+            "facies_index": item.facies_index, "facies_name": item.facies_name,
             "approved": "1" if item.approved else "0",
         })
     _write_dict_rows(path, rows, fieldnames=(
         "annotation_id", "photo", "preview", "well", "photo_top", "photo_base",
         "depth_top", "depth_base", "facies_top", "facies_base", "label", "polygon_json", "image_width", "image_height",
-        "source_sheet", "source_row", "source_file", "target_text", "association", "environment", "field_name", "approved",
+        "source_sheet", "source_row", "source_file", "facies_index", "facies_name",
+        "target_text", "association", "environment", "field_name", "approved",
     ))
 
 
@@ -761,9 +765,9 @@ def _table_source_signature(excel_paths: list[Path], mapping_path: Path) -> str:
 def _write_table_cache(project_dir: Path, rows, mappings, issues, excel_files) -> None:
     mapping_path = project_dir / "column_mapping.json"
     payload = {
-        # v2 persists the alternate GIS limits. Invalidate pre-GIS caches so
-        # existing projects automatically re-read their Excel headers once.
-        "schema": "excel-photo-table-cache-v2",
+        # v3 persists separate facies index/name targets. Invalidate old caches
+        # so each project reloads its source Excel into the new schema.
+        "schema": "excel-photo-table-cache-v3",
         "signature": _table_source_signature([Path(path) for path in excel_files], mapping_path),
         "excel_files": [str(path) for path in excel_files],
         "rows": [asdict(item) for item in rows],
@@ -782,7 +786,7 @@ def _load_table_cache(project_dir: Path, excel_paths: list[Path]):
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("schema") != "excel-photo-table-cache-v2":
+        if payload.get("schema") != "excel-photo-table-cache-v3":
             return None
         if payload.get("signature") != _table_source_signature(excel_paths, project_dir / "column_mapping.json"):
             return None

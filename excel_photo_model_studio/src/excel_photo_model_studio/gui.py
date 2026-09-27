@@ -218,6 +218,7 @@ class StepVerificationDialog(QDialog):
         self.excel_path = Path(excel_path)
         self.photos_dir = Path(photos_dir)
         self.use_ocr = bool(use_ocr)
+        self._excel_ready = False
         self.setWindowTitle("Пошаговая сверка Excel → фото → маски")
         self.resize(1180, 820)
         self._worker: _DiagnosticWorker | None = None
@@ -278,6 +279,16 @@ class StepVerificationDialog(QDialog):
     def _build_excel_page(self) -> None:
         page = QWidget(self)
         layout = QVBoxLayout(page)
+        workbook_row = QHBoxLayout()
+        workbook_row.addWidget(QLabel("Книга Excel:"))
+        self.excel_file_label = QLabel(str(self.excel_path))
+        self.excel_file_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.excel_file_label.setToolTip(str(self.excel_path))
+        workbook_row.addWidget(self.excel_file_label, 1)
+        self.excel_picker_button = QPushButton("Открыть / выбрать Excel…")
+        self.excel_picker_button.clicked.connect(self._choose_excel)
+        workbook_row.addWidget(self.excel_picker_button)
+        layout.addLayout(workbook_row)
         self.mapping_summary = QLabel()
         self.mapping_summary.setWordWrap(True)
         layout.addWidget(self.mapping_summary)
@@ -298,13 +309,13 @@ class StepVerificationDialog(QDialog):
         self.raw_sheet_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectItems)
         source_layout.addWidget(self.raw_sheet_table, 1)
         self.excel_views.addTab(source_page, "Исходный Excel — выделенные колонки")
-        self.excel_table = QTableWidget(0, 9, page)
+        self.excel_table = QTableWidget(0, 10, page)
         self.excel_table.setHorizontalHeaderLabels((
             "Файл / лист / строка", "Скважина", "От, м", "До, м", "Толщина, м",
-            "Фация", "Краткое описание", "Источник интервала", "Интервал керна",
+            "Индекс фации", "Название фации", "Краткое описание", "Источник интервала", "Интервал керна",
         ))
         self.excel_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.excel_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        self.excel_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
         self.excel_table.setAlternatingRowColors(True)
         self.excel_views.addTab(self.excel_table, "Строки после чтения")
         layout.addWidget(self.excel_views, 1)
@@ -426,6 +437,8 @@ class StepVerificationDialog(QDialog):
         self.stage_title.setText(titles[stage])
         self.pages.setCurrentIndex(stage)
         self.back_button.setEnabled(stage > 0 and stage < 5 and not self._busy())
+        self.excel_picker_button.setVisible(stage == 0)
+        self.excel_picker_button.setEnabled(stage == 0 and not self._busy())
         self.issue_button.setVisible(stage < 5)
         self.action_button.setVisible(stage < 5 or not self._failure)
         self.cancel_button.setText("Закрыть")
@@ -448,6 +461,7 @@ class StepVerificationDialog(QDialog):
             5: "Запустить полный расчёт проекта",
         }
         self.action_button.setText(action_labels[stage])
+        self.action_button.setEnabled(not self._busy() and (stage != 0 or self._excel_ready))
         if stage == 5 and self._failure:
             self.action_button.setVisible(False)
         if stage == 1:
@@ -471,6 +485,7 @@ class StepVerificationDialog(QDialog):
             return
         self.status.setText(message)
         self.action_button.setEnabled(False)
+        self.excel_picker_button.setEnabled(False)
         self.back_button.setEnabled(False)
         self.issue_button.setEnabled(False)
         self.cancel_button.setEnabled(False)
@@ -492,12 +507,66 @@ class StepVerificationDialog(QDialog):
 
     def _async_failed(self, message: str) -> None:
         self._worker = None
-        self.action_button.setEnabled(True)
+        self.action_button.setEnabled(self._stage != 0 or self._excel_ready)
+        self.excel_picker_button.setEnabled(self._stage == 0)
         self.back_button.setEnabled(0 < self._stage < 5)
         self.issue_button.setEnabled(True)
         self.cancel_button.setEnabled(True)
         self.status.setText(f"Этап не выполнен: {message}")
         QMessageBox.critical(self, "Ошибка пошаговой сверки", message)
+
+    def _choose_excel(self) -> None:
+        if self._busy() or self._stage != 0:
+            return
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выберите книгу Excel или таблицу CSV",
+            str(self.excel_path.parent),
+            "Таблицы (*.xlsx *.xlsm *.xltx *.xltm *.xls *.csv *.tsv);;Все файлы (*)",
+        )
+        if selected:
+            self._load_excel_file(Path(selected))
+
+    def _load_excel_file(self, path: Path) -> None:
+        if self._busy() or self._stage != 0:
+            return
+        path = Path(path).expanduser()
+        if path.suffix.lower() not in {".xlsx", ".xlsm", ".xltx", ".xltm", ".xls", ".csv", ".tsv"}:
+            self.status.setText("Выберите файл XLSX, XLSM, XLTX, XLTM, XLS, CSV или TSV.")
+            return
+        if not path.is_file():
+            self.status.setText(f"Файл Excel не найден: {path}")
+            return
+
+        self.excel_path = path.resolve()
+        self.excel_file_label.setText(str(self.excel_path))
+        self.excel_file_label.setToolTip(str(self.excel_path))
+        self._excel_ready = False
+        self.rows = []
+        self.mappings = []
+        self.issues = []
+        self.raw_sheets = {}
+        self.photos = []
+        self.columns = {}
+        self.column_errors = {}
+        self.column_confirmed.clear()
+        self.matches = []
+        self.unresolved = []
+        self.annotations = []
+        self.projected_columns = {}
+        self.orders = {}
+        self.mask_confirmed.clear()
+        self.audit = []
+        self._current_photo = 0
+        self._failure = ""
+        self.mapping_summary.clear()
+        self.raw_sheet_info.setText("Загружаю исходную книгу и определяю структуру…")
+        self.raw_sheet_table.clear()
+        self.raw_sheet_table.setRowCount(0)
+        self.raw_sheet_table.setColumnCount(0)
+        self.excel_table.setRowCount(0)
+        self.sheet_selector.clear()
+        self._run_async("Читаю выбранную книгу и определяю столбцы…", self._read_excel, self._excel_loaded)
 
     def _read_excel(self, progress):
         progress("Читаю Excel штатным парсером приложения…")
@@ -508,9 +577,10 @@ class StepVerificationDialog(QDialog):
     def _excel_loaded(self, result) -> None:
         self.rows, self.mappings, self.issues, self.excel_files, raw_sheets = result
         self.raw_sheets = {name: cells for name, cells in raw_sheets}
+        self._excel_ready = bool(self.rows and self.mappings and self.raw_sheets)
         fields = (
             ("well", "Скважина"), ("interval", "Интервал фации"),
-            ("top", "Верх фации"), ("base", "Низ фации"),
+            ("top", "Кровля фации / начало"), ("base", "Подошва фации / конец"),
             ("facies_thickness", "Толщина фации"), ("core_top", "Верх интервала керна"),
             ("core_base", "Низ интервала керна"), ("class_code", "Код фации"),
             ("class_index", "Индекс фации"), ("label", "Название фации"),
@@ -518,14 +588,45 @@ class StepVerificationDialog(QDialog):
             ("gis_interval", "Интервал по ГИС"), ("gis_top", "Верх по ГИС"),
             ("gis_base", "Низ по ГИС"),
         )
-        mapping_lines = [f"Строки с фациями: {len(self.rows)}. Листы Excel: {len(self.mappings)}."]
+        mapping_lines = [
+            f"Файл: {self.excel_path.name}. Строк с фациями: {len(self.rows)}. Листы Excel: {len(self.mappings)}.",
+            "Правило интервала: в группе «Интервал фации по бурению» Кровля — начало, Подошва — конец; "
+            "толщина фации должна точно совпасть с разностью после приведения к 0,01 м; разница даже в 1 см — ошибка, "
+            "допуска нет, целое значение читается как .00. "
+            "Несовпавший интервал по бурению не строит маску; "
+            "резерв ГИС используется только целиком в системе ГИС.",
+        ]
         for mapping in self.mappings:
             source = Path(mapping.source_file).name if mapping.source_file else self.excel_path.name
+            worksheet_rows = self.raw_sheets.get(mapping.sheet, [])
             resolved = [f"{label}: {self._excel_column(getattr(mapping, role))}" for role, label in fields if getattr(mapping, role)]
             mapping_lines.append(
-                f"{source} / лист «{mapping.sheet}», строка заголовков {mapping.header_row + 1}: "
+                f"{source} / лист «{mapping.sheet}», строка заголовков {mapping.header_row}: "
                 + "; ".join(resolved)
             )
+            if mapping.top and mapping.base:
+                source_cells = " ".join(
+                    str(worksheet_rows[row_index][column - 1] or "")
+                    for row_index in range(min(mapping.header_row, len(worksheet_rows)))
+                    for column in (mapping.top, mapping.base)
+                    if column and column <= len(worksheet_rows[row_index])
+                )
+                normalized_source = source_cells.casefold().replace("ё", "е")
+                if "бурен" in normalized_source or "drilling" in normalized_source:
+                    source_label = "по бурению"
+                elif "гис" in normalized_source or "gis" in normalized_source:
+                    source_label = "по ГИС"
+                else:
+                    source_label = "из выбранной группы Excel"
+                mapping_lines.append(
+                    f"  Интервал маски {source_label}: {self._excel_column(mapping.top)} (Кровля/начало) → "
+                    f"{self._excel_column(mapping.base)} (Подошва/конец); "
+                    + (
+                        f"{self._excel_column(mapping.facies_thickness)} (Толщина фации) — проверка."
+                        if mapping.facies_thickness else
+                        "колонка толщины не найдена, проверить интервал по ней нельзя."
+                    )
+                )
         if self.issues:
             mapping_lines.append(f"Замечаний парсера: {len(self.issues)}. Первое: {self.issues[0].message}")
         self.mapping_summary.setText("\n".join(mapping_lines))
@@ -540,7 +641,8 @@ class StepVerificationDialog(QDialog):
             values = (
                 f"{Path(row.source_file).name if row.source_file else row.sheet} / {row.sheet}!{row.row}",
                 row.well, format_depth(row.top), format_depth(row.base),
-                "" if row.thickness is None else format_depth(row.thickness), row.label,
+                "" if row.thickness is None else format_depth(row.thickness),
+                row.facies_index or row.label, row.facies_name or row.label,
                 row.target_text or row.description, row.metadata.get("interval_source", "drilling"),
                 "" if row.core_top is None or row.core_base is None else f"{format_depth(row.core_top)}–{format_depth(row.core_base)}",
             )
@@ -568,10 +670,10 @@ class StepVerificationDialog(QDialog):
 
         role_specs = (
             ("well", "Скважина", "#d9eaf7"),
-            ("interval", "Интервал фации", "#e2e2e2"),
-            ("top", "Кровля фации", "#bee3f8"),
-            ("base", "Подошва фации", "#a8dadc"),
-            ("facies_thickness", "Толщина фации", "#ffe0b2"),
+            ("interval", "Интервал фации (резервный столбец)", "#e2e2e2"),
+            ("top", "Кровля фации — начало", "#bee3f8"),
+            ("base", "Подошва фации — конец", "#a8dadc"),
+            ("facies_thickness", "Толщина — проверка интервала", "#ffe0b2"),
             ("core_top", "Кровля интервала керна", "#d9ed92"),
             ("core_base", "Подошва интервала керна", "#c7e9b0"),
             ("class_code", "Код фации", "#e9d8fd"),
@@ -592,11 +694,12 @@ class StepVerificationDialog(QDialog):
             max((len(row) for row in source_rows), default=0),
             max(selected_columns, default=0),
         )
-        header_row = max(0, min(int(mapping.header_row), len(source_rows) - 1))
-        first_row = max(0, header_row - 3)
-        last_row = min(len(source_rows), max(header_row + 51, first_row + 60))
+        # ColumnMapping.header_row is one-based; QTableWidget indexes are zero-based.
+        header_index = max(0, min(int(mapping.header_row) - 1, len(source_rows) - 1))
+        first_row = max(0, header_index - 3)
+        last_row = min(len(source_rows), max(header_index + 51, first_row + 60))
         shown_rows = source_rows[first_row:last_row]
-        header_values = source_rows[header_row]
+        header_values = source_rows[header_index]
         column_headers = []
         header_roles = []
         for column_index in range(1, column_count + 1):
@@ -638,7 +741,7 @@ class StepVerificationDialog(QDialog):
             f"Подсвечены выбранные столбцы: {selected_labels or 'нет'}.")
         if selected_columns:
             first_column = min(selected_columns)
-            anchor_row = max(0, min(header_row - first_row, len(shown_rows) - 1))
+            anchor_row = max(0, min(header_index - first_row, len(shown_rows) - 1))
             table.scrollToItem(table.item(anchor_row, first_column - 1), QTableWidget.ScrollHint.PositionAtCenter)
 
     @staticmethod
@@ -960,6 +1063,8 @@ class StepVerificationDialog(QDialog):
         if self._busy():
             return
         if self._stage == 0:
+            if not self._excel_ready:
+                return QMessageBox.warning(self, "Excel не загружен", "Откройте книгу и дождитесь чтения листа Excel.")
             self.audit.append("Подтверждение: пользователь проверил распознанные заголовки и значения Excel.")
             self._set_stage(1)
             self._run_async("Ищу изображения и выделяю столбики керна на каждом…", self._discover_and_detect, self._columns_loaded)
@@ -1405,7 +1510,7 @@ class MainWindow(QMainWindow):
         self.analysis_confidence.setSuffix(" %")
         form.addRow("Созданный best.pt:", self.analysis_model)
         form.addRow("Папка нового керна:", self.analysis_photos)
-        form.addRow("Итоговый Excel из 22 столбцов:", self.analysis_output)
+        form.addRow("Итоговый Excel с 23 полями фации:", self.analysis_output)
         form.addRow("Минимальная уверенность:", self.analysis_confidence)
         layout.addLayout(form)
         analyze = QPushButton("Распознать фации, сформировать столбец 22 и создать Excel")
@@ -1450,6 +1555,7 @@ class MainWindow(QMainWindow):
             excel_path, photos_path, use_ocr=self.ocr.isChecked(), parent=self,
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.excel.set_value(dialog.excel_path)
             self._pending_verified_photo_records = list(dialog.photos)
             self._create_project()
 
@@ -1990,6 +2096,23 @@ class MainWindow(QMainWindow):
         self._read_dataset_output()
         self.dataset_button.setEnabled(True)
         self.train_log.append(f"\nСборка датасета завершена, код {code}.")
+        if code == 0:
+            try:
+                manifest = json.loads((self.dataset_output.value() / "dataset_manifest.json").read_text(encoding="utf-8"))
+                stats = manifest.get("facies_statistics", [])
+                self.train_log.append(
+                    f"Новый справочник из текущих Excel: {len(stats)} фаций; "
+                    f"{manifest.get('annotation_count', 0)} масок, "
+                    f"{manifest.get('photo_count', 0)} фото."
+                )
+                for item in stats:
+                    self.train_log.append(
+                        f"  {item.get('facies_index', '')} — {item.get('facies_name', '')}: "
+                        f"{item.get('mask_count', 0)} масок, "
+                        f"{item.get('description_count', 0)} описаний."
+                    )
+            except (OSError, ValueError, TypeError):
+                pass
 
     def _start_training(self) -> None:
         if self.process and self.process.state() != QProcess.ProcessState.NotRunning:

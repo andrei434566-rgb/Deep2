@@ -791,6 +791,8 @@ def project_matches(
                     association=match.description.association,
                     environment=match.description.environment,
                     field_name=match.description.field_name,
+                    facies_index=match.description.facies_index or match.description.label,
+                    facies_name=match.description.facies_name or match.description.label,
                 ))
     return annotations, columns_by_photo, orders_by_photo
 
@@ -1018,11 +1020,25 @@ def _select_core_boxes(
         region = candidate[max(0, top):min(height, bottom), max(0, left):min(width, right)]
         if region.size == 0:
             continue
+        row_occupancy = region.mean(axis=1)
+        column_occupancy = region.mean(axis=0)
         fill = float(region.mean())
-        dense_rows = float((region.mean(axis=1) >= 0.35).mean())
-        dense_columns = float((region.mean(axis=0) >= 0.22).mean())
+        dense_rows = float((row_occupancy >= 0.35).mean())
+        dense_columns = float((column_occupancy >= 0.22).mean())
+        median_row_occupancy = float(np.median(row_occupancy))
+        median_column_occupancy = float(np.median(column_occupancy))
         aspect = box_height / max(1, box_width)
-        if fill < 0.035 or dense_rows < 0.12 or dense_columns < 0.16 or aspect < 0.42:
+        # A physical core is a vertically elongated, filled lane. Thin black
+        # rules and ruler ticks can become tall connected components after the
+        # morphology/projection passes, but they occupy only a small part of
+        # the lane's rows/columns. Require sustained coverage in both axes and
+        # reject square/wide grid fragments; this still admits narrow half-core
+        # pieces because their *height* remains much greater than their width.
+        if (
+            fill < 0.08 or dense_rows < 0.28 or dense_columns < 0.28
+            or median_row_occupancy < 0.45 or median_column_occupancy < 0.45
+            or aspect < 1.25 or aspect > 45.0
+        ):
             continue
 
         narrow = box_width < width * 0.075

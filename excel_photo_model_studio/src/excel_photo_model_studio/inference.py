@@ -23,7 +23,7 @@ def analyze_photos_to_excel(
     description_model: Path | None = None,
     confidence: float = 0.25,
 ) -> dict:
-    """Apply the unified model and export the stable 22-column well description."""
+    """Apply the unified model and export facies index, full name, and short description."""
     try:
         import torch
         from ultralytics import YOLO
@@ -133,7 +133,8 @@ def analyze_photos_to_excel(
                     "core_base": float(record.base),
                     "facies_top": depth_interval[0],
                     "facies_base": depth_interval[1],
-                    "facies_name": facies,
+                    "facies_index": facies,
+                    "facies_name": reference.get("facies_name", facies),
                     "association": reference.get("association", ""),
                     "environment": reference.get("environment", ""),
                     "confidence": score,
@@ -160,7 +161,7 @@ def analyze_photos_to_excel(
                     if crop.size == 0:
                         problems.append(f"{record.path.name}: пустая вырезка интервала")
                         continue
-                    row["description"] = text_model.generate(crop, facies=row["facies_name"])
+                    row["description"] = text_model.generate(crop, facies=row["facies_index"])
                     if not row["description"]:
                         problems.append(f"{record.path.name}: модель выдала пустое краткое описание")
                         continue
@@ -191,9 +192,11 @@ def analyze_photos_to_excel(
         "rows": len(output_rows),
         "skipped_photos": skipped_photos,
         "output_excel": str(destination),
-        "target_columns": 22,
-        "facies_column": 19,
-        "description_column": 22,
+        "target_headers": {
+            "facies_index": "Индекс фации",
+            "facies_name": "Название фации",
+            "target_text": "Краткое описание",
+        },
     }
 
 

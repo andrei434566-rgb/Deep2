@@ -156,6 +156,36 @@ class VisionTests(unittest.TestCase):
 
         self.assertEqual([], detect_core_columns(image))
 
+    def test_rejects_dense_black_grid_without_core(self):
+        image = np.full((1000, 1000, 3), 255, dtype=np.uint8)
+        # Dense rules can be joined by morphology into a large rectangular
+        # component that is taller than wide. Its alternating blank rows are
+        # still unlike solid core material.
+        for y in range(100, 901, 8):
+            cv2.line(image, (250, y), (750, y), (20, 20, 20), 2)
+
+        self.assertEqual([], detect_core_columns(image))
+
+    def test_rejects_vertical_black_rule_without_core(self):
+        image = np.full((1000, 900, 3), 255, dtype=np.uint8)
+        cv2.line(image, (450, 100), (450, 900), (15, 15, 15), 3)
+
+        self.assertEqual([], detect_core_columns(image))
+
+    def test_black_depth_grid_does_not_create_extra_core_boxes(self):
+        image = np.full((1000, 1000, 3), 255, dtype=np.uint8)
+        expected_lefts = (220, 390, 560, 730)
+        for left in expected_lefts:
+            cv2.rectangle(image, (left, 100), (left + 95, 900), (125, 125, 125), -1)
+        for y in range(110, 900, 8):
+            cv2.line(image, (140, y), (900, y), (20, 20, 20), 2)
+
+        boxes = detect_core_columns(image)
+
+        self.assertEqual(4, len(boxes))
+        self.assertTrue(all(any(abs(left - expected) <= 5 for left, _, _, _ in boxes)
+                            for expected in expected_lefts))
+
     def test_column_starts_at_core_not_at_depth_number_above_it(self):
         image = np.full((1000, 700, 3), 255, dtype=np.uint8)
         cv2.putText(

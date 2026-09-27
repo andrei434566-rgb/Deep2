@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -12,9 +13,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import cv2
 import numpy as np
 from openpyxl import Workbook
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QDialog
 
-from excel_photo_model_studio.gui import MainWindow
+from excel_photo_model_studio.gui import MainWindow, StepVerificationDialog
 from excel_photo_model_studio.matching import read_photo_map, write_photo_map
 from excel_photo_model_studio.models import PhotoRecord
 from excel_photo_model_studio.project import create_project
@@ -72,6 +73,91 @@ class GuiPreviewTests(unittest.TestCase):
             report = json.loads((project / "report.json").read_text(encoding="utf-8"))
             self.assertTrue(any("длиннее вместимости найденного керна" in issue["message"] for issue in report["issues"]))
             window.close()
+
+    def test_step_verification_can_open_and_switch_the_source_workbook(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            photos = root / "photos"
+            photos.mkdir()
+
+            def make_workbook(path: Path, well: str):
+                workbook = Workbook()
+                sheet = workbook.active
+                sheet.title = "седимент"
+                sheet.append([
+                    "Скважина", "Интервал фации по бурению Кровля",
+                    "Интервал фации по бурению Подошва", "Толщина фации, м",
+                    "Код фации", "Краткое описание",
+                ])
+                sheet.append([well, 100.0, 101.0, 1.0, "Dch", f"Песчаник {well}"])
+                workbook.save(path)
+
+            first = root / "first.xlsx"
+            second = root / "second.xlsx"
+            make_workbook(first, "W-1")
+            make_workbook(second, "W-2")
+            dialog = StepVerificationDialog(first, photos, use_ocr=False)
+
+            def wait_for_excel_load():
+                deadline = time.monotonic() + 5
+                while dialog._busy() and time.monotonic() < deadline:
+                    self.application.processEvents()
+                    time.sleep(0.01)
+                self.application.processEvents()
+                self.assertFalse(dialog._busy(), "Excel worker did not finish in time")
+
+            try:
+                wait_for_excel_load()
+                self.assertEqual("W-1", dialog.rows[0].well)
+                self.assertEqual(2, dialog.raw_sheet_table.rowCount())
+                self.assertIn("Интервал фации по бурению Кровля", dialog.raw_sheet_table.item(0, 1).text())
+                self.assertIn("Кровля/начало", dialog.mapping_summary.text())
+                self.assertIn("Толщина фации", dialog.mapping_summary.text())
+
+                with patch(
+                    "excel_photo_model_studio.gui.QFileDialog.getOpenFileName",
+                    return_value=(str(second), ""),
+                ):
+                    dialog._choose_excel()
+                wait_for_excel_load()
+
+                self.assertEqual(second.resolve(), dialog.excel_path)
+                self.assertEqual(str(second.resolve()), dialog.excel_file_label.text())
+                self.assertEqual("W-2", dialog.rows[0].well)
+                self.assertIn("W-2", dialog.raw_sheet_table.item(1, 0).text())
+            finally:
+                dialog.close()
+
+    def test_workbook_selected_in_step_dialog_is_used_for_project_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.xlsx"
+            selected = root / "selected.xlsx"
+            first.write_bytes(b"placeholder")
+            selected.write_bytes(b"placeholder")
+            photos = root / "photos"
+            photos.mkdir()
+            window = MainWindow()
+            window.excel.set_value(first)
+            window.photos.set_value(photos)
+
+            class AcceptedStepDialog:
+                def __init__(self, *_args, **_kwargs):
+                    self.excel_path = selected
+                    self.photos = []
+
+                def exec(self):
+                    return QDialog.DialogCode.Accepted
+
+            try:
+                with patch("excel_photo_model_studio.gui.StepVerificationDialog", AcceptedStepDialog), \
+                        patch.object(window, "_create_project") as create_project:
+                    window._open_step_verification()
+
+                self.assertEqual(selected, window.excel.value())
+                create_project.assert_called_once_with()
+            finally:
+                window.close()
 
     def test_recalculate_retains_ocr_coordinate_basis_unless_depth_is_edited(self):
         with tempfile.TemporaryDirectory() as directory:

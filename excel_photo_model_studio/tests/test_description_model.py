@@ -14,7 +14,7 @@ from excel_photo_model_studio.description_model import DescriptionGenerator, tra
 
 
 class DescriptionModelTests(unittest.TestCase):
-    def test_trains_checkpoint_for_column_22(self):
+    def test_trains_checkpoint_with_index_name_and_short_description_targets(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             dataset = root / "dataset"
@@ -32,7 +32,7 @@ class DescriptionModelTests(unittest.TestCase):
                 (dataset / relative).write_bytes(encoded.tobytes())
                 rows.append({
                     "split": split, "crop": relative.as_posix(),
-                    "facies": "Tcr",
+                    "facies": "Tcr", "facies_index": "Tcr", "facies_name": "Песчаники",
                     "target_text": "Песчаник серый, слоистый.",
                 })
             (dataset / "caption_dataset.jsonl").write_text(
@@ -60,13 +60,21 @@ class DescriptionModelTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "обрезано"):
                 train_description_model(dataset, output, max_text_length=8)
 
-        self.assertEqual(22, checkpoint["target_column"])
-        self.assertEqual("excel-photo-description-v2", checkpoint["schema"])
+        self.assertNotIn("target_column", checkpoint)
+        self.assertEqual("excel-photo-description-v4", checkpoint["schema"])
         self.assertEqual(["Tcr"], checkpoint["facies_names"])
+        self.assertEqual(["facies_index", "facies_name", "target_text"], checkpoint["target_fields"])
+        self.assertEqual({
+            "facies_index": "Индекс фации",
+            "facies_name": "Название фации",
+            "target_text": "Краткое описание",
+        }, checkpoint["target_headers"])
+        self.assertEqual("Песчаники", checkpoint["facies_catalog"][0]["facies_name"])
         self.assertEqual(["interval_image", "facies_class"], checkpoint["conditioning"])
         self.assertEqual(5, info["train_samples"])
         self.assertEqual(1, info["val_samples"])
         self.assertEqual("cpu", info["device"])
+        self.assertNotIn("target_column", info)
 
 
 if __name__ == "__main__":

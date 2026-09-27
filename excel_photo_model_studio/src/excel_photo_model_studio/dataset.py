@@ -22,6 +22,7 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
         raise FileExistsError(f"Папка датасета уже существует: {destination}")
     rows = []
     seen_annotations = set()
+    source_target_headers = []
     for current_project in project_dirs:
         report_path = current_project / "report.json"
         if report_path.is_file():
@@ -41,6 +42,10 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
                 raise ValueError(f"{current_project.name}: есть неподтверждённые маски. Нельзя обучать на части скважины.")
             if report_path.is_file() and len(project_rows) != int(report.get("annotations", len(project_rows))):
                 raise ValueError(f"{current_project.name}: число масок не совпадает с проверенным отчётом; пересчитайте проект.")
+            if (current_project / "project.json").is_file():
+                source_target_headers.extend(
+                    _restore_facies_targets_from_excel(current_project, project_rows)
+                )
             for row in project_rows:
                 if row.get("approved") != "1":
                     continue
@@ -51,13 +56,14 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
                 rows.append(row)
     if not rows:
         raise ValueError("Нет подтверждённых масок. Проверьте previews и подтвердите строки в приложении.")
+    facies_statistics = _fresh_facies_statistics(rows)
     by_photo: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row in rows:
         _validate_annotation(row)
         by_photo[row["photo"]].append(row)
     if len(by_photo) < 2:
         raise ValueError("Нужно минимум два разных фото: одно фото нельзя одновременно использовать для train и val.")
-    labels = sorted({row["label"] for row in rows}, key=str.casefold)
+    labels = [item["facies_index"] for item in facies_statistics]
     class_ids = {label: index for index, label in enumerate(labels)}
     content_ids = {}
     for photo_name in by_photo:
@@ -95,7 +101,7 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
                 f"{max(0.0, min(1.0, float(x) / width)):.6f} {max(0.0, min(1.0, float(y) / height)):.6f}"
                 for x, y in polygon
             )
-            lines.append(f"{class_ids[row['label']]} {coords}")
+            lines.append(f"{class_ids[row['facies_index']]} {coords}")
             target_text = row.get("target_text", "").strip()
             if target_text:
                 xs = [float(point[0]) for point in polygon]
@@ -115,7 +121,8 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
                     "crop": str(crop_path.relative_to(destination).as_posix()),
                     "source_photo": str(photo), "source_sha256": digest,
                     "well": row.get("well", ""), "depth_top": float(row["depth_top"]),
-                    "depth_base": float(row["depth_base"]), "facies": row["label"],
+                    "depth_base": float(row["depth_base"]), "facies": row["facies_index"],
+                    "facies_index": row["facies_index"], "facies_name": row["facies_name"],
                     "association": row.get("association", ""), "environment": row.get("environment", ""),
                     "field_name": row.get("field_name", ""),
                     "target_text": target_text, "source_file": row.get("source_file", ""),
@@ -140,10 +147,13 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
         *(f"  {index}: {json.dumps(label, ensure_ascii=False)}" for index, label in enumerate(labels)), "",
     )), encoding="utf-8")
     manifest = {
-        "schema": "excel-photo-yolo-seg-v1", "created_at": datetime.now().isoformat(timespec="seconds"),
+        "schema": "excel-photo-yolo-seg-v2", "created_at": datetime.now().isoformat(timespec="seconds"),
         "project": str(project_dirs[0]) if len(project_dirs) == 1 else "",
         "projects": [str(path) for path in project_dirs], "project_count": len(project_dirs),
         "data_yaml": str(yaml_path), "class_names": labels,
+        "facies_statistics": facies_statistics,
+        "facies_count": len(facies_statistics),
+        "source_target_headers": source_target_headers,
         "photo_count": len(by_photo), "annotation_count": len(rows), "split_strategy": strategy,
         "caption_count": len(caption_samples),
         "train_caption_count": sum(item["split"] == "train" for item in caption_samples),
@@ -151,10 +161,108 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
         "caption_dataset": str(caption_path),
         "train_photo_count": sum(value == "train" for value in split_by_photo.values()),
         "val_photo_count": sum(value == "val" for value in split_by_photo.values()),
-        "class_counts": dict(Counter(row["label"] for row in rows)), "samples": samples,
+        "class_counts": {item["facies_index"]: item["mask_count"] for item in facies_statistics},
+        "samples": samples,
     }
     (destination / "dataset_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return {**manifest, "output_dir": str(destination)}
+
+
+def _fresh_facies_statistics(rows: list[dict[str, str]]) -> list[dict[str, str | int]]:
+    """Reset class ids for this dataset and derive the taxonomy only from its Excel annotations."""
+    by_key: dict[str, dict] = {}
+    for row in rows:
+        index = (
+            " ".join(str(row.get("facies_index", "")).split())
+            or " ".join(str(row.get("label", "")).split())
+            or " ".join(str(row.get("facies_name", "")).split())
+        )
+        name = " ".join(str(row.get("facies_name", "")).split()) or index
+        if not index:
+            raise ValueError(f"У маски {row.get('annotation_id', '')} нет индекса фации.")
+        key = index.casefold()
+        known = by_key.get(key)
+        if known is not None and known["facies_name"].casefold() != name.casefold():
+            raise ValueError(
+                f"Индекс фации «{known['facies_index']}» связан с разными названиями: "
+                f"«{known['facies_name']}» и «{name}». Исправьте строки Excel до обучения."
+            )
+        if known is None:
+            known = {
+                "facies_index": index, "facies_name": name,
+                "mask_count": 0, "description_count": 0,
+            }
+            by_key[key] = known
+        known["mask_count"] += 1
+        known["description_count"] += bool(str(row.get("target_text", "")).strip())
+        # The segmentation class is reset to this dataset's Excel facies index.
+        row["facies_index"] = known["facies_index"]
+        row["facies_name"] = known["facies_name"]
+        row["label"] = known["facies_index"]
+    return sorted(by_key.values(), key=lambda item: str(item["facies_index"]).casefold())
+
+
+def _restore_facies_targets_from_excel(project: Path, annotations: list[dict[str, str]]) -> list[dict]:
+    config_path = project / "project.json"
+    if not config_path.is_file():
+        return []
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    excel_paths = config.get("excel_paths") or ([config["excel_path"]] if config.get("excel_path") else [])
+    if not excel_paths:
+        return []
+    from .tabular import read_many_tables
+    excel_rows, mappings, issues, _ = read_many_tables(
+        [Path(value) for value in excel_paths], project / "column_mapping.json",
+    )
+
+    def source_key(source_file, sheet, row_number):
+        if not str(source_file or "").strip():
+            return None
+        try:
+            source = str(Path(source_file).expanduser().resolve(strict=True)).casefold()
+            row = str(int(row_number))
+        except (OSError, TypeError, ValueError):
+            return None
+        return source, " ".join(str(sheet).casefold().split()), row
+
+    by_source = {
+        source_key(row.source_file, row.sheet, row.row): row
+        for row in excel_rows if source_key(row.source_file, row.sheet, row.row) is not None
+    }
+    missing_before = sum(not row.get("facies_index") or not row.get("facies_name") for row in annotations)
+    restored = 0
+    for annotation in annotations:
+        key = source_key(
+            annotation.get("source_file", ""), annotation.get("source_sheet", ""),
+            annotation.get("source_row", ""),
+        )
+        source_row = by_source.get(key)
+        if source_row is None:
+            continue
+        index = source_row.facies_index or source_row.label
+        name = source_row.facies_name or source_row.label or index
+        if not annotation.get("facies_index") or not annotation.get("facies_name"):
+            restored += 1
+        annotation["facies_index"] = index
+        annotation["facies_name"] = name
+        annotation["label"] = index
+    if restored < missing_before:
+        raise ValueError(
+            f"{project.name}: для {missing_before - restored} масок не удалось восстановить индекс/название фации "
+            "из исходного Excel по номеру строки. Пересчитайте проект и проверьте привязку Excel."
+        )
+    return [
+        {
+            "project": project.name, "source_file": item.source_file, "sheet": item.sheet,
+            "facies_index": item.source_headers.get("class_index")
+            or item.source_headers.get("class_code") or item.source_headers.get("label", ""),
+            "facies_name": item.source_headers.get("label")
+            or item.source_headers.get("class_code") or item.source_headers.get("class_index", ""),
+            "target_text": item.source_headers.get("target_text")
+            or item.source_headers.get("description", ""),
+        }
+        for item in mappings if item.class_index or item.label or item.target_text
+    ]
 
 
 def _validate_annotation(row: dict[str, str]) -> None:
