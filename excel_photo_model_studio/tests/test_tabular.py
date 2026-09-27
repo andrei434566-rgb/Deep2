@@ -37,6 +37,60 @@ class TableReaderTests(unittest.TestCase):
         self.assertEqual((100.0, 101.25), (rows[0].top, rows[0].base))
         self.assertEqual([], [item for item in issues if item.severity == "error"])
 
+    def test_header_group_in_first_three_rows_can_have_subheaders_on_row_four(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "row_four_subheader.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "седимент"
+            sheet["A1"] = "Послойное описание керна"
+            sheet["A3"] = "Скважина"
+            sheet["B3"] = "Интервал фации по бурению, м"
+            sheet.merge_cells("B3:C3")
+            sheet["D3"] = "Индекс фации"
+            sheet["E3"] = "Краткое описание"
+            sheet["B4"] = "Кровля"
+            sheet["C4"] = "Подошва"
+            sheet.append([1, 2, 3, 4, 5])  # Excel's column-number ruler
+            sheet.append(["W-1", 4105.0, 4105.25, "Dch", "Песчаник серый."])
+            workbook.save(path)
+
+            rows, mappings, issues = read_table(path)
+
+        self.assertEqual(4, mappings[0].header_row)
+        self.assertEqual((2, 3), (mappings[0].top, mappings[0].base))
+        self.assertEqual(1, len(rows))
+        self.assertEqual((4105.0, 4105.25), (rows[0].top, rows[0].base))
+        self.assertEqual("Dch", rows[0].facies_index)
+        self.assertEqual("Песчаник серый.", rows[0].target_text)
+        self.assertFalse([issue for issue in issues if issue.severity == "error"])
+
+    def test_multilevel_header_can_span_five_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "five_row_header.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "седимент"
+            sheet["A1"] = "Скважина"
+            sheet["B1"] = "Интервал фации по бурению, м"
+            sheet.merge_cells("B1:C1")
+            sheet["D1"] = "Индекс фации"
+            sheet["E1"] = "Краткое описание"
+            sheet["B5"] = "Кровля"
+            sheet["C5"] = "Подошва"
+            sheet.append([1, 2, 3, 4, 5])  # Excel's column-number ruler on row 6
+            sheet.append(["W-1", 4105.0, 4105.25, "Dch", "Песчаник серый."])
+            workbook.save(path)
+
+            rows, mappings, issues = read_table(path)
+
+        self.assertEqual(5, mappings[0].header_row)
+        self.assertEqual((2, 3), (mappings[0].top, mappings[0].base))
+        self.assertEqual(1, len(rows))
+        self.assertEqual((4105.0, 4105.25), (rows[0].top, rows[0].base))
+        self.assertEqual("Dch", rows[0].facies_index)
+        self.assertFalse([issue for issue in issues if issue.severity == "error"])
+
     def test_missing_excel_formula_cache_is_recalculated_on_a_temporary_copy(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "formula_values.xlsx"

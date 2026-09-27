@@ -38,7 +38,8 @@ ROLE_ALIASES: dict[str, tuple[str, ...]] = {
     "field_name": ("месторожд", "площадь", "field", "site", "object"),
 }
 
-HEADER_SCAN_ROWS = 3
+HEADER_SCAN_ROWS = 5
+HEADER_CONTINUATION_ROWS = 4
 
 
 class _UncachedFormula:
@@ -243,7 +244,13 @@ def detect_mapping(sheet: str, rows: list[list[Any]]) -> ColumnMapping:
     header_row = 1
     first_header_row = 1
     header_started = False
-    for index, row in enumerate(rows[:HEADER_SCAN_ROWS], start=1):
+    # Look for the first/header-group row in the first five rows and allow a
+    # multi-row header block to span five rows total. Real workbooks may have
+    # a title and notes above grouped intervals, with "Кровля / Подошва"
+    # several rows below the parent heading. Restricting the entire header to
+    # the initial scan window makes those columns collapse into one interval.
+    scan_limit = min(len(rows), HEADER_SCAN_ROWS + HEADER_CONTINUATION_ROWS)
+    for index, row in enumerate(rows[:scan_limit], start=1):
         nonempty = [normalize_text(value) for value in row if display_text(value)]
         if len(nonempty) > 1 and len(set(nonempty)) == 1:
             # A merged document title copied across the sheet must not add
@@ -256,11 +263,17 @@ def detect_mapping(sheet: str, rows: list[list[Any]]) -> ColumnMapping:
             if _score(display_text(value), role) >= 100
         }
         structural = hits & {"well", "interval", "top", "base", "core_top", "core_base", "label", "class_code", "class_index"}
-        starts_header = len(structural) >= 2 or (
-            bool(structural & {"interval", "top", "base", "core_top", "core_base"})
-            and bool(structural & {"well", "label", "class_code", "class_index"})
+        starts_header = index <= HEADER_SCAN_ROWS and (
+            len(structural) >= 2 or (
+                bool(structural & {"interval", "top", "base", "core_top", "core_base"})
+                and bool(structural & {"well", "label", "class_code", "class_index"})
+            )
         )
-        continues_header = header_started and index <= header_row + 2 and len(structural) >= 2
+        continues_header = (
+            header_started
+            and index <= first_header_row + HEADER_CONTINUATION_ROWS
+            and len(structural) >= 2
+        )
         if starts_header or continues_header:
             if not header_started:
                 first_header_row = index
@@ -405,7 +418,13 @@ def read_many_tables(
         all_mappings.extend(mappings)
         all_issues.extend(issues)
     if not all_rows:
-        raise ValueError("Ни в одном файле не найдены пригодные строки описания.")
+        details = "; ".join(
+            f"{item.source}: {item.message}"
+            for item in all_issues[:8]
+            if item.severity == "error"
+        )
+        suffix = f" Причины: {details}" if details else " Проверьте распознанные заголовки и содержимое листов."
+        raise ValueError("Ни в одном файле не найдены пригодные строки описания." + suffix)
     all_rows.sort(key=lambda item: (well_key(item.well), item.top, item.base, item.source_id))
     return all_rows, all_mappings, all_issues, files
 
