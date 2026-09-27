@@ -79,7 +79,7 @@ def _matches_for_basis(photo: PhotoRecord, rows: list[DescriptionRow], basis: st
                 continue
             span_cm = meters_to_centimeters(row.gis_base) - meters_to_centimeters(row.gis_top)
             if row.thickness_declared and row.thickness is not None:
-                if abs(meters_to_centimeters(row.thickness) - span_cm) > 1:
+                if meters_to_centimeters(row.thickness) != span_cm:
                     continue
             selected = replace(
                 row, top=row.gis_top, base=row.gis_base, thickness_valid=True,

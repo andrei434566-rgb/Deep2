@@ -73,6 +73,30 @@ class VisionTests(unittest.TestCase):
         ys = [point[1] for point in annotations[0].polygon]
         self.assertGreaterEqual(max(ys) - min(ys), 2.0)
 
+    def test_project_matches_reuses_the_columns_confirmed_in_the_wizard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            photo_path = Path(directory) / "W-1 100-101.jpg"
+            image = np.full((800, 600, 3), 255, dtype=np.uint8)
+            cv2.rectangle(image, (80, 100), (180, 700), (115, 115, 115), -1)
+            cv2.rectangle(image, (250, 100), (350, 700), (115, 115, 115), -1)
+            ok, encoded = cv2.imencode(".jpg", image)
+            self.assertTrue(ok)
+            photo_path.write_bytes(encoded.tobytes())
+            photo = PhotoRecord(photo_path, "W-1", 100, 101, "manual", True)
+            row = DescriptionRow("W-1", 100, 100.25, "Dch", "Data", 2)
+            confirmed = [(81, 102, 179, 699), (251, 102, 349, 699)]
+
+            with patch.object(vision, "detect_core_columns", side_effect=AssertionError("redetection happened")), \
+                    patch.object(vision, "detect_core_columns_from_path", side_effect=AssertionError("redetection happened")):
+                annotations, columns, _orders = project_matches(
+                    [Match(photo, row, 100, 100.25)],
+                    detected_columns_by_photo={photo_path: confirmed},
+                )
+
+        self.assertEqual(confirmed, columns[photo_path])
+        self.assertEqual(1, len(annotations))
+        self.assertEqual(81, min(x for x, _y in annotations[0].polygon))
+
     def test_rejects_narrow_ruler_beside_three_core_columns(self):
         image = np.full((1000, 800, 3), (25, 90, 160), dtype=np.uint8)
         cv2.rectangle(image, (70, 80), (90, 900), (120, 120, 120), -1)

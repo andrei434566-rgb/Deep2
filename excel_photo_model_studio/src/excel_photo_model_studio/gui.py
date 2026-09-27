@@ -26,9 +26,9 @@ from .models import (
     PhotoRecord, normalize_column_order,
 )
 from .photos import discover_photos, enrich_core_column_depths
-from .project import load_annotations, set_annotation_approvals
+from .project import load_annotations, set_annotation_approvals, write_verified_columns
 from .tabular import as_float, read_many_tables, read_workbook_sheets
-from .vision import detect_core_columns_from_path, project_matches
+from .vision import detect_column_order, detect_core_columns_from_path, project_matches, read_image
 
 
 class PathField(QWidget):
@@ -219,6 +219,7 @@ class StepVerificationDialog(QDialog):
         self.photos_dir = Path(photos_dir)
         self.use_ocr = bool(use_ocr)
         self._excel_ready = False
+        self._pending_excel_path: Path | None = None
         self.setWindowTitle("Пошаговая сверка Excel → фото → маски")
         self.resize(1180, 820)
         self._worker: _DiagnosticWorker | None = None
@@ -438,7 +439,10 @@ class StepVerificationDialog(QDialog):
         self.pages.setCurrentIndex(stage)
         self.back_button.setEnabled(stage > 0 and stage < 5 and not self._busy())
         self.excel_picker_button.setVisible(stage == 0)
-        self.excel_picker_button.setEnabled(stage == 0 and not self._busy())
+        # Keep workbook switching available while the initial workbook is
+        # loading; users can select a replacement without waiting for a slow
+        # or malformed source file to finish parsing.
+        self.excel_picker_button.setEnabled(stage == 0)
         self.issue_button.setVisible(stage < 5)
         self.action_button.setVisible(stage < 5 or not self._failure)
         self.cancel_button.setText("Закрыть")
@@ -485,7 +489,7 @@ class StepVerificationDialog(QDialog):
             return
         self.status.setText(message)
         self.action_button.setEnabled(False)
-        self.excel_picker_button.setEnabled(False)
+        self.excel_picker_button.setEnabled(self._stage == 0)
         self.back_button.setEnabled(False)
         self.issue_button.setEnabled(False)
         self.cancel_button.setEnabled(False)
@@ -504,9 +508,19 @@ class StepVerificationDialog(QDialog):
         self.cancel_button.setEnabled(True)
         callback(result)
         self._set_stage(self._stage)
+        pending_path = self._pending_excel_path
+        self._pending_excel_path = None
+        if pending_path is not None:
+            self._load_excel_file(pending_path)
 
     def _async_failed(self, message: str) -> None:
         self._worker = None
+        pending_path = self._pending_excel_path
+        self._pending_excel_path = None
+        if pending_path is not None:
+            self.status.setText("Заменяю исходную книгу и повторно читаю выбранный Excel…")
+            self._load_excel_file(pending_path)
+            return
         self.action_button.setEnabled(self._stage != 0 or self._excel_ready)
         self.excel_picker_button.setEnabled(self._stage == 0)
         self.back_button.setEnabled(0 < self._stage < 5)
@@ -516,16 +530,24 @@ class StepVerificationDialog(QDialog):
         QMessageBox.critical(self, "Ошибка пошаговой сверки", message)
 
     def _choose_excel(self) -> None:
-        if self._busy() or self._stage != 0:
+        if self._stage != 0:
             return
         selected, _ = QFileDialog.getOpenFileName(
             self,
             "Выберите книгу Excel или таблицу CSV",
             str(self.excel_path.parent),
             "Таблицы (*.xlsx *.xlsm *.xltx *.xltm *.xls *.csv *.tsv);;Все файлы (*)",
+            options=QFileDialog.Options(QFileDialog.Option.DontUseNativeDialog),
         )
         if selected:
-            self._load_excel_file(Path(selected))
+            selected_path = Path(selected)
+            if self._busy():
+                self._pending_excel_path = selected_path
+                self.status.setText(
+                    f"Выбрана новая книга {selected_path.name}; текущая операция завершится, затем откроется выбранный Excel."
+                )
+            else:
+                self._load_excel_file(selected_path)
 
     def _load_excel_file(self, path: Path) -> None:
         if self._busy() or self._stage != 0:
@@ -993,11 +1015,40 @@ class StepVerificationDialog(QDialog):
 
     def _project_confirmed_matches(self, progress):
         progress("Проецирую интервалы фаций на физические столбики керна…")
-        annotations, columns, orders = project_matches(self.matches)
+        unverified = [
+            photo.path.name for photo in self.photos
+            if photo.path not in self.column_confirmed or not self.columns.get(photo.path)
+        ]
+        if unverified:
+            raise ValueError(
+                "Нельзя строить маски: не подтверждены распознанные столбики для "
+                + ", ".join(unverified)
+            )
+        annotations, columns, orders = project_matches(
+            self.matches, detected_columns_by_photo=self.columns,
+        )
+        # Include photos without facies matches too: their confirmed core boxes
+        # must survive project creation and must not be detected a second time.
+        for photo in self.photos:
+            if photo.path in orders:
+                continue
+            boxes = sorted(self.columns[photo.path], key=lambda box: (box[0], box[1]))
+            image = read_image(photo.path)
+            requested = normalize_column_order(photo.column_order)
+            order = detect_column_order(image, boxes) if requested == COLUMN_ORDER_AUTO else requested
+            if order == COLUMN_ORDER_RIGHT_TO_LEFT:
+                boxes.reverse()
+            columns[photo.path] = boxes
+            orders[photo.path] = order
         return annotations, columns, orders
 
     def _projection_loaded(self, result) -> None:
         self.annotations, self.projected_columns, self.orders = result
+        self.photos = [
+            replace(photo, column_order=self.orders.get(photo.path, photo.column_order))
+            for photo in self.photos
+        ]
+        self._confirmed_photos = self.photos
         self.mask_confirmed.clear()
         self._current_photo = 0
         self.audit.append(f"Проекция: создано участков-масок: {len(self.annotations)}.")
@@ -1144,7 +1195,7 @@ class StepVerificationDialog(QDialog):
             lines.extend(("", self._failure, "Исправьте указанный этап и запустите сверку заново."))
         else:
             lines.extend((
-                "", "Следующий шаг запустит стандартное создание проекта с теми же исходными Excel и фото.",
+                "", "Следующий шаг создаст проект и перенесёт в него подтверждённые глубины, рамки керна и порядок столбиков.",
                 "Пошаговая сверка — диагностика: найденные здесь расхождения перечислены выше и не скрываются автоматическим переходом к обучению.",
             ))
         self.summary_text.setPlainText("\n".join(lines))
@@ -1164,6 +1215,8 @@ class MainWindow(QMainWindow):
         self.resize(1180, 760)
         self.current_project: Path | None = None
         self._pending_verified_photo_records: list[PhotoRecord] | None = None
+        self._pending_verified_columns: dict[Path, list[tuple[int, int, int, int]]] | None = None
+        self._pending_verified_orders: dict[Path, str] | None = None
         self.matching_preview_paths: dict[str, str] = {}
         self.matching_preview_details: dict[str, list[str]] = {}
         self.matching_preview_regions: dict[str, list[dict]] = {}
@@ -1557,6 +1610,14 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.excel.set_value(dialog.excel_path)
             self._pending_verified_photo_records = list(dialog.photos)
+            self._pending_verified_columns = {
+                photo.path: list(dialog.columns[photo.path])
+                for photo in dialog.photos
+            }
+            self._pending_verified_orders = {
+                photo.path: dialog.orders[photo.path]
+                for photo in dialog.photos
+            }
             self._create_project()
 
     def _load_photo_map(self) -> None:
@@ -1697,6 +1758,8 @@ class MainWindow(QMainWindow):
         self.project_progress.setVisible(False)
         if code != 0:
             self._pending_verified_photo_records = None
+            self._pending_verified_columns = None
+            self._pending_verified_orders = None
             return self._error("Обработка не завершена. Подробности показаны в журнале.")
         try:
             project_dir = self._project_dir()
@@ -1706,9 +1769,15 @@ class MainWindow(QMainWindow):
         if self._pending_project_action == "create" and self._pending_verified_photo_records is not None:
             try:
                 write_photo_map(project_dir / "photo_map.csv", self._pending_verified_photo_records)
+                if self._pending_verified_columns is not None and self._pending_verified_orders is not None:
+                    write_verified_columns(
+                        project_dir, self._pending_verified_columns, self._pending_verified_orders,
+                    )
             except Exception as exc:
                 return self._error(f"Не удалось перенести подтверждённые интервалы в проект: {exc}")
             self._pending_verified_photo_records = None
+            self._pending_verified_columns = None
+            self._pending_verified_orders = None
             self.matching_preview_paths.clear()
             self.matching_preview_details.clear()
             self.matching_preview_regions.clear()
@@ -1749,6 +1818,7 @@ class MainWindow(QMainWindow):
             f"Нужно подтвердить интервалы: {report['unconfirmed_photos']}",
             f"Фото без обязательного интервала: {report.get('photos_without_intervals', 0)}",
             f"Фото без распознанного керна: {report.get('photos_without_core_columns', 0)}",
+            f"Рамки керна, перенесённые из пошаговой проверки: {report.get('verified_column_photos', 0)} фото",
             f"Фото с найденными фациями: {report.get('photos_with_facies', 0)} из {report.get('photos', 0)}",
             f"Фото без масок в датасете: {report.get('photos_without_masks', 0)}",
             f"Полный список фото и причин пропуска: {report.get('photo_inventory', 'photo_inventory.csv')}",

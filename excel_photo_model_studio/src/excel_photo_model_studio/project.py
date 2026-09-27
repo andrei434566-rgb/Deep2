@@ -65,6 +65,31 @@ def create_project(
     return refresh_project(project_dir)
 
 
+def write_verified_columns(
+    project_dir: Path,
+    columns_by_photo: dict[Path, list[tuple[int, int, int, int]]],
+    orders_by_photo: dict[Path, str],
+) -> Path:
+    """Persist the exact core boxes a user reviewed in the guided workflow.
+
+    The file fingerprint prevents stale coordinates from being silently reused
+    if an image is replaced at the same path later.
+    """
+    payload = {"schema": "verified-core-columns-v1", "photos": {}}
+    for source_path, boxes in columns_by_photo.items():
+        path = Path(source_path).expanduser().resolve(strict=True)
+        stat = path.stat()
+        payload["photos"][str(path)] = {
+            "size_bytes": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "order": normalize_column_order(orders_by_photo.get(source_path, "auto")),
+            "boxes": [list(map(int, box)) for box in boxes],
+        }
+    destination = Path(project_dir) / "verified_columns.json"
+    _write_json(destination, payload)
+    return destination
+
+
 def refresh_project(project_dir: Path) -> dict:
     project_dir = Path(project_dir).expanduser().resolve(strict=True)
     config = _read_project(project_dir)
@@ -92,6 +117,15 @@ def refresh_project(project_dir: Path) -> dict:
             and row.core_base > row.core_top
         }))
         photo_records = enrich_core_column_depths(photo_records, core_intervals)
+    verified_columns, verified_column_issues = _load_verified_columns(project_dir, photo_records)
+    verified_orders = {
+        path: entry["order"] for path, entry in verified_columns.items()
+    }
+    if verified_orders:
+        photo_records = [
+            replace(photo, column_order=verified_orders.get(photo.path, photo.column_order))
+            for photo in photo_records
+        ]
     photos = suggest_missing_intervals(photo_records, rows)
     old_approvals = _existing_approvals(project_dir / "annotations.csv")
     confirmed = [photo for photo in photos if photo.mapping_confirmed]
@@ -115,6 +149,9 @@ def refresh_project(project_dir: Path) -> dict:
     annotations, columns, orders = project_matches(
         matches, capacities_by_photo=capacity_by_path,
         depth_ranges_by_photo=depth_ranges_by_path,
+        detected_columns_by_photo={
+            path: entry["boxes"] for path, entry in verified_columns.items()
+        },
     )
     # Every selected image is required to be a core photo. Detect columns even
     # when its depth or Excel match is missing, so it cannot disappear silently
@@ -123,9 +160,15 @@ def refresh_project(project_dir: Path) -> dict:
         if photo.path in columns:
             continue
         try:
-            columns[photo.path] = detect_core_columns_from_path(photo.path)
             image = read_image(photo.path)
-            requested_order = normalize_column_order(photo.column_order)
+            verified = verified_columns.get(photo.path)
+            columns[photo.path] = (
+                list(verified["boxes"])
+                if verified is not None else detect_core_columns_from_path(photo.path)
+            )
+            requested_order = normalize_column_order(
+                verified["order"] if verified is not None else photo.column_order
+            )
             if requested_order == COLUMN_ORDER_AUTO:
                 order = detect_column_order(image, columns[photo.path])
             else:
@@ -173,6 +216,7 @@ def refresh_project(project_dir: Path) -> dict:
         }
     _write_json(project_dir / "detected_columns.json", detected_payload)
     all_issues = list(issues)
+    all_issues.extend(verified_column_issues)
     projection_issues = _projection_issues(photos, annotations, columns, depth_ranges_by_path)
     all_issues.extend(projection_issues)
     facies_mask_gaps = _facies_mask_gaps(rows, annotations)
@@ -283,6 +327,7 @@ def refresh_project(project_dir: Path) -> dict:
             not photo.mapping_confirmed or not photo.has_interval for photo in photos
         ),
         "photos_without_core_columns": len(photos_without_core),
+        "verified_column_photos": len(verified_columns),
         "matches": len(matches),
         "annotations": len(annotations),
         "photos_with_facies": len(photos_with_facies),
@@ -511,6 +556,9 @@ def _validation_snapshot(project_dir: Path, config: dict, photos) -> dict:
     paths = [Path(path) for path in config.get("excel_paths", ())]
     paths += [photo.path for photo in photos]
     paths += [project_dir / name for name in ("annotations.csv", "photo_map.csv", "column_mapping.json", "detected_columns.json")]
+    verified_columns = project_dir / "verified_columns.json"
+    if verified_columns.is_file():
+        paths.append(verified_columns)
     return {
         "files": {str(path.resolve()): _file_stamp(path) for path in paths},
         "photos_dir": config["photos_dir"],
@@ -543,6 +591,60 @@ def _read_project(project_dir: Path) -> dict:
     if config.get("schema") != PROJECT_SCHEMA:
         raise ValueError("Неизвестная версия проекта.")
     return config
+
+
+def _load_verified_columns(project_dir: Path, photos: list[PhotoRecord]):
+    """Load reviewed boxes only when the exact source image is unchanged."""
+    source = Path(project_dir) / "verified_columns.json"
+    if not source.is_file():
+        return {}, []
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        entries = payload.get("photos", {})
+        if payload.get("schema") != "verified-core-columns-v1" or not isinstance(entries, dict):
+            raise ValueError("неизвестный формат файла подтверждённых столбиков")
+    except (OSError, ValueError, TypeError) as exc:
+        return {}, [Issue("warning", source.name, f"Файл подтверждённых столбиков не прочитан: {exc}.")]
+
+    available = {photo.path.resolve(): photo.path for photo in photos}
+    result = {}
+    issues = []
+    for source_path, entry in entries.items():
+        try:
+            original_path = Path(source_path).expanduser().resolve(strict=True)
+            photo_path = available.get(original_path)
+            if photo_path is None:
+                continue
+            stat = original_path.stat()
+            if stat.st_size != int(entry["size_bytes"]) or stat.st_mtime_ns != int(entry["mtime_ns"]):
+                issues.append(Issue(
+                    "warning", photo_path.name,
+                    "Фото изменилось после пошаговой проверки; подтверждённые рамки керна не применены, "
+                    "для этого файла запущено повторное распознавание.",
+                ))
+                continue
+            image = read_image(photo_path)
+            height, width = image.shape[:2]
+            boxes = []
+            for raw_box in entry["boxes"]:
+                if len(raw_box) != 4:
+                    raise ValueError("рамка должна содержать четыре координаты")
+                left, top, right, bottom = (int(value) for value in raw_box)
+                if not (0 <= left < right <= width and 0 <= top < bottom <= height):
+                    raise ValueError("рамка выходит за пределы исходного фото")
+                boxes.append((left, top, right, bottom))
+            if not boxes:
+                raise ValueError("список рамок пуст")
+            result[photo_path] = {
+                "boxes": boxes,
+                "order": normalize_column_order(entry.get("order", "auto")),
+            }
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            issues.append(Issue(
+                "warning", Path(source_path).name,
+                f"Подтверждённые рамки керна не применены: {exc}; будет использовано распознавание.",
+            ))
+    return result, issues
 
 
 def _annotation_revision(item) -> str:

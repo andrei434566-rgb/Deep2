@@ -13,7 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import cv2
 import numpy as np
 from openpyxl import Workbook
-from PySide6.QtWidgets import QApplication, QDialog
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog
 
 from excel_photo_model_studio.gui import MainWindow, StepVerificationDialog
 from excel_photo_model_studio.matching import read_photo_map, write_photo_map
@@ -117,14 +117,66 @@ class GuiPreviewTests(unittest.TestCase):
                 with patch(
                     "excel_photo_model_studio.gui.QFileDialog.getOpenFileName",
                     return_value=(str(second), ""),
-                ):
+                ) as choose_file:
                     dialog._choose_excel()
+                self.assertEqual(
+                    QFileDialog.Options(QFileDialog.Option.DontUseNativeDialog),
+                    choose_file.call_args.kwargs["options"],
+                )
                 wait_for_excel_load()
 
                 self.assertEqual(second.resolve(), dialog.excel_path)
                 self.assertEqual(str(second.resolve()), dialog.excel_file_label.text())
                 self.assertEqual("W-2", dialog.rows[0].well)
                 self.assertIn("W-2", dialog.raw_sheet_table.item(1, 0).text())
+            finally:
+                dialog.close()
+
+    def test_step_workbook_picker_stays_available_during_initial_load(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            photos = root / "photos"
+            photos.mkdir()
+
+            def make_workbook(path: Path, well: str):
+                workbook = Workbook()
+                sheet = workbook.active
+                sheet.append([
+                    "Скважина", "Интервал фации по бурению Кровля",
+                    "Интервал фации по бурению Подошва", "Толщина фации, м",
+                    "Индекс фации", "Название фации", "Краткое описание",
+                ])
+                sheet.append([well, 100.0, 101.0, 1.0, "Dch", "Каналы", f"Описание {well}"])
+                workbook.save(path)
+
+            first, second = root / "first.xlsx", root / "second.xlsx"
+            make_workbook(first, "W-1")
+            make_workbook(second, "W-2")
+            dialog = StepVerificationDialog(first, photos, use_ocr=False)
+            try:
+                self.assertTrue(dialog.excel_picker_button.isEnabled())
+                with patch(
+                    "excel_photo_model_studio.gui.QFileDialog.getOpenFileName",
+                    return_value=(str(second), ""),
+                ) as choose_file:
+                    dialog._choose_excel()
+                self.assertEqual(
+                    QFileDialog.Options(QFileDialog.Option.DontUseNativeDialog),
+                    choose_file.call_args.kwargs["options"],
+                )
+                self.assertEqual(second, dialog._pending_excel_path)
+
+                deadline = time.monotonic() + 5
+                while (dialog._busy() or dialog._pending_excel_path is not None) and time.monotonic() < deadline:
+                    self.application.processEvents()
+                    time.sleep(0.01)
+                self.application.processEvents()
+
+                self.assertFalse(dialog._busy(), "Excel workers did not finish in time")
+                self.assertEqual(second.resolve(), dialog.excel_path)
+                self.assertEqual("W-2", dialog.rows[0].well)
+                self.assertEqual("Каналы", dialog.rows[0].facies_name)
+                self.assertEqual("Описание W-2", dialog.rows[0].target_text)
             finally:
                 dialog.close()
 
@@ -137,6 +189,9 @@ class GuiPreviewTests(unittest.TestCase):
             selected.write_bytes(b"placeholder")
             photos = root / "photos"
             photos.mkdir()
+            photo = photos / "core.jpg"
+            confirmed_record = PhotoRecord(photo, "W-1", 100.0, 101.0, "manual", True)
+            confirmed_boxes = [(10, 20, 80, 220)]
             window = MainWindow()
             window.excel.set_value(first)
             window.photos.set_value(photos)
@@ -144,7 +199,9 @@ class GuiPreviewTests(unittest.TestCase):
             class AcceptedStepDialog:
                 def __init__(self, *_args, **_kwargs):
                     self.excel_path = selected
-                    self.photos = []
+                    self.photos = [confirmed_record]
+                    self.columns = {photo: confirmed_boxes}
+                    self.orders = {photo: "left_to_right"}
 
                 def exec(self):
                     return QDialog.DialogCode.Accepted
@@ -155,6 +212,9 @@ class GuiPreviewTests(unittest.TestCase):
                     window._open_step_verification()
 
                 self.assertEqual(selected, window.excel.value())
+                self.assertEqual([confirmed_record], window._pending_verified_photo_records)
+                self.assertEqual({photo: confirmed_boxes}, window._pending_verified_columns)
+                self.assertEqual({photo: "left_to_right"}, window._pending_verified_orders)
                 create_project.assert_called_once_with()
             finally:
                 window.close()

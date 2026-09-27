@@ -16,11 +16,52 @@ from excel_photo_model_studio.matching import read_photo_map
 from excel_photo_model_studio.models import DescriptionRow, Match, PhotoRecord
 from excel_photo_model_studio.project import (
     _write_facies_inventory, create_project, load_annotations,
-    refresh_project, set_annotation_approvals,
+    refresh_project, set_annotation_approvals, write_verified_columns,
 )
 
 
 class ProjectFlowTests(unittest.TestCase):
+    def test_refresh_reuses_guided_core_boxes_instead_of_running_detector_again(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            excel = root / "description.xlsx"
+            photos = root / "photos"
+            photos.mkdir()
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["Скважина", "Кровля", "Подошва", "Толщина фации", "Код", "Краткое описание"])
+            sheet.append(["W-1", 100.0, 101.0, 1.0, "Dch", "Каналы"])
+            workbook.save(excel)
+
+            image = np.full((240, 180, 3), 255, dtype=np.uint8)
+            cv2.rectangle(image, (50, 20), (125, 220), (100, 100, 100), -1)
+            ok, encoded = cv2.imencode(".jpg", image)
+            self.assertTrue(ok)
+            photo = photos / "W-1 100.00-101.00.jpg"
+            photo.write_bytes(encoded.tobytes())
+
+            project = root / "project"
+            create_project(excel, photos, project)
+            confirmed_boxes = [(45, 18, 130, 222)]
+            write_verified_columns(
+                project, {photo: confirmed_boxes}, {photo: "left_to_right"},
+            )
+
+            with patch(
+                "excel_photo_model_studio.project.detect_core_columns_from_path",
+                side_effect=AssertionError("guided geometry must be reused"),
+            ) as detector:
+                report = refresh_project(project)
+
+            detector.assert_not_called()
+            self.assertEqual(1, report["verified_column_photos"])
+            detected = json.loads((project / "detected_columns.json").read_text(encoding="utf-8"))
+            self.assertEqual([list(confirmed_boxes[0])], detected[str(photo.resolve())]["boxes"])
+            annotation = load_annotations(project)[0]
+            polygon = json.loads(annotation["polygon_json"])
+            self.assertEqual(45.0, polygon[0][0])
+            self.assertEqual(0, report["photos_without_masks"])
+
     def test_all_ten_pages_and_all_core_columns_receive_facies_masks(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

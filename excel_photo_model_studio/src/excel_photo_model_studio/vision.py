@@ -699,6 +699,7 @@ def _depth_grid_pixels_per_centimeter(image: np.ndarray | None) -> float | None:
 def project_matches(
     matches: list[Match],
     *,
+    detected_columns_by_photo: dict[Path, list[tuple[int, int, int, int]]] | None = None,
     capacities_by_photo: dict[Path, int] | None = None,
     depth_ranges_by_photo: dict[Path, list[tuple[tuple[int, int, int, int], float, float]]] | None = None,
 ) -> tuple[
@@ -717,11 +718,17 @@ def project_matches(
         image = read_image(photo_path)
         height, width = image.shape[:2]
         photo = photo_matches[0].photo
-        columns = (
-            detect_core_columns_from_path(photo_path)
-            if photo.source.startswith("ocr_")
-            else detect_core_columns(image)
-        )
+        if detected_columns_by_photo is not None and photo_path in detected_columns_by_photo:
+            # Reuse the geometry already shown and confirmed in the guided
+            # workflow. Running detection a second time can shift or drop a
+            # column, making the displayed approval disagree with the masks.
+            columns = list(detected_columns_by_photo[photo_path])
+        else:
+            columns = (
+                detect_core_columns_from_path(photo_path)
+                if photo.source.startswith("ocr_")
+                else detect_core_columns(image)
+            )
         if not columns:
             columns_by_photo[photo_path] = []
             if capacities_by_photo is not None:
