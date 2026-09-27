@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import base64
 import csv
 import json
 import math
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 import unicodedata
 from dataclasses import replace
 from pathlib import Path
@@ -33,6 +38,19 @@ ROLE_ALIASES: dict[str, tuple[str, ...]] = {
     "field_name": ("месторожд", "площадь", "field", "site", "object"),
 }
 
+HEADER_SCAN_ROWS = 3
+
+
+class _UncachedFormula:
+    """Formula cell whose cached value is absent and Excel could not recalculate."""
+
+    def __init__(self, formula: str, address: str) -> None:
+        self.formula = formula
+        self.address = address
+
+    def __str__(self) -> str:
+        return self.formula
+
 
 def normalize_text(value: Any) -> str:
     text = " ".join(str(value or "").replace("\n", " ").split())
@@ -40,6 +58,8 @@ def normalize_text(value: Any) -> str:
 
 
 def display_text(value: Any) -> str:
+    if isinstance(value, _UncachedFormula):
+        return ""
     return " ".join(str(value or "").replace("\n", " ").split())
 
 
@@ -49,7 +69,7 @@ def well_key(value: str) -> str:
 
 
 def as_float(value: Any) -> float | None:
-    if value is None or str(value).strip() == "":
+    if value is None or isinstance(value, _UncachedFormula) or str(value).strip().startswith("="):
         return None
     decimal_value = parse_decimal_value(value)
     if decimal_value is None:
@@ -223,7 +243,7 @@ def detect_mapping(sheet: str, rows: list[list[Any]]) -> ColumnMapping:
     header_row = 1
     first_header_row = 1
     header_started = False
-    for index, row in enumerate(rows[:30], start=1):
+    for index, row in enumerate(rows[:HEADER_SCAN_ROWS], start=1):
         nonempty = [normalize_text(value) for value in row if display_text(value)]
         if len(nonempty) > 1 and len(set(nonempty)) == 1:
             # A merged document title copied across the sheet must not add
@@ -318,33 +338,22 @@ def read_table(path: Path, mapping_file: Path | None = None) -> tuple[list[Descr
         if override is None:
             mapping = detected
         else:
-            # Saved column maps from older versions intentionally remain
-            # authoritative for the primary drilling columns. New semantic
-            # fallback fields (GIS) are auto-discovered when absent.
-            override_gis_pair = bool(override.gis_top and override.gis_base)
-            detected_gis_pair = bool(detected.gis_top and detected.gis_base)
-            if override_gis_pair:
-                gis_top, gis_base = override.gis_top, override.gis_base
-            elif detected_gis_pair:
-                gis_top, gis_base = detected.gis_top, detected.gis_base
-            else:
-                gis_top, gis_base = override.gis_top, override.gis_base
-            gis_interval = None if gis_top and gis_base else (override.gis_interval or detected.gis_interval)
-            # Saved mappings contain positions for reading a particular sheet,
-            # but semantic target columns must follow the current header names.
-            # If a workbook has been reordered, refresh these positions from
-            # the headers rather than silently reading the old columns.
-            named_targets = {
+            # Resolve every field against the current header names first. A
+            # saved map is only a fallback for genuinely unlabelled/manual
+            # columns; it must not keep stale positions after a sheet changes.
+            roles = tuple(
+                key for key in ColumnMapping.__dataclass_fields__
+                if key not in {"sheet", "header_row", "source_file", "source_headers"}
+            )
+            named_columns = {
                 role: getattr(detected, role) or getattr(override, role)
-                for role in ("class_index", "label", "target_text", "description")
+                for role in roles
             }
+            source_headers = {**override.source_headers, **detected.source_headers}
             mapping = replace(
-                override,
-                **named_targets,
-                source_headers=detected.source_headers,
-                gis_interval=gis_interval,
-                gis_top=gis_top,
-                gis_base=gis_base,
+                detected,
+                **named_columns,
+                source_headers=source_headers,
             )
         mapping = replace(mapping, source_file=str(path))
         mappings.append(mapping)
@@ -352,9 +361,14 @@ def read_table(path: Path, mapping_file: Path | None = None) -> tuple[list[Descr
         descriptions.extend(parsed)
         issues.extend(sheet_issues)
     if not descriptions:
+        details = "; ".join(
+            f"{item.source}: {item.message}" for item in issues[:8]
+        )
+        suffix = f" Причины: {details}" if details else ""
         raise ValueError(
             "Не найдены строки с корректными интервалами и метками. Проверьте column_mapping.json: "
             "нужны well, top/base или interval, а также label либо code/index."
+            + suffix
         )
     descriptions.sort(key=lambda item: (well_key(item.well), item.top, item.base, item.source_id))
     return descriptions, mappings, issues
@@ -436,22 +450,74 @@ def _read_sheets(path: Path) -> list[tuple[str, list[list[Any]]]]:
         from openpyxl import load_workbook
     except ImportError as exc:
         raise RuntimeError("Для Excel установите openpyxl>=3.1.") from exc
-    book = load_workbook(path, read_only=False, data_only=True, keep_links=False)
+    return _read_xlsx_sheets(path)
+
+
+def _read_xlsx_sheets(path: Path, *, allow_recalculation: bool = True) -> list[tuple[str, list[list[Any]]]]:
+    """Read cached Excel values, recalculating missing formula caches when possible.
+
+    openpyxl does not calculate formulas. If a formula has no cached result,
+    try recalculating a temporary copy with installed Microsoft Excel. The
+    original workbook is never modified. If recalculation is unavailable, keep
+    an explicit sentinel so row parsing can report the exact affected cells.
+    """
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise RuntimeError("Для Excel установите openpyxl>=3.1.") from exc
+
+    formula_book = load_workbook(path, read_only=False, data_only=False, keep_links=False)
+    cached_book = load_workbook(path, read_only=False, data_only=True, keep_links=False)
+    missing: dict[str, set[str]] = {}
+    for formula_sheet in formula_book.worksheets:
+        value_sheet = cached_book[formula_sheet.title]
+        for row in formula_sheet.iter_rows():
+            for cell in row:
+                if cell.data_type == "f" and value_sheet[cell.coordinate].value is None:
+                    missing.setdefault(formula_sheet.title, set()).add(cell.coordinate)
+
+    if missing and allow_recalculation:
+        formula_book.close()
+        cached_book.close()
+        with tempfile.TemporaryDirectory(prefix="excel_formula_recalc_") as temporary:
+            temporary_path = Path(temporary) / path.name
+            shutil.copy2(path, temporary_path)
+            if _recalculate_with_excel(temporary_path):
+                return _read_xlsx_sheets(temporary_path, allow_recalculation=False)
+        # Re-open the untouched source to retain formula text and missing-cell
+        # addresses for useful diagnostics if Excel is unavailable.
+        formula_book = load_workbook(path, read_only=False, data_only=False, keep_links=False)
+        cached_book = load_workbook(path, read_only=False, data_only=True, keep_links=False)
+
     result: list[tuple[str, list[list[Any]]]] = []
     try:
-        for sheet in book.worksheets:
+        for formula_sheet in formula_book.worksheets:
+            sheet = cached_book[formula_sheet.title]
             merged_values: dict[tuple[int, int], Any] = {}
-            for merged in sheet.merged_cells.ranges:
+            for merged in formula_sheet.merged_cells.ranges:
                 value = sheet.cell(merged.min_row, merged.min_col).value
+                if value is None:
+                    value = formula_sheet.cell(merged.min_row, merged.min_col).value
                 for row_index in range(merged.min_row, merged.max_row + 1):
                     for column_index in range(merged.min_col, merged.max_col + 1):
                         merged_values[(row_index, column_index)] = value
             rows: list[list[Any]] = []
-            for row_index, source_row in enumerate(sheet.iter_rows(values_only=True), start=1):
-                values = [
-                    value if value is not None else merged_values.get((row_index, column_index))
-                    for column_index, value in enumerate(source_row, start=1)
-                ]
+            for row_index, (formula_row, value_row) in enumerate(zip(
+                formula_sheet.iter_rows(), sheet.iter_rows(), strict=False,
+            ), start=1):
+                values = []
+                for column_index, (formula_cell, value_cell) in enumerate(zip(
+                    formula_row, value_row, strict=False,
+                ), start=1):
+                    value = value_cell.value
+                    if value is None and formula_cell.data_type == "f":
+                        if formula_cell.coordinate in missing.get(formula_sheet.title, set()):
+                            value = _UncachedFormula(formula_cell.value, formula_cell.coordinate)
+                        else:
+                            value = formula_cell.value
+                    if value is None:
+                        value = merged_values.get((row_index, column_index))
+                    values.append(value)
                 while values and values[-1] is None:
                     values.pop()
                 rows.append(values)
@@ -459,8 +525,55 @@ def _read_sheets(path: Path) -> list[tuple[str, list[list[Any]]]]:
                 rows.pop()
             result.append((sheet.title, rows))
     finally:
-        book.close()
+        formula_book.close()
+        cached_book.close()
     return result
+
+
+def _recalculate_with_excel(path: Path) -> bool:
+    """Recalculate formulas using installed Excel through hidden PowerShell COM."""
+    if os.name != "nt":
+        return False
+    path_payload = base64.b64encode(str(path).encode("utf-8")).decode("ascii")
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$path = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{path_payload}'))
+$excel = $null
+$book = $null
+try {{
+  $excel = New-Object -ComObject Excel.Application
+  $excel.Visible = $false
+  $excel.DisplayAlerts = $false
+  $excel.AskToUpdateLinks = $false
+  $excel.AutomationSecurity = 3
+  $excel.Calculation = -4105
+  $book = $excel.Workbooks.Open($path, 0, $false)
+  $excel.CalculateFullRebuild()
+  $book.Save()
+  $book.Close($false)
+  exit 0
+}} catch {{
+  Write-Error $_
+  exit 1
+}} finally {{
+  if ($book -ne $null) {{ [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($book) }}
+  if ($excel -ne $null) {{ $excel.Quit(); [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($excel) }}
+  [GC]::Collect()
+  [GC]::WaitForPendingFinalizers()
+}}
+"""
+    encoded_script = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    try:
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded_script],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0 and path.is_file()
 
 
 def _sniff_delimiter(path: Path) -> str:
@@ -473,6 +586,14 @@ def _sniff_delimiter(path: Path) -> str:
 
 def _cell(row: list[Any], column: int | None) -> Any:
     return row[column - 1] if column and column <= len(row) else None
+
+
+def _is_column_number_row(row: list[Any]) -> bool:
+    """Skip only the explicit Excel column-number ruler (1, 2, 3, ...)."""
+    values = [as_float(value) for value in row if display_text(value)]
+    if len(values) < 4 or any(value is None or not value.is_integer() for value in values):
+        return False
+    return [int(value) for value in values if value is not None] == list(range(1, len(values) + 1))
 
 
 def _thickness_matches_interval(top: float, base: float, thickness: float) -> bool:
@@ -508,14 +629,30 @@ def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[De
     if not ((mapping.top and mapping.base) or mapping.interval):
         issues.append(Issue("error", mapping.sheet, "Не найдены столбцы интервала слоя."))
         return output, issues
+    mapped_columns = {
+        value for key, value in mapping.to_dict().items()
+        if key not in {"header_row", "sheet", "source_file", "source_headers"}
+        and isinstance(value, int)
+    }
     for row_number, row in enumerate(rows[mapping.header_row :], start=mapping.header_row + 1):
-        mapped_columns = [
-            value for key, value in mapping.to_dict().items()
-            if key not in {"header_row", "sheet", "source_file"} and isinstance(value, int)
-        ]
-        numbered = [column for column in mapped_columns if display_text(_cell(row, column)) == str(column)]
-        if len(numbered) >= 4:
+        if _is_column_number_row(row):
             continue
+        unresolved_formulas = [
+            value for value in row if isinstance(value, _UncachedFormula)
+        ]
+        if unresolved_formulas:
+            relevant = any(
+                isinstance(_cell(row, column), _UncachedFormula)
+                for column in mapped_columns
+            )
+            addresses = ", ".join(
+                f"{value.address} ({value.formula})" for value in unresolved_formulas
+            )
+            issues.append(Issue(
+                "error" if relevant else "warning",
+                f"{mapping.sheet}!{row_number}",
+                "Формулы не имеют сохранённого результата, а Excel не смог их пересчитать: " + addresses,
+            ))
         top = as_float(_cell(row, mapping.top))
         base = as_float(_cell(row, mapping.base))
         if top is None or base is None:
@@ -531,10 +668,24 @@ def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[De
             top, base = gis_top, gis_base
             row_source = "gis"
         if top is None or base is None or base <= top:
+            raw_top = display_text(_cell(row, mapping.top)) or "∅"
+            raw_base = display_text(_cell(row, mapping.base)) or "∅"
+            raw_interval = display_text(_cell(row, mapping.interval)) or "∅"
+            issues.append(Issue(
+                "error",
+                f"{mapping.sheet}!{row_number}",
+                "Строка не отброшена молча: не удалось прочитать возрастающий интервал фации. "
+                f"Кровля={raw_top}; подошва={raw_base}; объединённый интервал={raw_interval}; "
+                f"резерв ГИС={gis_top!r}–{gis_base!r}.",
+            ))
             continue
         top = normalize_depth(top)
         base = normalize_depth(base)
         if base <= top:
+            issues.append(Issue(
+                "error", f"{mapping.sheet}!{row_number}",
+                f"После округления до 0,01 м интервал схлопнулся: {format_depth(top)}–{format_depth(base)} м.",
+            ))
             continue
         thickness = as_float(_cell(row, mapping.facies_thickness))
         thickness_declared = thickness is not None
@@ -606,6 +757,11 @@ def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[De
             continue
         description = display_text(_cell(row, mapping.description))
         target_text = display_text(_cell(row, mapping.target_text)) or description
+        if not target_text:
+            issues.append(Issue(
+                "warning", f"{mapping.sheet}!{row_number}",
+                "Краткое описание в строке не найдено; строка оставлена, но обучение маске потребует описания.",
+            ))
         association = display_text(_cell(row, mapping.association))
         environment = display_text(_cell(row, mapping.environment))
         metadata = {

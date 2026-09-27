@@ -5,8 +5,9 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 from excel_photo_model_studio.depth import meters_to_centimeters
 from excel_photo_model_studio.tabular import (
@@ -15,6 +16,98 @@ from excel_photo_model_studio.tabular import (
 
 
 class TableReaderTests(unittest.TestCase):
+    def test_detects_headers_in_the_third_row_and_starts_data_after_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "third_row_header.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["Отчёт по скважине"])
+            sheet.append(["Сформировано автоматически"])
+            sheet.append([
+                "Скважина", "Интервал фации по бурению Кровля",
+                "Интервал фации по бурению Подошва", "Индекс фации", "Краткое описание",
+            ])
+            sheet.append(["W-1", 100.0, 101.25, "Dch", "Песчаник серый."])
+            workbook.save(path)
+
+            rows, mappings, issues = read_table(path)
+
+        self.assertEqual(3, mappings[0].header_row)
+        self.assertEqual(1, len(rows))
+        self.assertEqual((100.0, 101.25), (rows[0].top, rows[0].base))
+        self.assertEqual([], [item for item in issues if item.severity == "error"])
+
+    def test_missing_excel_formula_cache_is_recalculated_on_a_temporary_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "formula_values.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append([
+                "Скважина", "Интервал фации по бурению Кровля",
+                "Интервал фации по бурению Подошва", "Индекс фации", "Краткое описание",
+            ])
+            sheet.append(["W-1", "=100+0", "=100+1.25", "Dch", "Песчаник серый."])
+            workbook.save(path)
+            workbook.close()
+
+            def recalculate_temporary_copy(temporary_path: Path) -> bool:
+                recalculated = load_workbook(temporary_path, data_only=False)
+                recalculated.active["B2"] = 100.0
+                recalculated.active["C2"] = 101.25
+                recalculated.save(temporary_path)
+                recalculated.close()
+                return True
+
+            with patch(
+                "excel_photo_model_studio.tabular._recalculate_with_excel",
+                side_effect=recalculate_temporary_copy,
+            ) as recalculate:
+                rows, _mappings, issues = read_table(path)
+
+            original = load_workbook(path, data_only=False)
+            original_formulas = (original.active["B2"].value, original.active["C2"].value)
+            original.close()
+
+        self.assertEqual(1, recalculate.call_count)
+        self.assertEqual((100.0, 101.25), (rows[0].top, rows[0].base))
+        self.assertEqual(("=100+0", "=100+1.25"), original_formulas)
+        self.assertFalse(any("формулы" in item.message.casefold() for item in issues))
+
+    def test_uncalculated_formula_rows_report_exact_cells_instead_of_silent_skip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "uncalculated.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append([
+                "Скважина", "Интервал фации по бурению Кровля",
+                "Интервал фации по бурению Подошва", "Индекс фации", "Краткое описание",
+            ])
+            sheet.append(["W-1", "=A2+99", "=A2+100", "Dch", "Песчаник серый."])
+            workbook.save(path)
+            workbook.close()
+
+            with patch("excel_photo_model_studio.tabular._recalculate_with_excel", return_value=False):
+                with self.assertRaisesRegex(ValueError, r"Sheet!2: Формулы.*B2.*C2"):
+                    read_table(path)
+
+    def test_row_with_missing_description_is_retained_and_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing_description.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append([
+                "Скважина", "Интервал фации по бурению Кровля",
+                "Интервал фации по бурению Подошва", "Индекс фации", "Краткое описание",
+            ])
+            sheet.append(["W-1", 100.0, 101.0, "Dch", None])
+            workbook.save(path)
+
+            rows, _mappings, issues = read_table(path)
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("Dch", rows[0].facies_index)
+        self.assertTrue(any("Краткое описание" in item.message for item in issues))
+
     def test_source_sheet_preview_preserves_excel_cells_for_mapping_highlight(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "preview.xlsx"
@@ -221,6 +314,7 @@ class TableReaderTests(unittest.TestCase):
         self.assertEqual(7, mappings[0].class_index)
         self.assertEqual(4, mappings[0].label)
         self.assertEqual(1, mappings[0].target_text)
+        self.assertEqual((6, 3), (mappings[0].top, mappings[0].base))
         self.assertEqual("Dch", rows[0].facies_index)
         self.assertEqual("Каналы", rows[0].facies_name)
         self.assertEqual("Гравийный песчаник.", rows[0].target_text)
