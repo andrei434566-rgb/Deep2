@@ -290,8 +290,9 @@ class StepVerificationDialog(QDialog):
         self.excel_picker_button.clicked.connect(self._choose_excel)
         workbook_row.addWidget(self.excel_picker_button)
         layout.addLayout(workbook_row)
-        self.mapping_summary = QLabel()
-        self.mapping_summary.setWordWrap(True)
+        self.mapping_summary = QTextEdit()
+        self.mapping_summary.setReadOnly(True)
+        self.mapping_summary.setMaximumHeight(180)
         layout.addWidget(self.mapping_summary)
         self.excel_views = QTabWidget(page)
         source_page = QWidget(self.excel_views)
@@ -650,8 +651,20 @@ class StepVerificationDialog(QDialog):
                     )
                 )
         if self.issues:
-            mapping_lines.append(f"Замечаний парсера: {len(self.issues)}. Первое: {self.issues[0].message}")
-        self.mapping_summary.setText("\n".join(mapping_lines))
+            errors = [item for item in self.issues if item.severity == "error"]
+            warnings = [item for item in self.issues if item.severity != "error"]
+            mapping_lines.append(
+                f"Проблемы чтения Excel: ошибок {len(errors)}, предупреждений {len(warnings)}."
+            )
+            for item in errors[:100]:
+                mapping_lines.append(f"  {item.source}: {item.message}")
+            if len(errors) > 100:
+                mapping_lines.append(f"  …не показаны ещё {len(errors) - 100} ошибок.")
+            for item in warnings[:20]:
+                mapping_lines.append(f"  Предупреждение {item.source}: {item.message}")
+            if len(warnings) > 20:
+                mapping_lines.append(f"  …не показаны ещё {len(warnings) - 20} предупреждений.")
+        self.mapping_summary.setPlainText("\n".join(mapping_lines))
         self.sheet_selector.blockSignals(True)
         self.sheet_selector.clear()
         for index, mapping in enumerate(self.mappings):

@@ -111,8 +111,8 @@ class GuiPreviewTests(unittest.TestCase):
                 self.assertEqual("W-1", dialog.rows[0].well)
                 self.assertEqual(2, dialog.raw_sheet_table.rowCount())
                 self.assertIn("Интервал фации по бурению Кровля", dialog.raw_sheet_table.item(0, 1).text())
-                self.assertIn("Кровля/начало", dialog.mapping_summary.text())
-                self.assertIn("Толщина фации", dialog.mapping_summary.text())
+                self.assertIn("Кровля/начало", dialog.mapping_summary.toPlainText())
+                self.assertIn("Толщина фации", dialog.mapping_summary.toPlainText())
 
                 with patch(
                     "excel_photo_model_studio.gui.QFileDialog.getOpenFileName",

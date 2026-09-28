@@ -97,6 +97,98 @@ class VisionTests(unittest.TestCase):
         self.assertEqual(1, len(annotations))
         self.assertEqual(81, min(x for x, _y in annotations[0].polygon))
 
+    def test_projected_mask_follows_core_edges_and_does_not_cover_adjacent_arrow(self):
+        with tempfile.TemporaryDirectory() as directory:
+            photo_path = Path(directory) / "W-1 100-101.jpg"
+            image = np.full((400, 220, 3), 255, dtype=np.uint8)
+            cv2.rectangle(image, (75, 40), (125, 350), (185, 185, 185), -1)
+            # A reviewed detection may include a small margin around the rock.
+            # The blue arrow and black vertical tray edge are not core pixels.
+            cv2.line(image, (143, 170), (143, 255), (190, 75, 20), 8)
+            cv2.line(image, (65, 60), (65, 340), (15, 15, 15), 2)
+            ok, encoded = cv2.imencode(".jpg", image)
+            self.assertTrue(ok)
+            photo_path.write_bytes(encoded.tobytes())
+            photo = PhotoRecord(photo_path, "W-1", 100.0, 101.0, "manual", True)
+            row = DescriptionRow("W-1", 100.0, 101.0, "Dch", "Data", 2)
+
+            annotations, _columns, _orders = project_matches(
+                [Match(photo, row, 100.0, 101.0)],
+                detected_columns_by_photo={photo_path: [(65, 40, 145, 350)]},
+            )
+
+        self.assertEqual(1, len(annotations))
+        xs = [point[0] for point in annotations[0].polygon]
+        self.assertGreaterEqual(min(xs), 72)
+        self.assertLessEqual(max(xs), 129)
+        self.assertNotIn(143.0, xs)
+
+    def test_long_facies_and_following_short_facies_project_continuously_across_photos(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            photos = []
+            detections = {}
+            for page_index, (top, base) in enumerate(((100.0, 105.0), (105.0, 110.0))):
+                path = root / f"W-1-{page_index}.jpg"
+                image = np.full((1200, 760, 3), 255, dtype=np.uint8)
+                boxes = []
+                for column_index in range(5):
+                    left = 30 + column_index * 140
+                    box = (left, 100, left + 120, 1100)
+                    # Rock is narrower than the reviewed bbox, as in a tray
+                    # photograph; the facies mask must follow the core, not
+                    # the empty margins around it.
+                    cv2.rectangle(image, (left + 7, 100), (left + 113, 1100), (185, 185, 185), -1)
+                    boxes.append(box)
+                ok, encoded = cv2.imencode(".jpg", image)
+                self.assertTrue(ok)
+                path.write_bytes(encoded.tobytes())
+                photo = PhotoRecord(path, "W-1", top, base, "manual", True)
+                photos.append(photo)
+                detections[path] = boxes
+
+            rows = [
+                DescriptionRow("W-1", 100.0, 107.0, "Dch", "Data", 2),
+                DescriptionRow("W-1", 107.0, 107.5, "Inbay", "Data", 3),
+                DescriptionRow("W-1", 107.5, 110.0, "MSTF", "Data", 4),
+            ]
+            matches = []
+            for photo in photos:
+                for row in rows:
+                    overlap_top = max(photo.top, row.top)
+                    overlap_base = min(photo.base, row.base)
+                    if overlap_base > overlap_top:
+                        matches.append(Match(photo, row, overlap_top, overlap_base))
+
+            annotations, _columns, _orders = project_matches(
+                matches, detected_columns_by_photo=detections,
+            )
+
+        by_label = {}
+        for annotation in annotations:
+            by_label.setdefault(annotation.label, []).append(annotation)
+        self.assertEqual({"Dch", "Inbay", "MSTF"}, set(by_label))
+        self.assertEqual([7.0, 0.5, 2.5], [
+            round(sum(item.depth_base - item.depth_top for item in by_label[label]), 2)
+            for label in ("Dch", "Inbay", "MSTF")
+        ])
+        self.assertEqual([7, 1, 3], [len(by_label[label]) for label in ("Dch", "Inbay", "MSTF")])
+        ordered = sorted(annotations, key=lambda item: (item.depth_top, item.depth_base))
+        self.assertEqual(100.0, ordered[0].depth_top)
+        self.assertEqual(110.0, ordered[-1].depth_base)
+        self.assertTrue(all(
+            round(left.depth_base, 2) == round(right.depth_top, 2)
+            for left, right in zip(ordered, ordered[1:])
+        ))
+        for item in annotations:
+            matching_box = next(
+                box for path, boxes in detections.items() if path == item.photo_path
+                for box in boxes if min(point[0] for point in item.polygon) >= box[0]
+                and max(point[0] for point in item.polygon) <= box[2]
+            )
+            self.assertGreaterEqual(min(point[0] for point in item.polygon), matching_box[0] + 4)
+            self.assertLessEqual(max(point[0] for point in item.polygon), matching_box[2] - 4)
+
     def test_rejects_narrow_ruler_beside_three_core_columns(self):
         image = np.full((1000, 800, 3), (25, 90, 160), dtype=np.uint8)
         cv2.rectangle(image, (70, 80), (90, 900), (120, 120, 120), -1)

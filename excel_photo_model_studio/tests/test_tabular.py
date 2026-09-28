@@ -11,7 +11,8 @@ from openpyxl import Workbook, load_workbook
 
 from excel_photo_model_studio.depth import meters_to_centimeters
 from excel_photo_model_studio.tabular import (
-    as_float, parse_interval, read_table, read_workbook_sheets, save_mappings,
+    _expand_merged_ranges, as_float, detect_mapping, parse_interval, read_table,
+    read_many_tables, read_workbook_sheets, save_mappings,
 )
 
 
@@ -36,6 +37,28 @@ class TableReaderTests(unittest.TestCase):
         self.assertEqual(1, len(rows))
         self.assertEqual((100.0, 101.25), (rows[0].top, rows[0].base))
         self.assertEqual([], [item for item in issues if item.severity == "error"])
+
+    def test_detects_flat_header_in_the_fourth_row(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fourth_row_header.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["Отчёт по керну"])
+            sheet.append(["Сформировано автоматически"])
+            sheet.append(["Версия таблицы 2"])
+            sheet.append([
+                "Скважина", "Интервал фации по бурению Кровля",
+                "Интервал фации по бурению Подошва", "Индекс фации", "Краткое описание",
+            ])
+            sheet.append(["W-1", 100.0, 101.25, "Dch", "Песчаник серый."])
+            workbook.save(path)
+
+            rows, mappings, issues = read_table(path)
+
+        self.assertEqual(4, mappings[0].header_row)
+        self.assertEqual(1, len(rows))
+        self.assertEqual((100.0, 101.25), (rows[0].top, rows[0].base))
+        self.assertFalse([issue for issue in issues if issue.severity == "error"])
 
     def test_header_group_in_first_three_rows_can_have_subheaders_on_row_four(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -65,9 +88,9 @@ class TableReaderTests(unittest.TestCase):
         self.assertEqual("Песчаник серый.", rows[0].target_text)
         self.assertFalse([issue for issue in issues if issue.severity == "error"])
 
-    def test_multilevel_header_can_span_five_rows(self):
+    def test_multilevel_header_can_span_four_rows(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "five_row_header.xlsx"
+            path = Path(directory) / "four_row_header.xlsx"
             workbook = Workbook()
             sheet = workbook.active
             sheet.title = "седимент"
@@ -76,20 +99,54 @@ class TableReaderTests(unittest.TestCase):
             sheet.merge_cells("B1:C1")
             sheet["D1"] = "Индекс фации"
             sheet["E1"] = "Краткое описание"
-            sheet["B5"] = "Кровля"
-            sheet["C5"] = "Подошва"
-            sheet.append([1, 2, 3, 4, 5])  # Excel's column-number ruler on row 6
+            sheet["B4"] = "Кровля"
+            sheet["C4"] = "Подошва"
+            sheet.append([1, 2, 3, 4, 5])  # Excel's column-number ruler on row 5
             sheet.append(["W-1", 4105.0, 4105.25, "Dch", "Песчаник серый."])
             workbook.save(path)
 
             rows, mappings, issues = read_table(path)
 
-        self.assertEqual(5, mappings[0].header_row)
+        self.assertEqual(4, mappings[0].header_row)
         self.assertEqual((2, 3), (mappings[0].top, mappings[0].base))
         self.assertEqual(1, len(rows))
         self.assertEqual((4105.0, 4105.25), (rows[0].top, rows[0].base))
         self.assertEqual("Dch", rows[0].facies_index)
         self.assertFalse([issue for issue in issues if issue.severity == "error"])
+
+    def test_date_number_format_does_not_hide_numeric_depths_or_zero_class_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "date_formatted_depths.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append([
+                "Скважина", "Интервал фации по бурению Кровля",
+                "Интервал фации по бурению Подошва", "Индекс фации", "Краткое описание",
+            ])
+            sheet.append(["W-1", 4105.0, 4105.25, 0, "Песчаник серый."])
+            sheet["B2"].number_format = "yyyy-mm-dd"
+            sheet["C2"].number_format = "yyyy-mm-dd"
+            workbook.save(path)
+
+            rows, _mappings, issues = read_table(path)
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual((4105.0, 4105.25), (rows[0].top, rows[0].base))
+        self.assertEqual("0", rows[0].facies_index)
+        self.assertEqual("0", rows[0].label)
+        self.assertFalse([issue for issue in issues if issue.severity == "error"])
+
+    def test_xls_merged_interval_headers_are_expanded_before_mapping(self):
+        rows = [
+            ["Скважина", "Интервал фации по бурению", "", "Индекс фации", "Краткое описание"],
+            ["", "Кровля", "Подошва", "", ""],
+            ["W-1", 4105.0, 4105.25, "Dch", "Песчаник серый."],
+        ]
+        _expand_merged_ranges(rows, [(0, 1, 1, 3)])
+        mapping = detect_mapping("седимент", rows)
+
+        self.assertEqual("Интервал фации по бурению", rows[0][2])
+        self.assertEqual((2, 3), (mapping.top, mapping.base))
 
     def test_missing_excel_formula_cache_is_recalculated_on_a_temporary_copy(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -161,6 +218,21 @@ class TableReaderTests(unittest.TestCase):
         self.assertEqual(1, len(rows))
         self.assertEqual("Dch", rows[0].facies_index)
         self.assertTrue(any("Краткое описание" in item.message for item in issues))
+
+    def test_zero_parsed_rows_error_includes_exact_excel_row_cause(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing_facies_index.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append([
+                "Скважина", "Интервал фации по бурению Кровля",
+                "Интервал фации по бурению Подошва", "Индекс фации",
+            ])
+            sheet.append(["W-1", 100.0, 101.0, None])
+            workbook.save(path)
+
+            with self.assertRaisesRegex(ValueError, r"Sheet!2: Нет метки класса"):
+                read_many_tables(path)
 
     def test_source_sheet_preview_preserves_excel_cells_for_mapping_highlight(self):
         with tempfile.TemporaryDirectory() as directory:

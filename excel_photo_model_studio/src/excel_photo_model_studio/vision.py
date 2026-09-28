@@ -717,6 +717,7 @@ def project_matches(
     for photo_path, photo_matches in grouped.items():
         image = read_image(photo_path)
         height, width = image.shape[:2]
+        core_foreground = _core_candidate_mask(image)
         photo = photo_matches[0].photo
         if detected_columns_by_photo is not None and photo_path in detected_columns_by_photo:
             # Reuse the geometry already shown and confirmed in the guided
@@ -777,10 +778,7 @@ def project_matches(
                 y0 = pixel_top + (overlap_top - column_top) / (column_base - column_top) * (pixel_bottom - pixel_top)
                 y1 = pixel_top + (overlap_base - column_top) / (column_base - column_top) * (pixel_bottom - pixel_top)
                 y0, y1 = _minimum_vertical_span(y0, y1, pixel_top, pixel_bottom)
-                polygon = (
-                    (float(left), float(y0)), (float(max(left + 1, right - 1)), float(y0)),
-                    (float(max(left + 1, right - 1)), float(y1)), (float(left), float(y1)),
-                )
+                polygon = _core_slice_polygon(core_foreground, box, y0, y1)
                 identity = "|".join((
                     str(photo_path.resolve()), match.description.source_id, str(column_index),
                     f"{overlap_top:.6f}", f"{overlap_base:.6f}", match.description.label,
@@ -802,6 +800,85 @@ def project_matches(
                     facies_name=match.description.facies_name or match.description.label,
                 ))
     return annotations, columns_by_photo, orders_by_photo
+
+
+def _core_slice_polygon(
+    foreground: np.ndarray,
+    box: tuple[int, int, int, int],
+    y0: float,
+    y1: float,
+) -> tuple[tuple[float, float], ...]:
+    """Trace the visible rock silhouette within one depth slice.
+
+    Column discovery intentionally returns a stable bounding box for user
+    review. Using that whole rectangle as a training polygon also labels tray
+    walls, pale gutters, and any rule/arrow that touches the box. Here we use
+    the same foreground evidence as the detector to follow the rock's left and
+    right edges row by row. Sparse rows (fractures, bright patches, labels) are
+    interpolated from neighboring rock rows; if there is not enough evidence,
+    retain the reviewed rectangle rather than silently discard the facies.
+    """
+    image_height, image_width = foreground.shape[:2]
+    left, top, right, bottom = box
+    left = max(0, min(image_width, int(left)))
+    right = max(left, min(image_width, int(right)))
+    top = max(0, min(image_height, int(top)))
+    bottom = max(top, min(image_height, int(bottom)))
+    box_width, box_height = right - left, bottom - top
+    y0 = max(float(top), min(float(bottom), float(y0)))
+    y1 = max(y0, min(float(bottom), float(y1)))
+    if box_width < 4 or box_height < 2 or y1 <= y0:
+        return ((float(left), y0), (float(right), y0), (float(right), y1), (float(left), y1))
+
+    lane = foreground[top:bottom, left:right]
+    minimum_run = max(3, round(box_width * 0.36))
+    center_left = round(box_width * 0.30)
+    center_right = max(center_left + 1, round(box_width * 0.70))
+    left_edges = np.full(box_height, np.nan, dtype=np.float32)
+    right_edges = np.full(box_height, np.nan, dtype=np.float32)
+    minimum_center_overlap = max(2, round(box_width * 0.24))
+    for row_index, row in enumerate(lane):
+        runs = _runs(row)
+        candidates = []
+        for run_left, run_right in runs:
+            run_width = run_right - run_left
+            center_overlap = max(0, min(run_right, center_right) - max(run_left, center_left))
+            if run_width >= minimum_run and center_overlap >= minimum_center_overlap:
+                candidates.append((center_overlap, run_width, run_left, run_right))
+        if candidates:
+            _overlap, _width, run_left, run_right = max(candidates)
+            left_edges[row_index] = left + run_left
+            right_edges[row_index] = left + run_right
+
+    known = np.flatnonzero(np.isfinite(left_edges) & np.isfinite(right_edges))
+    if len(known) < max(3, round(box_height * 0.08)):
+        return ((float(left), y0), (float(right), y0), (float(right), y1), (float(left), y1))
+
+    row_positions = np.arange(box_height, dtype=np.float32)
+    left_edges = np.interp(row_positions, known, left_edges[known]).astype(np.float32)
+    right_edges = np.interp(row_positions, known, right_edges[known]).astype(np.float32)
+    smooth_width = max(3, min(17, round(box_height * 0.012) | 1))
+    radius = smooth_width // 2
+    padded_left = np.pad(left_edges, (radius, radius), mode="edge")
+    padded_right = np.pad(right_edges, (radius, radius), mode="edge")
+    left_edges = np.array([
+        np.median(padded_left[index:index + smooth_width])
+        for index in range(box_height)
+    ], dtype=np.float32)
+    right_edges = np.array([
+        np.median(padded_right[index:index + smooth_width])
+        for index in range(box_height)
+    ], dtype=np.float32)
+
+    slice_height = y1 - y0
+    step = max(1, math.ceil(slice_height / 40))
+    sample_y = np.unique(np.append(np.arange(y0, y1, step, dtype=np.float32), [y0, y1]))
+    local_y = np.clip(sample_y - top, 0.0, max(0.0, box_height - 1.0))
+    x_left = np.interp(local_y, row_positions, left_edges)
+    x_right = np.interp(local_y, row_positions, right_edges)
+    left_points = [(float(x), float(y)) for x, y in zip(x_left, sample_y)]
+    right_points = [(float(x), float(y)) for x, y in zip(x_right[::-1], sample_y[::-1])]
+    return tuple(left_points + right_points)
 
 
 def detect_column_order(image: np.ndarray, columns: list[tuple[int, int, int, int]]) -> str:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import csv
+from datetime import date, datetime, time, timedelta
 import json
 import math
 import os
@@ -38,8 +39,8 @@ ROLE_ALIASES: dict[str, tuple[str, ...]] = {
     "field_name": ("месторожд", "площадь", "field", "site", "object"),
 }
 
-HEADER_SCAN_ROWS = 5
-HEADER_CONTINUATION_ROWS = 4
+HEADER_SCAN_ROWS = 4
+HEADER_CONTINUATION_ROWS = 3
 
 
 class _UncachedFormula:
@@ -53,15 +54,26 @@ class _UncachedFormula:
         return self.formula
 
 
+class _ExcelDateSerial:
+    """A date-formatted Excel number, kept usable as a numeric depth value."""
+
+    def __init__(self, value: date | datetime | time | timedelta, serial: float) -> None:
+        self.value = value
+        self.serial = serial
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+
 def normalize_text(value: Any) -> str:
-    text = " ".join(str(value or "").replace("\n", " ").split())
+    text = " ".join(str("" if value is None else value).replace("\n", " ").split())
     return unicodedata.normalize("NFKC", text).casefold().replace("ё", "е")
 
 
 def display_text(value: Any) -> str:
     if isinstance(value, _UncachedFormula):
         return ""
-    return " ".join(str(value or "").replace("\n", " ").split())
+    return " ".join(str("" if value is None else value).replace("\n", " ").split())
 
 
 def well_key(value: str) -> str:
@@ -72,6 +84,8 @@ def well_key(value: str) -> str:
 def as_float(value: Any) -> float | None:
     if value is None or isinstance(value, _UncachedFormula) or str(value).strip().startswith("="):
         return None
+    if isinstance(value, _ExcelDateSerial):
+        value = value.serial
     decimal_value = parse_decimal_value(value)
     if decimal_value is None:
         return None
@@ -244,8 +258,8 @@ def detect_mapping(sheet: str, rows: list[list[Any]]) -> ColumnMapping:
     header_row = 1
     first_header_row = 1
     header_started = False
-    # Look for the first/header-group row in the first five rows and allow a
-    # multi-row header block to span five rows total. Real workbooks may have
+    # Look for the first/header-group row in the first four rows and allow a
+    # multi-row header block to span four rows total. Real workbooks may have
     # a title and notes above grouped intervals, with "Кровля / Подошва"
     # several rows below the parent heading. Restricting the entire header to
     # the initial scan window makes those columns collapse into one interval.
@@ -463,8 +477,13 @@ def _read_sheets(path: Path) -> list[tuple[str, list[list[Any]]]]:
             import xlrd
         except ImportError as exc:
             raise RuntimeError("Для старого формата .xls установите xlrd>=2.0.") from exc
-        book = xlrd.open_workbook(path)
-        return [(sheet.name, [sheet.row_values(row) for row in range(sheet.nrows)]) for sheet in book.sheets()]
+        book = xlrd.open_workbook(path, formatting_info=True)
+        result = []
+        for sheet in book.sheets():
+            rows = [sheet.row_values(row) for row in range(sheet.nrows)]
+            _expand_merged_ranges(rows, sheet.merged_cells)
+            result.append((sheet.name, rows))
+        return result
     try:
         from openpyxl import load_workbook
     except ImportError as exc:
@@ -482,6 +501,7 @@ def _read_xlsx_sheets(path: Path, *, allow_recalculation: bool = True) -> list[t
     """
     try:
         from openpyxl import load_workbook
+        from openpyxl.utils.datetime import to_excel
     except ImportError as exc:
         raise RuntimeError("Для Excel установите openpyxl>=3.1.") from exc
 
@@ -534,6 +554,11 @@ def _read_xlsx_sheets(path: Path, *, allow_recalculation: bool = True) -> list[t
                             value = _UncachedFormula(formula_cell.value, formula_cell.coordinate)
                         else:
                             value = formula_cell.value
+                    if isinstance(value, (datetime, date, time, timedelta)):
+                        try:
+                            value = _ExcelDateSerial(value, float(to_excel(value, formula_book.epoch)))
+                        except (TypeError, ValueError, OverflowError):
+                            pass
                     if value is None:
                         value = merged_values.get((row_index, column_index))
                     values.append(value)
@@ -603,6 +628,23 @@ def _sniff_delimiter(path: Path) -> str:
         return ";"
 
 
+def _expand_merged_ranges(rows: list[list[Any]], merged_ranges: Iterable[tuple[int, int, int, int]]) -> None:
+    """Expand xlrd's zero-based, half-open merged-cell ranges in-place."""
+    for row_start, row_end, column_start, column_end in merged_ranges:
+        if row_start >= len(rows) or column_start >= len(rows[row_start]):
+            continue
+        value = rows[row_start][column_start]
+        if value in (None, ""):
+            continue
+        for row_index in range(row_start, min(row_end, len(rows))):
+            row = rows[row_index]
+            if len(row) < column_end:
+                row.extend([""] * (column_end - len(row)))
+            for column_index in range(column_start, column_end):
+                if row[column_index] in (None, ""):
+                    row[column_index] = value
+
+
 def _cell(row: list[Any], column: int | None) -> Any:
     return row[column - 1] if column and column <= len(row) else None
 
@@ -654,6 +696,10 @@ def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[De
         and isinstance(value, int)
     }
     for row_number, row in enumerate(rows[mapping.header_row :], start=mapping.header_row + 1):
+        # Spacer rows are common inside formatted workbooks. They aren't
+        # incomplete facies records and should not inflate the parser errors.
+        if not any(display_text(value) for value in row):
+            continue
         if _is_column_number_row(row):
             continue
         unresolved_formulas = [
@@ -738,7 +784,12 @@ def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[De
                 ))
         well = display_text(_cell(row, mapping.well)) or last_well or sheet_well
         if not well:
-            issues.append(Issue("error", f"{mapping.sheet}!{row_number}", "Не указана скважина."))
+            raw_well = display_text(_cell(row, mapping.well)) or "∅"
+            header_well = mapping.source_headers.get("well", "не определён")
+            issues.append(Issue(
+                "error", f"{mapping.sheet}!{row_number}",
+                f"Не указана скважина: колонка «{header_well}», значение {raw_well}.",
+            ))
             continue
         if last_well and well_key(well) != well_key(last_well):
             # Forward-fill within one well only. Otherwise the first row of a
@@ -772,7 +823,17 @@ def _parse_sheet(rows: list[list[Any]], mapping: ColumnMapping) -> tuple[list[De
         facies_name = name or code or index
         label = facies_index
         if not label:
-            issues.append(Issue("error", f"{mapping.sheet}!{row_number}", "Нет метки класса; строка пропущена."))
+            class_cells = []
+            for role, column in (("class_index", mapping.class_index), ("class_code", mapping.class_code), ("label", mapping.label)):
+                if column:
+                    header = mapping.source_headers.get(role, f"колонка {column}")
+                    value = display_text(_cell(row, column)) or "∅"
+                    class_cells.append(f"{header}={value}")
+            details = "; ".join(class_cells) or "столбцы индекса, кода и названия не распознаны"
+            issues.append(Issue(
+                "error", f"{mapping.sheet}!{row_number}",
+                f"Нет метки класса; строка пропущена. Проверка ячеек: {details}.",
+            ))
             continue
         description = display_text(_cell(row, mapping.description))
         target_text = display_text(_cell(row, mapping.target_text)) or description
