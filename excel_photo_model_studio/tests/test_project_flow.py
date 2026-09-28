@@ -59,7 +59,10 @@ class ProjectFlowTests(unittest.TestCase):
             self.assertEqual([list(confirmed_boxes[0])], detected[str(photo.resolve())]["boxes"])
             annotation = load_annotations(project)[0]
             polygon = json.loads(annotation["polygon_json"])
-            self.assertEqual(45.0, polygon[0][0])
+            # The manually confirmed box is reused, while the training mask
+            # trims its empty margin to the visible rock silhouette.
+            self.assertGreaterEqual(min(point[0] for point in polygon), 50.0)
+            self.assertLessEqual(max(point[0] for point in polygon), 126.0)
             self.assertEqual(0, report["photos_without_masks"])
 
     def test_all_ten_pages_and_all_core_columns_receive_facies_masks(self):

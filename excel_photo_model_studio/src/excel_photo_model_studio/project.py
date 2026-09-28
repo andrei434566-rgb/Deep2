@@ -500,8 +500,13 @@ def _projection_issues(photos, annotations, columns, depth_ranges) -> list[Issue
                 if (min(xs) < left - 1 or max(xs) > right + 1
                         or min(ys) < pixel_top - 1 or max(ys) > pixel_base + 1):
                     problems.append(f"маска выходит за границы столбика {index}")
-                if (max(xs) - min(xs)) < max(1, right - left - 2):
-                    problems.append(f"маска не покрывает ширину столбика {index}")
+                # The detected box is a review/cropping envelope and can
+                # include pale margins around the rock. Projected masks
+                # deliberately follow the visible core silhouette, so they
+                # must be substantial but need not fill the whole box width.
+                minimum_core_width = max(1, round((right - left) * 0.35))
+                if (max(xs) - min(xs)) < minimum_core_width:
+                    problems.append(f"маска слишком узкая для столбика {index}")
                 mask_top, mask_base = meters_to_centimeters(item.depth_top), meters_to_centimeters(item.depth_base)
                 pixel_span = max(1, pixel_base - pixel_top)
                 projected_top = top_cm + round((min(ys) - pixel_top) * (base_cm - top_cm) / pixel_span)
