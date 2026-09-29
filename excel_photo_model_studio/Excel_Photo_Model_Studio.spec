@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
-from importlib.metadata import distributions
+import sysconfig
 
 from PyInstaller.utils.hooks import collect_all, collect_dynamic_libs, collect_submodules
 
@@ -19,25 +19,21 @@ hiddenimports = collect_submodules("excel_photo_model_studio") + [
     "PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets", "xlrd",
 ]
 
-# CUDA pip wheels keep their runtime DLLs in separate ``nvidia-*`` wheels.
-# PyInstaller's Torch hook collects torch/lib, so include the companion CUDA
-# libraries at their package-relative paths and add those directories to the
-# Windows DLL search path before Torch is imported.
-for distribution in distributions():
-    if not str(distribution.metadata.get("Name", "")).casefold().startswith("nvidia-"):
-        continue
-    for relative in distribution.files or ():
-        relative_path = Path(str(relative).replace("\\", "/"))
-        if not relative_path.as_posix().startswith("nvidia/"):
-            continue
-        source = Path(distribution.locate_file(relative))
+# CUDA pip wheels install their runtime files below the shared ``nvidia``
+# namespace package. Read the actual site-packages tree instead of wheel
+# RECORD metadata: on Windows, RECORD paths can be normalized differently by
+# package installers and silently omit DLLs from a PyInstaller build.
+site_packages = Path(sysconfig.get_paths()["purelib"])
+nvidia_root = site_packages / "nvidia"
+if nvidia_root.is_dir():
+    for source in nvidia_root.rglob("*"):
         if not source.is_file():
             continue
         suffix = source.suffix.casefold()
-        destination = relative_path.parent.as_posix()
+        destination = source.parent.relative_to(site_packages).as_posix()
         if suffix == ".dll":
             binaries.append((str(source), destination))
-        elif suffix in {".json", ".dat", ".ptx", ".fatbin"}:
+        elif suffix in {".json", ".dat", ".ptx", ".fatbin", ".cubin", ".bin"}:
             datas.append((str(source), destination))
 
 for package in ("ultralytics", "cv2", "openpyxl", "xlrd", "numpy", "pytesseract"):
