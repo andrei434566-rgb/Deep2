@@ -31,8 +31,9 @@ jobs:
       - name: Install application dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu126
           python -m pip install -r excel_photo_model_studio/requirements.txt pyinstaller
+          python -c "import torch; assert torch.version.cuda == '12.6', torch.version.cuda; print('PyTorch:', torch.__version__, 'CUDA build:', torch.version.cuda)"
 
       - name: Install portable OCR runtime
         shell: pwsh
@@ -58,6 +59,8 @@ jobs:
         shell: pwsh
         working-directory: excel_photo_model_studio
         run: |
+          $cudaRuntime = Get-ChildItem -LiteralPath 'dist/Excel_Photo_Model_Studio/_internal/nvidia' -Filter '*.dll' -Recurse -File -ErrorAction SilentlyContinue
+          if (-not $cudaRuntime) { throw 'PyTorch CUDA runtime DLLs were not bundled.' }
           $process = Start-Process -FilePath 'dist/Excel_Photo_Model_Studio/Excel_Photo_Model_Studio.exe' -ArgumentList 'self-test --output portable-self-test.json' -WindowStyle Hidden -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Portable application smoke test failed: $($process.ExitCode)" }
           Get-Content portable-self-test.json
@@ -95,7 +98,7 @@ jobs:
           name: Excel Photo Model Studio ${{ github.ref_name }}
           generate_release_notes: true
           make_latest: false
-          body_path: excel_photo_model_studio/RELEASE_NOTES_0.4.8.md
+          body_path: excel_photo_model_studio/RELEASE_NOTES_0.6.0.md
           files: |
             excel_photo_model_studio/release/*.zip
             excel_photo_model_studio/release/*.sha256

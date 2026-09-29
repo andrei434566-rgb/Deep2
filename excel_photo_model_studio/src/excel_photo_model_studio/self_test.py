@@ -22,6 +22,11 @@ def run_self_test(destination: Path) -> dict:
     from .gui import MainWindow
     from .photos import _configure_tesseract
 
+    if not str(torch.version.cuda or "").startswith("12.6"):
+        raise RuntimeError(
+            "В портативной сборке должна быть CUDA-сборка PyTorch 12.6; "
+            f"получено: {torch.version.cuda!r}."
+        )
     if not _configure_tesseract(pytesseract):
         raise RuntimeError("В сборке не найден Tesseract.")
     image = np.full((110, 560, 3), 255, np.uint8)

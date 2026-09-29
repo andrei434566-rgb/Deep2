@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from .description_model import DescriptionGenerator
 from .depth import centimeters_to_meters, meters_to_centimeters
 from .matching import sort_photo_records
 from .models import COLUMN_ORDER_RIGHT_TO_LEFT
@@ -20,15 +20,13 @@ def analyze_photos_to_excel(
     photos_dir: Path,
     destination: Path,
     *,
-    description_model: Path | None = None,
     confidence: float = 0.25,
 ) -> dict:
-    """Apply the unified model and export facies index, full name, and short description."""
+    """Apply a YOLO segmentation model and map class metadata into the Excel output."""
     try:
-        import torch
         from ultralytics import YOLO
     except ImportError as exc:
-        raise RuntimeError("Для анализа нужны PyTorch и ultralytics.") from exc
+        raise RuntimeError("Для анализа нужны PyTorch и пакет ultralytics.") from exc
     model_path = Path(model_path).expanduser().resolve(strict=True)
     photos_dir = Path(photos_dir).expanduser().resolve(strict=True)
     destination = Path(destination).expanduser().absolute()
@@ -37,19 +35,24 @@ def analyze_photos_to_excel(
     if not 0.0 < float(confidence) < 1.0:
         raise ValueError("Порог уверенности должен быть между 0 и 1.")
 
-    checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
-    contract = checkpoint.get("core_model_contract", {}) if isinstance(checkpoint, dict) else {}
-    if not contract:
-        contract_path = model_path.with_name("model_contract.json")
-        if contract_path.is_file():
-            contract = json.loads(contract_path.read_text(encoding="utf-8"))
-    embedded_description = checkpoint.get("core_description_checkpoint") if isinstance(checkpoint, dict) else None
-    standalone = Path(description_model).expanduser().resolve(strict=True) if description_model else None
-    sibling = model_path.with_name("description_best.pt")
-    if standalone is None and embedded_description is None and sibling.is_file():
-        standalone = sibling
-    if standalone is None and embedded_description is None:
-        raise ValueError("В best.pt нет модели столбца 22 и рядом не найден description_best.pt.")
+    contract_path = model_path.with_name("model_contract.json")
+    metadata_path = model_path.with_name("class_metadata.json")
+    contract = json.loads(contract_path.read_text(encoding="utf-8")) if contract_path.is_file() else {}
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else {}
+    classes = metadata.get("classes") or contract.get("classes") or []
+    facies_reference = {
+        int(item["class_id"]): item for item in classes
+        if isinstance(item, dict) and str(item.get("class_id", "")).isdigit()
+    }
+    description_generator = None
+    description_model_warning = ""
+    description_model_path = model_path.with_name("description_best.pt")
+    if description_model_path.is_file():
+        try:
+            from .description_model import DescriptionGenerator
+            description_generator = DescriptionGenerator(description_model_path)
+        except Exception as exc:
+            description_model_warning = str(exc)
 
     records = discover_photos(photos_dir, use_ocr=True)
     records = enrich_core_column_depths(records)
@@ -63,8 +66,6 @@ def analyze_photos_to_excel(
         )
     records = sort_photo_records(records)
     visual_model = YOLO(str(model_path))
-    text_model = DescriptionGenerator(standalone if standalone is not None else embedded_description)
-    facies_reference = contract.get("facies_reference", {}) if isinstance(contract, dict) else {}
     output_rows: list[dict] = []
     skipped_photos: list[str] = []
     problems: list[str] = []
@@ -111,8 +112,10 @@ def analyze_photos_to_excel(
                 points = np.asarray(polygon, dtype=np.float32)
                 if points.ndim != 2 or points.shape[0] < 3:
                     continue
-                facies = _class_name(visual_model.names, class_id)
-                reference = facies_reference.get(facies, {}) if isinstance(facies_reference, dict) else {}
+                class_name = _class_name(visual_model.names, class_id)
+                reference = facies_reference.get(class_id, {})
+                facies_index = str(reference.get("facies_index") or class_name)
+                facies_name = str(reference.get("facies_name") or class_name)
                 # A prediction can cross column lanes. Clip and map each physical
                 # piece separately; never assign a ruler/background mask to the
                 # nearest column merely because it has a similar y coordinate.
@@ -133,10 +136,11 @@ def analyze_photos_to_excel(
                     "core_base": float(record.base),
                     "facies_top": depth_interval[0],
                     "facies_base": depth_interval[1],
-                    "facies_index": facies,
-                    "facies_name": reference.get("facies_name", facies),
+                    "facies_index": facies_index,
+                    "facies_name": facies_name,
                     "association": reference.get("association", ""),
                     "environment": reference.get("environment", ""),
+                    "description": reference.get("default_description", ""),
                     "confidence": score,
                     "source_photo": str(record.path),
                     "column_index": column_index,
@@ -161,10 +165,9 @@ def analyze_photos_to_excel(
                     if crop.size == 0:
                         problems.append(f"{record.path.name}: пустая вырезка интервала")
                         continue
-                    row["description"] = text_model.generate(crop, facies=row["facies_index"])
+                    row["_interval_crop"] = _compact_description_crop(crop)
                     if not row["description"]:
-                        problems.append(f"{record.path.name}: модель выдала пустое краткое описание")
-                        continue
+                        row["description"] = row["facies_name"]
                     resolved_rows.append(row)
             photo_rows = sorted(resolved_rows, key=lambda row: (row["facies_top"], row["facies_base"]))
             output_rows.extend(photo_rows)
@@ -173,6 +176,9 @@ def analyze_photos_to_excel(
     if not output_rows:
         raise ValueError("Модель не нашла ни одного интервала фаций на выбранных фотографиях.")
     output_rows.sort(key=lambda row: (str(row.get("well", "")).casefold(), row["facies_top"], row["facies_base"]))
+    generated_description_count, fallback_description_count = _apply_interval_descriptions(
+        output_rows, description_generator,
+    )
     layer_counts: dict[str, int] = {}
     for row in output_rows:
         well = row["well"]
@@ -191,6 +197,18 @@ def analyze_photos_to_excel(
         "photos": len(records),
         "rows": len(output_rows),
         "skipped_photos": skipped_photos,
+        "class_metadata_available": bool(facies_reference),
+        "description_model_available": description_generator is not None,
+        "description_model_warning": description_model_warning,
+        "generated_descriptions": generated_description_count,
+        "fallback_descriptions": fallback_description_count,
+        "description_policy": (
+            "Краткое описание генерируется отдельной символьной моделью из вырезки интервала, "
+            "индекса фации и длины полного непрерывного интервала. Части, продолжающиеся на соседнем фото, "
+            "получают один и тот же текст; при низкой уверенности используется подтверждённый пример класса."
+            if description_generator is not None
+            else "Текстовая модель отсутствует; используется подтверждённое описание класса из метаданных."
+        ),
         "output_excel": str(destination),
         "target_headers": {
             "facies_index": "Индекс фации",
@@ -198,6 +216,65 @@ def analyze_photos_to_excel(
             "target_text": "Краткое описание",
         },
     }
+
+
+def _apply_interval_descriptions(rows: list[dict], generator) -> tuple[int, int]:
+    """Generate once for a full same-facies interval, including page/column continuations."""
+    groups: list[list[dict]] = []
+    for row in rows:
+        if not groups:
+            groups.append([row])
+            continue
+        previous = groups[-1][-1]
+        same_photo = str(previous.get("source_photo", "")) == str(row.get("source_photo", ""))
+        same_prediction = previous.get("prediction_index") == row.get("prediction_index")
+        continues = (
+            str(previous.get("well", "")).casefold() == str(row.get("well", "")).casefold()
+            and str(previous.get("facies_index", "")).casefold() == str(row.get("facies_index", "")).casefold()
+            and meters_to_centimeters(previous["facies_base"]) == meters_to_centimeters(row["facies_top"])
+            and (not same_photo or same_prediction)
+        )
+        if continues:
+            groups[-1].append(row)
+        else:
+            groups.append([row])
+
+    generated_rows = 0
+    for group in groups:
+        fallback = next((str(row.get("description", "")).strip() for row in group if str(row.get("description", "")).strip()), "")
+        if not fallback:
+            fallback = str(group[0].get("facies_name", "")).strip()
+        description = fallback
+        if generator is not None:
+            # The generator sees the clearest reviewed/predicted interval crop,
+            # while its numeric condition is the total depth span of all pages.
+            crop = max(
+                (row.get("_interval_crop") for row in group if row.get("_interval_crop") is not None),
+                key=lambda image: image.shape[0] * image.shape[1], default=None,
+            )
+            full_thickness = max(0.0, float(group[-1]["facies_base"]) - float(group[0]["facies_top"]))
+            if crop is not None:
+                candidate, confidence = generator.generate_with_confidence(
+                    crop, facies=group[0].get("facies_index", ""),
+                    facies_name=group[0].get("facies_name", ""), interval_m=full_thickness,
+                )
+                if candidate and confidence >= 0.10:
+                    description = candidate
+                    generated_rows += len(group)
+        for row in group:
+            row["description"] = description
+            row.pop("_interval_crop", None)
+    return generated_rows, len(rows) - generated_rows
+
+
+def _compact_description_crop(image: np.ndarray, max_side: int = 256) -> np.ndarray:
+    """Bound memory while retaining the crop's original aspect ratio and texture."""
+    height, width = image.shape[:2]
+    scale = min(1.0, max_side / max(1, width, height))
+    if scale >= 1.0:
+        return image.copy()
+    size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    return cv2.resize(image, size, interpolation=cv2.INTER_AREA)
 
 
 def polygon_depth_interval(

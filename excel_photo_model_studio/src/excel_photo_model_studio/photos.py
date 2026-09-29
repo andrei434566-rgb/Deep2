@@ -36,6 +36,26 @@ def parse_filename(path: Path) -> PhotoRecord:
     return PhotoRecord(path=path, well=_well_hint(stem))
 
 
+def confirm_manual_photo_interval(
+    record: PhotoRecord, well: str, top: float, base: float,
+) -> PhotoRecord:
+    """Apply a corrected interval and invalidate depth OCR derived from the old one."""
+    changed = (
+        record.well.strip() != str(well).strip()
+        or record.top != float(top)
+        or record.base != float(base)
+    )
+    return replace(
+        record,
+        well=str(well).strip(), top=float(top), base=float(base),
+        source="manual" if changed else record.source,
+        mapping_confirmed=True,
+        column_depths=() if changed else record.column_depths,
+        column_ocr_checked=False if changed else record.column_ocr_checked,
+        depth_basis="unknown" if changed else record.depth_basis,
+    )
+
+
 def _is_figure_number(stem: str, start: int) -> bool:
     """Figure references such as ``Fig. 15.1-20`` are not depth intervals."""
     before = stem[:start]

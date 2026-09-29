@@ -200,6 +200,50 @@ class VisionTests(unittest.TestCase):
         self.assertEqual(3, len(boxes))
         self.assertTrue(all(right - left >= 80 for left, _, right, _ in boxes))
 
+    def test_rejects_down_arrows_but_keeps_half_core_columns(self):
+        image = np.full((500, 500, 3), 255, dtype=np.uint8)
+        cv2.rectangle(image, (65, 25), (125, 455), (145, 145, 145), -1)
+        # A genuine narrow/half-core lane must remain eligible next to a full lane.
+        cv2.rectangle(image, (165, 45), (190, 435), (155, 155, 155), -1)
+        for x in (270, 340, 410):
+            cv2.arrowedLine(image, (x, 240), (x, 330), (15, 45, 100), 6, tipLength=0.24)
+        for y in (100, 190, 280, 370):
+            cv2.line(image, (25, y), (475, y), (25, 25, 25), 2)
+
+        boxes = detect_core_columns(image)
+
+        self.assertEqual(2, len(boxes))
+        centers = [(left + right) / 2 for left, _, right, _ in boxes]
+        self.assertTrue(any(65 <= center <= 125 for center in centers))
+        self.assertTrue(any(165 <= center <= 190 for center in centers))
+        self.assertFalse(any(250 <= center <= 430 for center in centers))
+
+    def test_keeps_a_one_centimetre_facies_fragment_at_the_final_core_edge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            photo_path = Path(directory) / "W-1 4144.00-4144.20.jpg"
+            image = np.full((400, 180, 3), 255, dtype=np.uint8)
+            cv2.rectangle(image, (60, 25), (120, 375), (145, 145, 145), -1)
+            ok, encoded = cv2.imencode(".jpg", image)
+            self.assertTrue(ok)
+            photo_path.write_bytes(encoded.tobytes())
+            photo = PhotoRecord(photo_path, "W-1", 4144.00, 4144.20, "manual", True)
+            rows = [
+                DescriptionRow("W-1", 4144.00, 4144.10, "Dch", "Data", 2),
+                DescriptionRow("W-1", 4144.10, 4144.19, "Inbay", "Data", 3),
+                DescriptionRow("W-1", 4144.19, 4144.20, "MSTF", "Data", 4),
+            ]
+            matches = [
+                Match(photo, row, row.top, row.base) for row in rows
+            ]
+            annotations, _columns, _orders = project_matches(
+                matches, detected_columns_by_photo={photo_path: [(60, 25, 121, 376)]},
+            )
+
+        self.assertEqual(["Dch", "Inbay", "MSTF"], [item.label for item in annotations])
+        self.assertEqual(4144.19, annotations[-1].depth_top)
+        self.assertEqual(4144.20, annotations[-1].depth_base)
+        self.assertGreaterEqual(max(y for _x, y in annotations[-1].polygon), 375)
+
     def test_detects_pale_report_columns_instead_of_left_depth_ruler(self):
         image = np.full((1200, 1000, 3), 255, dtype=np.uint8)
         cv2.line(image, (105, 110), (105, 1030), (40, 40, 40), 3)

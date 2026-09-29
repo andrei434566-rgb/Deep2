@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 import tempfile
+import json
 import sys
 import types
 from pathlib import Path
@@ -12,7 +13,8 @@ import numpy as np
 import torch
 
 from excel_photo_model_studio.inference import (
-    analyze_photos_to_excel, polygon_depth_interval, _uncovered_intervals, _resolve_prediction_overlaps,
+    analyze_photos_to_excel, polygon_depth_interval, _uncovered_intervals,
+    _resolve_prediction_overlaps, _apply_interval_descriptions,
 )
 from excel_photo_model_studio.models import PhotoRecord
 
@@ -49,11 +51,40 @@ class InferenceTests(unittest.TestCase):
         result = _resolve_prediction_overlaps(rows)
         self.assertEqual([(100.0, 100.5), (100.5, 101.0)], [(row["facies_top"], row["facies_base"]) for row in result])
 
+    def test_description_is_generated_once_for_facies_continuing_on_next_photo(self):
+        class FakeGenerator:
+            def __init__(self):
+                self.calls = []
+
+            def generate_with_confidence(self, image, *, facies, facies_name, interval_m):
+                self.calls.append((image.shape, facies, facies_name, interval_m))
+                return "Описание полного интервала.", 0.9
+
+        generator = FakeGenerator()
+        rows = [
+            {"well": "W", "facies_index": "Dch", "facies_name": "Channels", "description": "Fallback.",
+             "facies_top": 100.0, "facies_base": 101.0, "source_photo": "a.jpg", "_interval_crop": np.zeros((50, 10, 3), np.uint8)},
+            {"well": "W", "facies_index": "Dch", "facies_name": "Channels", "description": "Fallback.",
+             "facies_top": 101.0, "facies_base": 102.0, "source_photo": "b.jpg", "_interval_crop": np.zeros((60, 10, 3), np.uint8)},
+        ]
+
+        generated, fallback = _apply_interval_descriptions(rows, generator)
+
+        self.assertEqual((2, 0), (generated, fallback))
+        self.assertEqual(1, len(generator.calls))
+        self.assertEqual(((60, 10, 3), "Dch", "Channels", 2.0), generator.calls[0])
+        self.assertEqual(["Описание полного интервала."] * 2, [row["description"] for row in rows])
+        self.assertTrue(all("_interval_crop" not in row for row in rows))
+
     def _analysis_context(self, root, records, polygons):
         from contextlib import ExitStack
         stack = ExitStack()
         model_path = root / "best.pt"
         model_path.touch()
+        (root / "class_metadata.json").write_text(json.dumps({"classes": [{
+            "class_id": 0, "facies_index": "Tcr", "facies_name": "Песчаник",
+            "default_description": "Песчаник мелкозернистый.",
+        }]}), encoding="utf-8")
         result = SimpleNamespace(
             masks=SimpleNamespace(xy=polygons),
             boxes=SimpleNamespace(cls=torch.zeros(len(polygons)), conf=torch.full((len(polygons),), .95)),
@@ -62,22 +93,19 @@ class InferenceTests(unittest.TestCase):
         fake = types.ModuleType("ultralytics")
         fake.YOLO = lambda _: visual
         stack.enter_context(patch.dict(sys.modules, {"ultralytics": fake}))
-        stack.enter_context(patch("torch.load", return_value={"core_description_checkpoint": {"schema": "fake"}}))
         stack.enter_context(patch("excel_photo_model_studio.inference.discover_photos", return_value=records))
         stack.enter_context(patch("excel_photo_model_studio.inference.enrich_core_column_depths", side_effect=lambda rows: rows))
         stack.enter_context(patch("excel_photo_model_studio.inference.read_image", return_value=np.full((100, 100, 3), 180, dtype=np.uint8)))
         stack.enter_context(patch("excel_photo_model_studio.inference.detect_core_columns", return_value=[(10, 10, 50, 90)]))
         stack.enter_context(patch("excel_photo_model_studio.inference.detect_column_order", return_value="left_to_right"))
-        text_factory = stack.enter_context(patch("excel_photo_model_studio.inference.DescriptionGenerator"))
-        text_factory.return_value.generate.return_value = "Песчаник слоистый."
         export = stack.enter_context(patch("excel_photo_model_studio.inference.export_standardized_workbook"))
-        return stack, model_path, text_factory, export
+        return stack, model_path, export
 
     def test_unresolved_photo_blocks_partial_well_export(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             records = [PhotoRecord(root / "ok.jpg", "W", 100, 101), PhotoRecord(root / "unknown.jpg")]
-            stack, model, _, export = self._analysis_context(root, records, [])
+            stack, model, export = self._analysis_context(root, records, [])
             with stack, self.assertRaisesRegex(ValueError, "unknown.jpg"):
                 analyze_photos_to_excel(model, root, root / "out.xlsx")
             export.assert_not_called()
@@ -87,7 +115,7 @@ class InferenceTests(unittest.TestCase):
             root = Path(directory)
             records = [PhotoRecord(root / "a.jpg", "W", 100, 101)]
             polygon = np.array([[10, 10], [50, 10], [50, 50], [10, 50]], dtype=np.float32)
-            stack, model, _, export = self._analysis_context(root, records, [polygon])
+            stack, model, export = self._analysis_context(root, records, [polygon])
             with stack, self.assertRaisesRegex(ValueError, "не покрывают"):
                 analyze_photos_to_excel(model, root, root / "out.xlsx")
             export.assert_not_called()
@@ -97,15 +125,14 @@ class InferenceTests(unittest.TestCase):
             root = Path(directory)
             records = [PhotoRecord(root / "b.jpg", "W", 101, 102), PhotoRecord(root / "a.jpg", "W", 100, 101)]
             polygon = np.array([[10, 10], [50, 10], [50, 90], [10, 90]], dtype=np.float32)
-            stack, model, text_factory, export = self._analysis_context(root, records, [polygon])
+            stack, model, export = self._analysis_context(root, records, [polygon])
             with stack:
                 info = analyze_photos_to_excel(model, root, root / "out.xlsx")
-            text_factory.assert_called_once()
-            self.assertEqual(2, text_factory.return_value.generate.call_count)
             self.assertEqual(2, info["photos"])
             rows = export.call_args.args[0]
             self.assertEqual([1, 2], [row["layer_no"] for row in rows])
             self.assertEqual([100, 101], [row["facies_top"] for row in rows])
+            self.assertTrue(all(row["description"] == "Песчаник мелкозернист." for row in rows))
 
 
 if __name__ == "__main__":

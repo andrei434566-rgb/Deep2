@@ -1131,19 +1131,17 @@ def _select_core_boxes(
         if narrow and near_page_edge and sparse_scale:
             continue
         plausible.append(box)
-    # Do not remove a narrow lane merely because its neighbours are full-width
-    # cores: half-core pieces are legitimate and common in the source set. The
-    # exception is a thin extreme-left lane beside several real columns, which
-    # is the page's depth ruler rather than a core lane.
-    broad = [box for box in plausible if box[2] - box[0] >= max(20, width * 0.04)]
-    if len(broad) >= 2:
-        median_width = float(np.median([box[2] - box[0] for box in broad]))
+    # Half-core lanes are common, but printed arrows beside a short page core
+    # can also form tall, dense connected components. Use the wider rock lanes
+    # as a local scale reference and reject only components much thinner than
+    # a half-core; this keeps partial core while dropping arrows/ruler marks.
+    broad = [box for box in plausible if box[2] - box[0] >= max(12, width * 0.025)]
+    if broad:
+        reference_width = max(box[2] - box[0] for box in broad)
+        minimum_lane_width = max(6, round(reference_width * 0.32))
         plausible = [
             box for box in plausible
-            if not (
-                (box[0] + box[2]) / 2 < width * 0.18
-                and box[2] - box[0] < median_width * 0.45
-            )
+            if box[2] - box[0] >= minimum_lane_width
         ]
     return plausible
 

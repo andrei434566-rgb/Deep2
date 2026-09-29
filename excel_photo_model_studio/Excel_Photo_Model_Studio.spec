@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
+from importlib.metadata import distributions
 
 from PyInstaller.utils.hooks import collect_all, collect_dynamic_libs, collect_submodules
 
@@ -17,6 +18,27 @@ binaries = collect_dynamic_libs("shiboken6")
 hiddenimports = collect_submodules("excel_photo_model_studio") + [
     "PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets", "xlrd",
 ]
+
+# CUDA pip wheels keep their runtime DLLs in separate ``nvidia-*`` wheels.
+# PyInstaller's Torch hook collects torch/lib, so include the companion CUDA
+# libraries at their package-relative paths and add those directories to the
+# Windows DLL search path before Torch is imported.
+for distribution in distributions():
+    if not str(distribution.metadata.get("Name", "")).casefold().startswith("nvidia-"):
+        continue
+    for relative in distribution.files or ():
+        relative_path = Path(str(relative).replace("\\", "/"))
+        if not relative_path.as_posix().startswith("nvidia/"):
+            continue
+        source = Path(distribution.locate_file(relative))
+        if not source.is_file():
+            continue
+        suffix = source.suffix.casefold()
+        destination = relative_path.parent.as_posix()
+        if suffix == ".dll":
+            binaries.append((str(source), destination))
+        elif suffix in {".json", ".dat", ".ptx", ".fatbin"}:
+            datas.append((str(source), destination))
 
 for package in ("ultralytics", "cv2", "openpyxl", "xlrd", "numpy", "pytesseract"):
     collected = collect_all(package)
@@ -36,7 +58,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[str(project_root / "cuda_runtime_hook.py")],
     excludes=["tkinter", "IPython", "notebook", "jupyter", "pytest"],
     noarchive=False,
     optimize=1,

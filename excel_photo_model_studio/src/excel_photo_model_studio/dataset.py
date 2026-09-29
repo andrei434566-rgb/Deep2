@@ -57,6 +57,23 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
     if not rows:
         raise ValueError("Нет подтверждённых масок. Проверьте previews и подтвердите строки в приложении.")
     facies_statistics = _fresh_facies_statistics(rows)
+    for facies in facies_statistics:
+        matching_rows = [
+            row for row in rows
+            if row.get("facies_index", "").casefold() == str(facies["facies_index"]).casefold()
+        ]
+        descriptions = Counter(
+            " ".join(str(row.get("target_text", "")).split())
+            for row in matching_rows if str(row.get("target_text", "")).strip()
+        )
+        facies["description_examples"] = [value for value, _count in descriptions.most_common(5)]
+        facies["default_description"] = descriptions.most_common(1)[0][0] if descriptions else ""
+        for field in ("association", "environment"):
+            values = Counter(
+                " ".join(str(row.get(field, "")).split())
+                for row in matching_rows if str(row.get(field, "")).strip()
+            )
+            facies[field] = values.most_common(1)[0][0] if values else ""
     by_photo: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row in rows:
         _validate_annotation(row)
@@ -102,31 +119,50 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
                 for x, y in polygon
             )
             lines.append(f"{class_ids[row['facies_index']]} {coords}")
-            target_text = row.get("target_text", "").strip()
+            target_text = " ".join(str(row.get("target_text", "")).split())
             if target_text:
-                xs = [float(point[0]) for point in polygon]
-                ys = [float(point[1]) for point in polygon]
-                x0, x1 = max(0, int(min(xs))), min(source_image.shape[1], int(max(xs)) + 1)
-                y0, y1 = max(0, int(min(ys))), min(source_image.shape[0], int(max(ys)) + 1)
-                crop = source_image[y0:y1, x0:x1]
+                points = np.asarray(polygon, dtype=np.float32)
+                xs, ys = points[:, 0], points[:, 1]
+                x0, x1 = max(0, int(np.floor(xs.min()))), min(source_image.shape[1], int(np.ceil(xs.max())) + 1)
+                y0, y1 = max(0, int(np.floor(ys.min()))), min(source_image.shape[0], int(np.ceil(ys.max())) + 1)
+                crop = source_image[y0:y1, x0:x1].copy()
                 if crop.size == 0:
                     raise ValueError(f"Пустая подтверждённая вырезка: {row.get('annotation_id', '')}")
+                # Keep only pixels inside the reviewed interval mask. This prevents
+                # ruler lines/arrows/background from becoming text-model shortcuts.
+                local_polygon = np.rint(points - np.array([x0, y0], dtype=np.float32)).astype(np.int32)
+                interval_mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+                cv2.fillPoly(interval_mask, [local_polygon], 255)
+                crop[interval_mask == 0] = 255
                 crop_path = destination / "crops" / split / f"{stem}_{annotation_index:03d}.jpg"
                 ok, encoded = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 96])
                 if not ok:
                     raise ValueError(f"Не удалось сохранить вырезку: {row.get('annotation_id', '')}")
                 crop_path.write_bytes(encoded.tobytes())
+                facies_top = _number_or(row.get("facies_top"), float(row["depth_top"]))
+                facies_base = _number_or(row.get("facies_base"), float(row["depth_base"]))
                 caption_samples.append({
-                    "annotation_id": row.get("annotation_id", ""), "split": split,
-                    "crop": str(crop_path.relative_to(destination).as_posix()),
-                    "source_photo": str(photo), "source_sha256": digest,
-                    "well": row.get("well", ""), "depth_top": float(row["depth_top"]),
-                    "depth_base": float(row["depth_base"]), "facies": row["facies_index"],
-                    "facies_index": row["facies_index"], "facies_name": row["facies_name"],
-                    "association": row.get("association", ""), "environment": row.get("environment", ""),
+                    "annotation_id": row.get("annotation_id", ""),
+                    "split": split,
+                    "crop": crop_path.relative_to(destination).as_posix(),
+                    "source_photo": str(photo),
+                    "source_sha256": digest,
+                    "well": row.get("well", ""),
+                    "depth_top": float(row["depth_top"]),
+                    "depth_base": float(row["depth_base"]),
+                    "interval_top": facies_top,
+                    "interval_base": facies_base,
+                    "interval_m": max(0.0, facies_base - facies_top),
+                    "facies": row["facies_index"],
+                    "facies_index": row["facies_index"],
+                    "facies_name": row["facies_name"],
+                    "association": row.get("association", ""),
+                    "environment": row.get("environment", ""),
                     "field_name": row.get("field_name", ""),
-                    "target_text": target_text, "source_file": row.get("source_file", ""),
-                    "source_sheet": row.get("source_sheet", ""), "source_row": row.get("source_row", ""),
+                    "target_text": target_text,
+                    "source_file": row.get("source_file", ""),
+                    "source_sheet": row.get("source_sheet", ""),
+                    "source_row": row.get("source_row", ""),
                 })
         label_path = destination / "labels" / split / f"{stem}.txt"
         label_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -136,9 +172,38 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
             "label": str(label_path.relative_to(destination)),
             "well": annotations[0].get("well", ""), "annotation_count": len(annotations),
         })
+    split_lists = {}
+    for split in ("train", "val"):
+        relative_images = [
+            item["image"] for item in samples if item["split"] == split
+        ]
+        list_path = destination / f"{split}.txt"
+        list_path.write_text("".join(f"{value}\n" for value in relative_images), encoding="utf-8")
+        split_lists[split] = str(list_path)
+    class_metadata = {
+        "schema": "excel-photo-facies-metadata-v1",
+        "target_headers": {
+            "facies_index": "Индекс фации",
+            "facies_name": "Название фации",
+            "description": "Краткое описание",
+        },
+        "classes": [
+            {"class_id": class_id, **facies_statistics[class_id]}
+            for class_id in range(len(labels))
+        ],
+        "description_policy": (
+            "YOLO predicts the interval mask and facies class. A separate character decoder is trained "
+            "from approved interval crops and the Excel short-description field."
+        ),
+    }
+    class_metadata_path = destination / "class_metadata.json"
+    class_metadata_path.write_text(
+        json.dumps(class_metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+    )
     caption_path = destination / "caption_dataset.jsonl"
     caption_path.write_text(
-        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in caption_samples), encoding="utf-8"
+        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in caption_samples),
+        encoding="utf-8",
     )
     yaml_path = destination / "data.yaml"
     yaml_path.write_text("\n".join((
@@ -147,10 +212,11 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
         *(f"  {index}: {json.dumps(label, ensure_ascii=False)}" for index, label in enumerate(labels)), "",
     )), encoding="utf-8")
     manifest = {
-        "schema": "excel-photo-yolo-seg-v2", "created_at": datetime.now().isoformat(timespec="seconds"),
+        "schema": "excel-photo-yolo-seg-v4", "created_at": datetime.now().isoformat(timespec="seconds"),
         "project": str(project_dirs[0]) if len(project_dirs) == 1 else "",
         "projects": [str(path) for path in project_dirs], "project_count": len(project_dirs),
         "data_yaml": str(yaml_path), "class_names": labels,
+        "class_metadata": str(class_metadata_path), "split_lists": split_lists,
         "facies_statistics": facies_statistics,
         "facies_count": len(facies_statistics),
         "source_target_headers": source_target_headers,
@@ -168,7 +234,7 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
     return {**manifest, "output_dir": str(destination)}
 
 
-def _fresh_facies_statistics(rows: list[dict[str, str]]) -> list[dict[str, str | int]]:
+def _fresh_facies_statistics(rows: list[dict[str, str]]) -> list[dict[str, str | int | list[str]]]:
     """Reset class ids for this dataset and derive the taxonomy only from its Excel annotations."""
     by_key: dict[str, dict] = {}
     for row in rows:
@@ -285,6 +351,16 @@ def _validate_annotation(row: dict[str, str]) -> None:
     top, base = float(row["depth_top"]), float(row["depth_base"])
     if not math.isfinite(top) or not math.isfinite(base) or base <= top:
         raise ValueError(f"Некорректный метраж маски: {row.get('annotation_id', '')}.")
+
+
+def _number_or(value, fallback: float) -> float:
+    if value is None or not str(value).strip():
+        return float(fallback)
+    try:
+        result = float(str(value).strip().replace(" ", "").replace(",", "."))
+    except ValueError:
+        return float(fallback)
+    return result if math.isfinite(result) else float(fallback)
 
 
 def _verify_validation_snapshot(project: Path, report: dict) -> None:

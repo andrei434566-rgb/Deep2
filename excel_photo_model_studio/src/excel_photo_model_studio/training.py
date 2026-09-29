@@ -1,197 +1,196 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
+import tempfile
 from datetime import datetime
 from pathlib import Path
+
+
+DEFAULT_WEIGHTS = "yolo11s-seg.pt"
 
 
 def train_model(
     dataset_dir: Path,
     output_dir: Path,
     *,
-    architecture: str = "yolo11n-seg.yaml",
-    epochs: int = 50,
-    patience: int = 12,
-    image_size: int = 640,
-    device: str | int | None = None,
+    weights: str | Path = DEFAULT_WEIGHTS,
+    epochs: int = 300,
+    patience: int = 80,
+    image_size: int = 1024,
+    batch_size: int = 2,
+    device: int | str = 0,
 ) -> dict:
+    """Fine-tune a YOLO11 segmentation checkpoint on the reviewed CVAT dataset."""
     dataset_dir = Path(dataset_dir).expanduser().resolve(strict=True)
     output_dir = Path(output_dir).expanduser().absolute()
-    architecture = str(architecture).strip()
-    if not architecture or Path(architecture).suffix.lower() not in {".yaml", ".yml"}:
-        raise ValueError("Для обучения с нуля укажите YAML-архитектуру сегментационной модели, а не готовый .pt.")
+    weights = str(weights).strip()
+    if not weights:
+        raise ValueError("Укажите предобученные веса YOLO11-seg.")
+    if str(device).strip().casefold() not in {"0", "cuda:0"}:
+        raise ValueError("Обучение в этой версии запускается только на GPU CUDA 0.")
     if output_dir.exists():
         raise FileExistsError(f"Папка результата уже существует: {output_dir}")
-    if epochs < 1 or patience < 1:
-        raise ValueError("epochs и patience должны быть положительными.")
+    if epochs < 1 or patience < 1 or image_size < 32 or batch_size < 1:
+        raise ValueError("Эпохи, patience, размер изображения и batch должны быть положительными.")
+
     yaml_path = dataset_dir / "data.yaml"
     manifest_path = dataset_dir / "dataset_manifest.json"
-    if not yaml_path.is_file() or not manifest_path.is_file():
-        raise ValueError("Папка не является подготовленным датасетом этой системы.")
+    metadata_path = dataset_dir / "class_metadata.json"
+    train_list = dataset_dir / "train.txt"
+    val_list = dataset_dir / "val.txt"
+    if not yaml_path.is_file() or not manifest_path.is_file() or not metadata_path.is_file():
+        raise ValueError("Выберите датасет приложения в формате CVAT / Ultralytics YOLO Segmentation.")
+    if not train_list.is_file() or not train_list.read_text(encoding="utf-8").strip():
+        raise ValueError("В датасете нет списка обучающих фото train.txt.")
+    if not val_list.is_file() or not val_list.read_text(encoding="utf-8").strip():
+        raise ValueError("В датасете нет независимой выборки проверки val.txt. Добавьте подтверждённые фото/скважины.")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if not manifest.get("class_names") or not metadata.get("classes"):
+        raise ValueError("В датасете не найден список классов фаций.")
+
     try:
+        import torch
         from ultralytics import YOLO
     except ImportError as exc:
-        raise RuntimeError("Установите ultralytics из requirements.txt.") from exc
-    if device is None:
-        try:
-            import torch
-            device = 0 if torch.cuda.is_available() else "cpu"
-        except ImportError:
-            device = "cpu"
-    runs_dir = output_dir.with_name(output_dir.name + "_runs")
-    if runs_dir.exists():
-        raise FileExistsError(f"Папка журналов уже существует: {runs_dir}")
-    runs_dir.mkdir(parents=True)
-    model = YOLO(architecture)
+        raise RuntimeError("Для обучения нужны CUDA-сборка PyTorch и пакет ultralytics.") from exc
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA GPU недоступна: обучение остановлено без перехода на CPU. "
+            "Проверьте NVIDIA-драйвер и CUDA-сборку PyTorch в этой версии приложения."
+        )
+    try:
+        torch.cuda.set_device(0)
+        gpu_name = torch.cuda.get_device_name(0)
+    except Exception as exc:
+        raise RuntimeError(f"Не удалось инициализировать CUDA GPU 0: {exc}") from exc
+
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    runs_root = output_dir.with_name(output_dir.name + "_runs")
+    runs_dir = runs_root / f"run_{datetime.now():%Y%m%d_%H%M%S_%f}"
+    runs_dir.mkdir(parents=True, exist_ok=False)
+    model = YOLO(weights)
+    _require_yolo11_segmentation(model, weights)
     result = model.train(
         data=str(yaml_path), task="segment", epochs=int(epochs), patience=int(patience),
-        pretrained=False,
-        imgsz=int(image_size), device=device, batch=-1 if device != "cpu" else 4,
-        # Ultralytics' AMP self-test can fetch pretrained weights even when
-        # pretrained=False. Keep scratch/offline training genuinely offline.
-        cache=False, amp=False, seed=42, deterministic=True, workers=0,
-        project=str(runs_dir), name="training", exist_ok=False,
-        mosaic=0.0, mixup=0.0, copy_paste=0.0, flipud=0.0,
-        degrees=0.0, perspective=0.0, translate=0.05, scale=0.15,
+        imgsz=int(image_size), device=0, batch=int(batch_size), workers=0,
+        optimizer="AdamW", lr0=0.0005, cos_lr=True, amp=True,
+        pretrained=True, cache=False, rect=True,
+        save_period=25, seed=42, deterministic=True,
+        hsv_h=0.005, hsv_s=0.25, hsv_v=0.25,
+        degrees=2.0, translate=0.05, scale=0.15, shear=0.0,
+        flipud=0.0, fliplr=0.0, mosaic=0.0, mixup=0.0, copy_paste=0.0,
+        project=str(runs_dir), name="yolo11_finetune", exist_ok=False,
     )
-    save_dir = Path(str(getattr(result, "save_dir", runs_dir / "training")))
+    save_dir = Path(str(getattr(result, "save_dir", runs_dir / "yolo11_finetune")))
     best = save_dir / "weights" / "best.pt"
     if not best.is_file():
-        raise RuntimeError("Обучение завершилось без best.pt.")
-    output_dir.mkdir(parents=True)
-    published = output_dir / "best.pt"
-    shutil.copy2(best, published)
-    shutil.copy2(yaml_path, output_dir / "data.yaml")
-    shutil.copy2(manifest_path, output_dir / "dataset_manifest.json")
-    info = {
-        "schema": "excel-photo-trained-model-v2", "status": "candidate_requires_review",
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "initialization": "random_weights", "pretrained": False, "architecture": architecture,
-        "best_model": str(published), "dataset": str(dataset_dir), "epochs_limit": epochs,
-        "patience": patience, "image_size": image_size, "device": str(device), "training_run": str(save_dir),
-    }
-    (output_dir / "training_info.json").write_text(json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        raise RuntimeError("Обучение YOLO11 завершилось без weights/best.pt.")
+
+    # Free the segmentation trainer's optimizer/model allocations before the
+    # separate text model uses the same GPU.
+    import gc
+    del result, model
+    gc.collect()
+    if hasattr(torch.cuda, "empty_cache"):
+        torch.cuda.empty_cache()
+
+    description_dir = runs_dir / "description_model"
+    try:
+        from .description_model import train_description_model
+        description_info = train_description_model(
+            dataset_dir, description_dir, epochs=40, patience=8, image_size=128,
+            hidden_size=128, batch_size=8, device="cuda:0", progress=print,
+        )
+    except Exception as exc:
+        description_info = {
+            "schema": "excel-photo-description-training-v2",
+            "status": "not_trained",
+            "reason": f"Обучение текста не завершено: {exc}",
+        }
+        print("Модель сегментации обучена; генерация описаний пропущена. " + description_info["reason"])
+    description_checkpoint = description_dir / "description_best.pt"
+
+    with tempfile.TemporaryDirectory(prefix=f".{output_dir.name}_pending_", dir=output_dir.parent) as staging:
+        package_dir = Path(staging) / output_dir.name
+        package_dir.mkdir()
+        published = package_dir / "best.pt"
+        shutil.copy2(best, published)
+        shutil.copy2(yaml_path, package_dir / "data.yaml")
+        shutil.copy2(manifest_path, package_dir / "dataset_manifest.json")
+        shutil.copy2(metadata_path, package_dir / "class_metadata.json")
+        if description_info.get("status") == "trained_candidate" and description_checkpoint.is_file():
+            shutil.copy2(description_checkpoint, package_dir / "description_best.pt")
+            shutil.copy2(
+                description_dir / "description_training_info.json",
+                package_dir / "description_training_info.json",
+            )
+        else:
+            (package_dir / "description_training_info.json").write_text(
+                json.dumps(description_info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+            )
+        contract = {
+            "schema": "excel-photo-yolo11-seg-v2",
+            "task": "instance-segmentation",
+            "architecture": "YOLO11-seg",
+            "best_model": "best.pt",
+            "class_metadata": "class_metadata.json",
+            "target_headers": metadata.get("target_headers", {}),
+            "classes": metadata["classes"],
+            "description_model": "description_best.pt" if description_info.get("status") == "trained_candidate" else None,
+            "description_policy": (
+                "Separate interval-image + facies-index + interval-thickness character decoder; "
+                "review generated text before geological use."
+                if description_info.get("status") == "trained_candidate"
+                else "Text model not trained: " + str(description_info.get("reason", "insufficient interval examples"))
+            ),
+        }
+        (package_dir / "model_contract.json").write_text(
+            json.dumps(contract, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
+        info = {
+            "schema": "excel-photo-model-training-v2",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "status": "candidate_requires_review",
+            "architecture": "YOLO11-seg",
+            "pretrained_weights": weights,
+            "device": "cuda:0",
+            "gpu_name": str(gpu_name),
+            "best_model": str(output_dir / "best.pt"),
+            "dataset": str(dataset_dir),
+            "training_run": str(save_dir),
+            "epochs_limit": int(epochs),
+            "patience": int(patience),
+            "image_size": int(image_size),
+            "batch_size": int(batch_size),
+            "class_count": len(manifest["class_names"]),
+            "photo_count": int(manifest.get("photo_count", 0)),
+            "mask_count": int(manifest.get("annotation_count", 0)),
+            "description_model_status": description_info.get("status", "not_trained"),
+            "description_model_reason": description_info.get("reason", ""),
+            "description_train_samples": int(description_info.get("train_samples", 0)),
+            "description_val_samples": int(description_info.get("val_samples", 0)),
+            "description_best_epoch": int(description_info.get("best_epoch", 0)),
+            "description_best_val_loss": description_info.get("best_val_loss"),
+        }
+        (package_dir / "training_info.json").write_text(
+            json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
+        package_dir.rename(output_dir)
     return info
 
 
-def train_bundle(
-    dataset_dir: Path,
-    output_dir: Path,
-    *,
-    architecture: str = "yolo11n-seg.yaml",
-    epochs: int = 50,
-    patience: int = 12,
-    image_size: int = 640,
-    device: str | int | None = None,
-    description_epochs: int = 40,
-    description_patience: int = 8,
-) -> dict:
-    """Train the compatible two-part package used by Kern Analyzer."""
-    dataset_dir = Path(dataset_dir).expanduser().resolve(strict=True)
-    manifest = json.loads((dataset_dir / "dataset_manifest.json").read_text(encoding="utf-8"))
-    if manifest.get("train_caption_count", 0) < 5 or manifest.get("val_caption_count", 0) < 1:
-        raise ValueError("Недостаточно строк с кратким описанием для обучения полного комплекта модели.")
-    visual = train_model(
-        dataset_dir, output_dir, architecture=architecture, epochs=epochs,
-        patience=patience, image_size=image_size, device=device,
-    )
-    from .description_model import train_description_model
-    text = train_description_model(
-        dataset_dir, output_dir, epochs=description_epochs, patience=description_patience, device=device,
-    )
-    facies_reference = _facies_reference(dataset_dir)
-    contract = {
-        "schema": "kern-unified-model-bundle-v4",
-        "status": "candidate_requires_geologist_review",
-        "initialization": "random_weights",
-        "pretrained": False,
-        "architecture": architecture,
-        "visual_model": "best.pt",
-        "description_embedded_in_best_pt": True,
-        "description_checkpoint_key": "core_description_checkpoint",
-        "standalone_description_model": "description_best.pt",
-        "target_fields": ["facies_index", "facies_name", "target_text"],
-        "target_headers": {
-            "facies_index": "Индекс фации",
-            "facies_name": "Название фации",
-            "target_text": "Краткое описание",
-        },
-        "facies_classes": manifest.get("class_names", []),
-        "facies_statistics": manifest.get("facies_statistics", []),
-        "source_target_headers": manifest.get("source_target_headers", []),
-        "facies_class_key": "facies_index",
-        "facies_taxonomy_policy": "fresh_per_dataset_from_source_excel",
-        "description_target_header": "Краткое описание",
-        "description_conditioning": ["interval_image", "facies_class"],
-        "facies_reference": facies_reference,
-        "dataset_manifest": "dataset_manifest.json",
-        "note": "Excel fields are resolved by semantic header names per workbook and sheet; model class index/name mappings are derived afresh from this dataset.",
-    }
-    embed_description_checkpoint(
-        Path(output_dir) / "best.pt", Path(output_dir) / "description_best.pt", contract,
-    )
-    (Path(output_dir) / "model_contract.json").write_text(
-        json.dumps(contract, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    return {"visual": visual, "description": text, "contract": contract, "output_dir": str(Path(output_dir).resolve())}
-
-
-def embed_description_checkpoint(visual_model: Path, description_model: Path, contract: dict) -> Path:
-    """Embed description and facies-index/name metadata without breaking Ultralytics loading."""
-    try:
-        import torch
-    except ImportError as exc:
-        raise RuntimeError("Для объединения модели установите PyTorch.") from exc
-    visual_model = Path(visual_model).resolve(strict=True)
-    description_model = Path(description_model).resolve(strict=True)
-    visual_checkpoint = torch.load(visual_model, map_location="cpu", weights_only=False)
-    description_checkpoint = torch.load(description_model, map_location="cpu", weights_only=False)
-    if not isinstance(visual_checkpoint, dict):
-        raise ValueError("best.pt не содержит ожидаемый checkpoint Ultralytics.")
-    if not isinstance(description_checkpoint, dict):
-        raise ValueError("description_best.pt не является checkpoint модели описания.")
-    target_header = description_checkpoint.get("target_header") or description_checkpoint.get(
-        "target_headers", {},
-    ).get("target_text")
-    legacy_column = description_checkpoint.get("target_column")
-    if target_header != "Краткое описание" and legacy_column != 23:
-        raise ValueError("description_best.pt не указывает целевое поле по заголовку «Краткое описание».")
-    visual_checkpoint["core_model_schema"] = "kern-unified-best-v3"
-    visual_checkpoint["core_description_checkpoint"] = description_checkpoint
-    visual_checkpoint["core_model_contract"] = contract
-    temporary = visual_model.with_name(visual_model.name + ".tmp")
-    torch.save(visual_checkpoint, temporary)
-    os.replace(temporary, visual_model)
-    return visual_model
-
-
-def _facies_reference(dataset_dir: Path) -> dict[str, dict[str, str]]:
-    from collections import Counter, defaultdict
-
-    path = Path(dataset_dir) / "caption_dataset.jsonl"
-    if not path.is_file():
-        return {}
-    values: dict[str, dict[str, Counter]] = defaultdict(lambda: defaultdict(Counter))
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        row = json.loads(line)
-        facies = str(row.get("facies_index") or row.get("facies", "")).strip()
-        if not facies:
-            continue
-        name = str(row.get("facies_name", "")).strip()
-        if name:
-            values[facies]["facies_name"][name] += 1
-        for key in ("association", "environment", "field_name"):
-            value = str(row.get(key, "")).strip()
-            if value:
-                values[facies][key][value] += 1
-    return {
-        facies: {
-            key: counter.most_common(1)[0][0]
-            for key, counter in fields.items() if counter
-        }
-        for facies, fields in sorted(values.items())
-    }
+def _require_yolo11_segmentation(model, weights: str) -> None:
+    task = str(getattr(model, "task", "")).casefold()
+    if task and task not in {"segment", "segmentation"}:
+        raise ValueError(f"Выбран checkpoint для задачи «{task}», нужен YOLO11 segmentation.")
+    core = getattr(model, "model", None)
+    config = getattr(core, "yaml", {}) if core is not None else {}
+    yaml_file = str(config.get("yaml_file", "")) if isinstance(config, dict) else ""
+    identity = (yaml_file + " " + str(weights)).casefold()
+    if "yolo11" not in identity:
+        raise ValueError(
+            "Выбраны не YOLO11-веса. Старый best.pt/last.pt автоматически не подхватывается: "
+            "укажите yolo11n-seg.pt или yolo11s-seg.pt."
+        )

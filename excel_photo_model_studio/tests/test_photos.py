@@ -8,12 +8,28 @@ from unittest.mock import patch
 import numpy as np
 
 from excel_photo_model_studio.photos import (
-    discover_photos, enrich_core_column_depths, extract_depth_interval, extract_well, parse_filename,
+    confirm_manual_photo_interval, discover_photos, enrich_core_column_depths,
+    extract_depth_interval, extract_well, parse_filename,
 )
 from excel_photo_model_studio.models import PhotoRecord
 
 
 class PhotoOcrParsingTests(unittest.TestCase):
+    def test_manual_interval_edit_invalidates_stale_per_column_ocr(self):
+        source = PhotoRecord(
+            Path("core.jpg"), "W-1", 4144.0, 4144.2, "ocr_verified", True,
+            column_depths=((0.5, 4144.0, 4144.2),),
+            column_ocr_checked=True, depth_basis="drilling",
+        )
+
+        corrected = confirm_manual_photo_interval(source, "W-1", 4144.0, 4144.1)
+
+        self.assertEqual((4144.0, 4144.1), (corrected.top, corrected.base))
+        self.assertEqual("manual", corrected.source)
+        self.assertEqual((), corrected.column_depths)
+        self.assertFalse(corrected.column_ocr_checked)
+        self.assertEqual("unknown", corrected.depth_basis)
+
     def test_discovery_keeps_every_supported_photo_in_nested_folders(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

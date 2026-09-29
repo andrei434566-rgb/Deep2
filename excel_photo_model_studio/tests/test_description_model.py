@@ -4,77 +4,76 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 import cv2
 import numpy as np
-import torch
 
-from excel_photo_model_studio.description_model import DescriptionGenerator, train_description_model
+from excel_photo_model_studio.description_model import (
+    DescriptionGenerator, train_description_model,
+)
 
 
 class DescriptionModelTests(unittest.TestCase):
-    def test_trains_checkpoint_with_index_name_and_short_description_targets(self):
+    def test_insufficient_caption_samples_are_reported_instead_of_fabricating_a_model(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            dataset = root / "dataset"
-            output = root / "model"
+            dataset, output = root / "dataset", root / "model"
+            dataset.mkdir()
+            output.mkdir()
+            (dataset / "caption_dataset.jsonl").write_text(
+                json.dumps({"split": "train", "target_text": "Песчаник"}, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            info = train_description_model(dataset, output, device="cpu", progress=lambda _message: None)
+            self.assertEqual("not_trained", info["status"])
+            self.assertIn("независимых проверочных", info["reason"])
+            self.assertFalse((output / "description_best.pt").exists())
+
+    def test_trains_interval_conditioned_text_checkpoint_and_loads_generator(self):
+        import torch
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset, output = root / "dataset", root / "model"
             (dataset / "crops" / "train").mkdir(parents=True)
             (dataset / "crops" / "val").mkdir(parents=True)
             output.mkdir()
             rows = []
-            for index in range(6):
-                split = "train" if index < 5 else "val"
+            for index in range(24):
+                split = "train" if index < 20 else "val"
                 relative = Path("crops") / split / f"{index}.jpg"
-                image = np.full((32, 32, 3), 50 + index * 20, dtype=np.uint8)
+                image = np.full((40, 24, 3), 70 + index * 15, dtype=np.uint8)
                 ok, encoded = cv2.imencode(".jpg", image)
                 self.assertTrue(ok)
                 (dataset / relative).write_bytes(encoded.tobytes())
                 rows.append({
-                    "split": split, "crop": relative.as_posix(),
-                    "facies": "Tcr", "facies_index": "Tcr", "facies_name": "Песчаники",
+                    "split": split, "crop": relative.as_posix(), "facies_index": "Dch",
+                    "facies_name": "Каналы", "interval_m": 0.8 + index / 10,
                     "target_text": "Песчаник серый, слоистый.",
                 })
             (dataset / "caption_dataset.jsonl").write_text(
-                "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8"
+                "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8",
             )
+            (dataset / "class_metadata.json").write_text(json.dumps({"classes": []}), encoding="utf-8")
 
             info = train_description_model(
-                dataset, output, epochs=1, patience=1, max_text_length=48,
-                image_size=32, hidden_size=32, batch_size=2, progress=lambda _: None,
-                device="cpu",
+                dataset, output, epochs=1, patience=1, image_size=32,
+                hidden_size=32, batch_size=5, device="cpu", progress=lambda _message: None,
             )
+
             checkpoint = torch.load(output / "description_best.pt", map_location="cpu", weights_only=False)
-            combined = output / "best.pt"
-            torch.save({"core_description_checkpoint": checkpoint}, combined)
-            original_load = torch.load
-            with patch("torch.load", wraps=original_load) as load:
-                generator = DescriptionGenerator(combined)
-                first = generator.generate(np.full((32, 32, 3), 130, dtype=np.uint8), "Tcr")
-                second = generator.generate(dataset / rows[0]["crop"], "Tcr")
-                self.assertEqual(1, load.call_count)
-                self.assertIsInstance(first, str)
-                self.assertIsInstance(second, str)
-                self.assertNotIn("<unk>", first)
-
-            with self.assertRaisesRegex(ValueError, "обрезано"):
-                train_description_model(dataset, output, max_text_length=8)
-
-        self.assertNotIn("target_column", checkpoint)
-        self.assertEqual("excel-photo-description-v4", checkpoint["schema"])
-        self.assertEqual(["Tcr"], checkpoint["facies_names"])
-        self.assertEqual(["facies_index", "facies_name", "target_text"], checkpoint["target_fields"])
-        self.assertEqual({
-            "facies_index": "Индекс фации",
-            "facies_name": "Название фации",
-            "target_text": "Краткое описание",
-        }, checkpoint["target_headers"])
-        self.assertEqual("Песчаники", checkpoint["facies_catalog"][0]["facies_name"])
-        self.assertEqual(["interval_image", "facies_class"], checkpoint["conditioning"])
-        self.assertEqual(5, info["train_samples"])
-        self.assertEqual(1, info["val_samples"])
-        self.assertEqual("cpu", info["device"])
-        self.assertNotIn("target_column", info)
+            generator = DescriptionGenerator(output / "description_best.pt")
+            generated = generator.generate(
+                np.full((24, 40, 3), 150, dtype=np.uint8), "Dch", "Каналы", 1.2,
+            )
+            self.assertEqual("trained_candidate", info["status"])
+            self.assertEqual(
+                ["interval_image_crop", "facies_index", "facies_name", "interval_thickness_m"],
+                info["conditioning"],
+            )
+            self.assertEqual("excel-photo-description-v5", checkpoint["schema"])
+            self.assertEqual([{"facies_index": "Dch", "facies_name": "Каналы"}], checkpoint["facies_conditions"])
+            self.assertIsInstance(generated, str)
 
 
 if __name__ == "__main__":

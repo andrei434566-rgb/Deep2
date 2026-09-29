@@ -603,7 +603,7 @@ class MatchingTests(unittest.TestCase):
                     "annotation_id": f"a{index}", "photo": str(image_path), "preview": "", "well": f"W-{index}",
                     "photo_top": "100", "photo_base": "101", "depth_top": "100", "depth_base": "101",
                     "label": "Sand", "facies_index": "Dch", "facies_name": "Каналы распределительные",
-                    "polygon_json": json.dumps([[5, 5], [50, 5], [50, 70], [5, 70]]),
+                    "polygon_json": json.dumps([[5, 5], [50, 5], [38, 70], [5, 70]]),
                     "image_width": "60", "image_height": "80", "source_sheet": "Data", "source_row": str(index + 2),
                     "approved": "1",
                     "target_text": "Песчаник светло-серый, слоистый.",
@@ -617,16 +617,28 @@ class MatchingTests(unittest.TestCase):
             result = build_dataset(project, root / "dataset")
 
             manifest = json.loads((root / "dataset" / "dataset_manifest.json").read_text(encoding="utf-8"))
-            caption = json.loads((root / "dataset" / "caption_dataset.jsonl").read_text(encoding="utf-8").splitlines()[0])
+            class_metadata = json.loads((root / "dataset" / "class_metadata.json").read_text(encoding="utf-8"))
+            captions = [
+                json.loads(line) for line in
+                (root / "dataset" / "caption_dataset.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
         self.assertEqual(3, result["photo_count"])
         self.assertEqual(1, manifest["val_photo_count"])
         self.assertEqual(["Dch"], manifest["class_names"])
-        self.assertEqual(3, manifest["caption_count"])
         self.assertEqual(1, manifest["facies_count"])
         self.assertEqual({"Dch": 3}, manifest["class_counts"])
         self.assertEqual("Каналы распределительные", manifest["facies_statistics"][0]["facies_name"])
-        self.assertEqual("Dch", caption["facies_index"])
-        self.assertEqual("Каналы распределительные", caption["facies_name"])
+        self.assertEqual("Dch", class_metadata["classes"][0]["facies_index"])
+        self.assertEqual("Каналы распределительные", class_metadata["classes"][0]["facies_name"])
+        self.assertEqual("Песчаник светло-серый, слоистый.", class_metadata["classes"][0]["default_description"])
+        self.assertEqual(3, len(captions))
+        self.assertEqual("Песчаник светло-серый, слоистый.", captions[0]["target_text"])
+        self.assertEqual(1.0, captions[0]["interval_m"])
+        crop = cv2.imdecode(
+            np.frombuffer((root / "dataset" / captions[0]["crop"]).read_bytes(), dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+        self.assertTrue(np.all(crop[-1, -1] == 255), "pixels outside the reviewed mask must be removed")
 
 
 class DatasetSplitTests(unittest.TestCase):
