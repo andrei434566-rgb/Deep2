@@ -132,7 +132,7 @@ class InferenceTests(unittest.TestCase):
             rows = export.call_args.args[0]
             self.assertEqual([1, 2], [row["layer_no"] for row in rows])
             self.assertEqual([100, 101], [row["facies_top"] for row in rows])
-            self.assertTrue(all(row["description"] == "Песчаник мелкозернист." for row in rows))
+            self.assertTrue(all(row["description"] == "Песчаник мелкозернистый." for row in rows))
 
 
 if __name__ == "__main__":

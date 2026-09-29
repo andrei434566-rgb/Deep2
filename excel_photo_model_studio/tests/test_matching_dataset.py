@@ -622,6 +622,10 @@ class MatchingTests(unittest.TestCase):
                 json.loads(line) for line in
                 (root / "dataset" / "caption_dataset.jsonl").read_text(encoding="utf-8").splitlines()
             ]
+            crop = cv2.imdecode(
+                np.frombuffer((root / "dataset" / captions[0]["crop"]).read_bytes(), dtype=np.uint8),
+                cv2.IMREAD_COLOR,
+            )
         self.assertEqual(3, result["photo_count"])
         self.assertEqual(1, manifest["val_photo_count"])
         self.assertEqual(["Dch"], manifest["class_names"])
@@ -634,10 +638,6 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(3, len(captions))
         self.assertEqual("Песчаник светло-серый, слоистый.", captions[0]["target_text"])
         self.assertEqual(1.0, captions[0]["interval_m"])
-        crop = cv2.imdecode(
-            np.frombuffer((root / "dataset" / captions[0]["crop"]).read_bytes(), dtype=np.uint8),
-            cv2.IMREAD_COLOR,
-        )
         self.assertTrue(np.all(crop[-1, -1] == 255), "pixels outside the reviewed mask must be removed")
 
 

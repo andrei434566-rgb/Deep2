@@ -129,7 +129,11 @@ def _snapshot_confirmed_project(source_project: Path, cache_root: Path) -> Path:
     cache_root.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     suffix = hashlib.sha256(str(source_project).encode("utf-8")).hexdigest()[:8]
-    final_dir = cache_root / f"{source_project.name}_{stamp}_{suffix}"
+    # Resolve the existing cache root before constructing report paths. On
+    # Windows, TEMP can contain an 8.3 alias (e.g. RUNNER~1); the verifier
+    # compares canonical resolved photo paths, so snapshots must store the
+    # same canonical form even before the final directory is renamed into place.
+    final_dir = cache_root.resolve() / f"{source_project.name}_{stamp}_{suffix}"
     if final_dir.exists():
         raise FileExistsError(f"Папка кэша уже существует: {final_dir}")
 

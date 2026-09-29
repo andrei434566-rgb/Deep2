@@ -1139,11 +1139,35 @@ def _select_core_boxes(
     if broad:
         reference_width = max(box[2] - box[0] for box in broad)
         minimum_lane_width = max(6, round(reference_width * 0.32))
+        # A narrow partial core can be much thinner than the ordinary lanes
+        # in a wide report scan. Keep it when the detected lane is densely
+        # occupied; arrows and ruler marks fail the sustained-fill checks
+        # above and do not become plausible boxes.
         plausible = [
             box for box in plausible
             if box[2] - box[0] >= minimum_lane_width
+            or (
+                _is_dense_narrow_core(box, candidate)
+                and width * 0.20 < (box[0] + box[2]) / 2 < width * 0.93
+            )
         ]
     return plausible
+
+
+def _is_dense_narrow_core(box, candidate: np.ndarray) -> bool:
+    left, top, right, bottom = box
+    region = candidate[max(0, top):min(candidate.shape[0], bottom), max(0, left):min(candidate.shape[1], right)]
+    if region.size == 0:
+        return False
+    row_occupancy = region.mean(axis=1)
+    column_occupancy = region.mean(axis=0)
+    return (
+        float(region.mean()) >= 0.70
+        and float((row_occupancy >= 0.55).mean()) >= 0.65
+        and float((column_occupancy >= 0.55).mean()) >= 0.65
+        and float(np.median(row_occupancy)) >= 0.70
+        and float(np.median(column_occupancy)) >= 0.70
+    )
 
 
 def _trim_column_caption_rows(box, candidate):

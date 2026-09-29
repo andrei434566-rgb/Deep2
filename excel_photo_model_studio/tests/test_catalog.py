@@ -65,15 +65,18 @@ class CatalogTests(unittest.TestCase):
             cataloged_sources = {
                 item["source_project"] for item in json.loads(catalog.read_text(encoding="utf-8"))["projects"]
             }
+            cached_manifests_exist = all((item / "cache_manifest.json").is_file() for item in loaded)
 
         self.assertEqual(len(projects), len(loaded))
         self.assertEqual(2, len(loaded))
         self.assertTrue(all(item.parent.name == "confirmed_wells" for item in loaded))
-        self.assertEqual({str(item) for item in projects}, cataloged_sources)
+        self.assertEqual({str(item.resolve()) for item in projects}, {
+            str(Path(source).resolve()) for source in cataloged_sources
+        })
         self.assertEqual(2, summary["projects"])
         self.assertEqual(2, result["project_count"])
         self.assertEqual(2, result["photo_count"])
-        self.assertTrue(all((item / "cache_manifest.json").is_file() for item in loaded))
+        self.assertTrue(cached_manifests_exist)
 
     def test_reconfirming_changed_project_adds_new_snapshot_without_losing_previous(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -120,7 +123,11 @@ class CatalogTests(unittest.TestCase):
                 writer = csv.DictWriter(target, fieldnames=row.keys(), delimiter=";")
                 writer.writeheader()
                 writer.writerow(row)
-            report["validation_snapshot"]["files"][str(annotations.resolve())] = [
+            annotation_key = next(
+                key for key in report["validation_snapshot"]["files"]
+                if Path(key).name.casefold() == annotations.name.casefold()
+            )
+            report["validation_snapshot"]["files"][annotation_key] = [
                 annotations.stat().st_size, annotations.stat().st_mtime_ns,
             ]
             (project / "report.json").write_text(json.dumps(report), encoding="utf-8")
@@ -140,7 +147,7 @@ class CatalogTests(unittest.TestCase):
                 writer.writeheader()
                 writer.writerow(row)
             report["approved_annotations"] = 0
-            report["validation_snapshot"]["files"][str(annotations.resolve())] = [
+            report["validation_snapshot"]["files"][annotation_key] = [
                 annotations.stat().st_size, annotations.stat().st_mtime_ns,
             ]
             (project / "report.json").write_text(json.dumps(report), encoding="utf-8")

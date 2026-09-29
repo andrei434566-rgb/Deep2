@@ -42,7 +42,7 @@ class DescriptionModelTests(unittest.TestCase):
             for index in range(24):
                 split = "train" if index < 20 else "val"
                 relative = Path("crops") / split / f"{index}.jpg"
-                image = np.full((40, 24, 3), 70 + index * 15, dtype=np.uint8)
+                image = np.full((40, 24, 3), 70 + index * 7, dtype=np.uint8)
                 ok, encoded = cv2.imencode(".jpg", image)
                 self.assertTrue(ok)
                 (dataset / relative).write_bytes(encoded.tobytes())
