@@ -76,21 +76,84 @@ jobs:
           if ($process.ExitCode -ne 0) { throw "Portable application smoke test failed: $($process.ExitCode)" }
           Get-Content portable-self-test.json
 
-      - name: Create release archive and checksum
+      - name: Create split release archives and checksum
         if: startsWith(github.ref, 'refs/tags/excel-photo-studio-v')
         shell: pwsh
         working-directory: excel_photo_model_studio
         run: |
           $version = $env:GITHUB_REF_NAME -replace '^excel-photo-studio-v', ''
           if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Unexpected release tag: $env:GITHUB_REF_NAME" }
-          $archiveName = "Excel_Photo_Model_Studio_${version}_Windows_x64.zip"
           New-Item -ItemType Directory -Force -Path release | Out-Null
-          $archivePath = Join-Path 'release' $archiveName
-          Compress-Archive -Path 'dist/Excel_Photo_Model_Studio/*' -DestinationPath $archivePath -CompressionLevel Optimal
-          $size = (Get-Item -LiteralPath $archivePath).Length
-          if ($size -ge 2000000000) { throw "Release ZIP is too large for GitHub: $size bytes" }
-          $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLower()
-          Set-Content -LiteralPath "$archivePath.sha256" -Value "$hash  $archiveName" -Encoding ascii
+          $releaseRoot = (Resolve-Path 'release').Path
+          $distRoot = (Resolve-Path 'dist/Excel_Photo_Model_Studio').Path
+          $files = @(Get-ChildItem -LiteralPath $distRoot -Recurse -File | Sort-Object Length -Descending)
+          if ($files.Count -eq 0) { throw 'Portable application folder is empty.' }
+          $totalBytes = [int64](($files | Measure-Object Length -Sum).Sum)
+          $targetPartBytes = [int64]1200000000
+          $partCount = [Math]::Max(1, [int][Math]::Ceiling($totalBytes / $targetPartBytes))
+          $partLists = [object[]]::new($partCount)
+          for ($index = 0; $index -lt $partCount; $index++) {
+            $partLists[$index] = [System.Collections.Generic.List[string]]::new()
+          }
+          $partSizes = [int64[]]::new($partCount)
+          foreach ($file in $files) {
+            $target = 0
+            for ($index = 1; $index -lt $partCount; $index++) {
+              if ($partSizes[$index] -lt $partSizes[$target]) { $target = $index }
+            }
+            $relative = [System.IO.Path]::GetRelativePath($distRoot, $file.FullName)
+            $partLists[$target].Add($relative)
+            $partSizes[$target] += $file.Length
+          }
+          $archivePaths = [System.Collections.Generic.List[string]]::new()
+          $utf8 = [System.Text.UTF8Encoding]::new($false)
+          Push-Location $distRoot
+          try {
+            for ($index = 0; $index -lt $partCount; $index++) {
+              $number = $index + 1
+              $archiveName = 'Excel_Photo_Model_Studio_{0}_Windows_x64_part{1:D2}.zip' -f $version, $number
+              $archivePath = Join-Path $releaseRoot $archiveName
+              $listPath = Join-Path $env:RUNNER_TEMP "studio-part$number.txt"
+              [System.IO.File]::WriteAllLines($listPath, $partLists[$index], $utf8)
+              & 'C:\Program Files\7-Zip\7z.exe' a -tzip -mx=1 -scsUTF-8 $archivePath "@$listPath"
+              if ($LASTEXITCODE -ne 0) { throw "7-Zip part $number failed with exit code $LASTEXITCODE" }
+              $size = (Get-Item -LiteralPath $archivePath).Length
+              if ($size -ge 1800000000) { throw "Release part is too large for GitHub: $archiveName ($size bytes)" }
+              $archivePaths.Add($archivePath)
+            }
+          } finally {
+            Pop-Location
+          }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $entryNames = [System.Collections.Generic.List[string]]::new()
+          [int64]$archivedBytes = 0
+          foreach ($archivePath in $archivePaths) {
+            $archive = [System.IO.Compression.ZipFile]::OpenRead($archivePath)
+            try {
+              foreach ($entry in $archive.Entries) {
+                if ($entry.Name) {
+                  $entryNames.Add($entry.FullName.Replace('/', '\'))
+                  $archivedBytes += $entry.Length
+                }
+              }
+            } finally {
+              $archive.Dispose()
+            }
+          }
+          $expectedNames = @($files | ForEach-Object { [System.IO.Path]::GetRelativePath($distRoot, $_.FullName).Replace('/', '\') })
+          $expectedSorted = @($expectedNames | Sort-Object)
+          $actualSorted = @($entryNames | Sort-Object)
+          $duplicates = @($entryNames | Group-Object | Where-Object Count -gt 1)
+          if ($entryNames.Count -ne $expectedNames.Count) { throw "Split archive file count mismatch: $($entryNames.Count) != $($expectedNames.Count)" }
+          if ($duplicates.Count) { throw 'Split archives contain duplicate file paths.' }
+          if (Compare-Object -ReferenceObject $expectedSorted -DifferenceObject $actualSorted) { throw 'Split archives do not contain the exact packaged file paths.' }
+          if ($archivedBytes -ne $totalBytes) { throw "Split archive byte coverage mismatch: $archivedBytes != $totalBytes" }
+          $hashLines = foreach ($archivePath in $archivePaths) {
+            $archiveName = Split-Path -Leaf $archivePath
+            $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLower()
+            "$hash  $archiveName"
+          }
+          $hashLines | Set-Content -LiteralPath 'release/SHA256SUMS.txt' -Encoding ascii
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -98,7 +161,7 @@ jobs:
           name: Excel-Photo-Model-Studio-Windows
           path: |
             excel_photo_model_studio/release/*.zip
-            excel_photo_model_studio/release/*.sha256
+            excel_photo_model_studio/release/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
 
@@ -109,7 +172,7 @@ jobs:
           name: Excel Photo Model Studio ${{ github.ref_name }}
           generate_release_notes: true
           make_latest: false
-          body_path: excel_photo_model_studio/RELEASE_NOTES_0.6.4.md
+          body_path: excel_photo_model_studio/RELEASE_NOTES_0.6.5.md
           files: |
             excel_photo_model_studio/release/*.zip
-            excel_photo_model_studio/release/*.sha256
+            excel_photo_model_studio/release/SHA256SUMS.txt
