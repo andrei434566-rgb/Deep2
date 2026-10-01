@@ -218,6 +218,43 @@ class VisionTests(unittest.TestCase):
         self.assertTrue(any(165 <= center <= 190 for center in centers))
         self.assertFalse(any(250 <= center <= 430 for center in centers))
 
+    def test_pale_page_mask_excludes_blue_arrows_but_keeps_neutral_core(self):
+        image = np.full((500, 500, 3), 255, dtype=np.uint8)
+        cv2.rectangle(image, (70, 35), (135, 300), (145, 145, 145), -1)
+        cv2.arrowedLine(image, (260, 340), (260, 440), (15, 45, 100), 8, tipLength=0.25)
+
+        candidate = vision._core_candidate_mask(image)
+
+        self.assertTrue(candidate[100, 100])
+        self.assertFalse(candidate[390, 260])
+        boxes = detect_core_columns(image)
+        self.assertEqual(1, len(boxes))
+        self.assertLess(boxes[0][2], 200)
+
+    def test_rejects_isolated_black_down_arrows_as_core(self):
+        image = np.full((700, 600, 3), 255, dtype=np.uint8)
+        for x in (140, 250, 360, 470):
+            cv2.arrowedLine(image, (x, 280), (x, 540), (15, 15, 15), 10, tipLength=0.22)
+        for y in (180, 350, 520):
+            cv2.line(image, (80, y), (540, y), (25, 25, 25), 2)
+
+        self.assertEqual([], detect_core_columns(image))
+
+    def test_keeps_one_short_core_while_rejecting_black_arrows_and_depth_rules(self):
+        image = np.full((700, 600, 3), 255, dtype=np.uint8)
+        cv2.rectangle(image, (300, 55), (370, 235), (145, 145, 145), -1)
+        for y in range(75, 225, 28):
+            cv2.line(image, (302, y), (368, y + 8), (90, 90, 90), 2)
+        for x in (140, 250, 400, 500):
+            cv2.arrowedLine(image, (x, 300), (x, 540), (15, 15, 15), 10, tipLength=0.22)
+        for y in range(180, 620, 110):
+            cv2.line(image, (80, y), (545, y), (25, 25, 25), 2)
+
+        boxes = detect_core_columns(image)
+
+        self.assertEqual(1, len(boxes))
+        self.assertLess(abs((boxes[0][0] + boxes[0][2]) / 2 - 335), 12)
+
     def test_keeps_a_one_centimetre_facies_fragment_at_the_final_core_edge(self):
         with tempfile.TemporaryDirectory() as directory:
             photo_path = Path(directory) / "W-1 4144.00-4144.20.jpg"

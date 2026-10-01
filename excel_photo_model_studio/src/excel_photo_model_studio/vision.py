@@ -99,7 +99,12 @@ def _core_candidate_mask(image: np.ndarray) -> np.ndarray:
         # A fixed V<235 threshold discarded it and left only the black ruler.
         page_level = float(np.quantile(value, 0.90))
         value_limit = int(np.clip(round(page_level - 3.0), 232, 252))
-        return value < value_limit
+        # Printed arrows and review annotations are often dark blue on an
+        # otherwise pale page.  The grayscale-only threshold used to admit
+        # those arrows as narrow "core" columns; keep neutral rock and ink,
+        # but exclude strongly coloured overlays just as the tray-image path
+        # already does.
+        return (value < value_limit) & (saturation < 105)
     return (saturation < 95) & (value < 238)
 
 
@@ -1104,6 +1109,8 @@ def _select_core_boxes(
         region = candidate[max(0, top):min(height, bottom), max(0, left):min(width, right)]
         if region.size == 0:
             continue
+        if _looks_like_down_arrow(box, candidate):
+            continue
         row_occupancy = region.mean(axis=1)
         column_occupancy = region.mean(axis=0)
         fill = float(region.mean())
@@ -1152,6 +1159,53 @@ def _select_core_boxes(
             )
         ]
     return plausible
+
+
+def _looks_like_down_arrow(box, candidate: np.ndarray) -> bool:
+    """Reject narrow printed down-arrows without suppressing slim core pieces.
+
+    A printed arrow has a nearly constant-width shaft and a symmetric head
+    that flares beyond it near the lower end.
+    The profile test is deliberately conservative and is only used for narrow,
+    strongly vertical candidates; the visual-review step still lets a user
+    remove any remaining false positive.
+    """
+    left, top, right, bottom = box
+    box_width, box_height = right - left, bottom - top
+    image_height, image_width = candidate.shape
+    if box_width <= 0 or box_height <= 0 or box_width > image_width * 0.075:
+        return False
+    if box_height / box_width < 3.0 or box_height < image_height * 0.08:
+        return False
+    y1, y2 = max(0, top), min(image_height, bottom)
+    margin = max(4, round(box_width * 0.75))
+    x1, x2 = max(0, left - margin), min(image_width, right + margin)
+    region = candidate[y1:y2, x1:x2]
+    if region.size == 0:
+        return False
+    if region.shape[0] < 30:
+        return False
+    row_x = [np.flatnonzero(row) for row in region]
+    spans = np.fromiter(
+        (int(points[-1] - points[0] + 1) if len(points) else 0 for points in row_x),
+        dtype=np.float32, count=region.shape[0],
+    )
+    centers = np.fromiter(
+        ((float(points[0] + points[-1]) / 2.0 + x1) if len(points) else -1.0 for points in row_x),
+        dtype=np.float32, count=region.shape[0],
+    )
+    minimum_head_span = max(box_width + 3, round(box_width * 1.55))
+    expected_center = (left + right) / 2.0
+    centered = np.abs(centers - expected_center) <= max(4.0, box_width * 0.45)
+    head = spans[int(len(spans) * 0.68):]
+    centered_head = centered[int(len(spans) * 0.68):]
+    # A downward arrow's two diagonal head strokes flare outside its otherwise
+    # constant-width shaft for several consecutive rows. Grid lines can make
+    # a single wide row, so require a short run rather than reacting to one.
+    flare_rows = (head >= minimum_head_span) & centered_head
+    if not len(flare_rows):
+        return False
+    return float(flare_rows.mean()) >= 0.035
 
 
 def _is_dense_narrow_core(box, candidate: np.ndarray) -> bool:

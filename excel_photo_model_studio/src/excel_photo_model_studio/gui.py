@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from .catalog import (
-    catalog_summary, confirm_project_for_training, default_catalog_path,
+    catalog_overview, confirm_project_for_training, default_catalog_path,
 )
 from .depth import format_depth
 from .matching import match_photos, read_photo_map, suggest_missing_intervals, write_photo_map
@@ -67,15 +67,27 @@ class PathField(QWidget):
 class MaskPreviewLabel(QLabel):
     """Image preview which shows the matched short description over a mask."""
 
+    regionClicked = Signal(str)
+
     def __init__(self, text: str = "", parent=None):
         super().__init__(text, parent)
         self._regions: list[dict] = []
         self._last_tip = ""
+        self._selectable = False
+        self._selected_region_key = ""
         self.setMouseTracking(True)
 
-    def set_regions(self, regions: list[dict]) -> None:
+    def set_regions(self, regions: list[dict], *, selectable: bool = False) -> None:
         self._regions = list(regions)
+        self._selectable = selectable
+        keys = {str(item.get("selection_key", "")) for item in self._regions}
+        if self._selected_region_key not in keys:
+            self._selected_region_key = ""
         self._last_tip = ""
+        self.update()
+
+    def set_selected_region(self, key: str) -> None:
+        self._selected_region_key = str(key or "")
         self.update()
 
     def paintEvent(self, event) -> None:
@@ -121,12 +133,50 @@ class MaskPreviewLabel(QLabel):
                 ])
             except (KeyError, TypeError, ValueError):
                 continue
-            pen = QPen(QColor("#00e5ff"), 2.0, Qt.PenStyle.DashLine)
+            selected = str(region.get("selection_key", "")) == self._selected_region_key
+            pen = QPen(
+                QColor("#ff3b30" if selected else "#00e5ff"),
+                3.0 if selected else 2.0,
+                Qt.PenStyle.SolidLine if selected else Qt.PenStyle.DashLine,
+            )
             painter.setPen(pen)
-            painter.setBrush(QColor(0, 229, 255, 28))
+            painter.setBrush(QColor(255, 59, 48, 48) if selected else QColor(0, 229, 255, 28))
             painter.drawPolygon(polygon)
             painter.drawText(polygon.boundingRect().topLeft() + QPointF(3, 16), str(region.get("label", "Керн")))
         painter.end()
+
+    def mousePressEvent(self, event) -> None:
+        if self._selectable and event.button() == Qt.MouseButton.LeftButton:
+            pixmap = self.pixmap()
+            if pixmap is not None and not pixmap.isNull() and self._regions:
+                x_offset = (self.width() - pixmap.width()) / 2.0
+                y_offset = (self.height() - pixmap.height()) / 2.0
+                local_x = event.position().x() - x_offset
+                local_y = event.position().y() - y_offset
+                image_width = max(float(item.get("image_width", 0) or 0) for item in self._regions)
+                image_height = max(float(item.get("image_height", 0) or 0) for item in self._regions)
+                if (
+                    image_width > 0 and image_height > 0
+                    and 0 <= local_x < pixmap.width() and 0 <= local_y < pixmap.height()
+                ):
+                    image_x = local_x * image_width / pixmap.width()
+                    image_y = local_y * image_height / pixmap.height()
+                    point = QPointF(image_x, image_y)
+                    candidates = []
+                    for region in self._regions:
+                        key = str(region.get("selection_key", ""))
+                        try:
+                            polygon = QPolygonF([QPointF(float(x), float(y)) for x, y in region["polygon"]])
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                        if key and polygon.containsPoint(point, Qt.FillRule.OddEvenFill):
+                            bounds = polygon.boundingRect()
+                            candidates.append((bounds.width() * bounds.height(), key))
+                    key = min(candidates)[1] if candidates else ""
+                    self._selected_region_key = key
+                    self.regionClicked.emit(key)
+                    self.update()
+        super().mousePressEvent(event)
 
     def tooltip_for_image_point(self, x: float, y: float) -> str:
         candidates: list[tuple[float, dict]] = []
@@ -236,6 +286,8 @@ class StepVerificationDialog(QDialog):
         self.columns: dict[Path, list[tuple[int, int, int, int]]] = {}
         self.column_errors: dict[Path, str] = {}
         self.column_confirmed: set[Path] = set()
+        self._selected_column: int | None = None
+        self.removed_column_candidates: dict[Path, list[tuple[int, tuple[int, int, int, int]]]] = {}
         self.matches = []
         self.unresolved = []
         self.annotations = []
@@ -344,9 +396,18 @@ class StepVerificationDialog(QDialog):
         self.column_confirm = QPushButton("Столбики на этом фото распознаны верно")
         self.column_confirm.clicked.connect(self._confirm_columns)
         left.addWidget(self.column_confirm)
+        self.column_remove = QPushButton("Удалить выделенную лишнюю маску")
+        self.column_remove.clicked.connect(self._remove_selected_column)
+        self.column_remove.setEnabled(False)
+        left.addWidget(self.column_remove)
+        self.column_undo_remove = QPushButton("Вернуть последнюю удалённую маску")
+        self.column_undo_remove.clicked.connect(self._undo_remove_column)
+        self.column_undo_remove.setEnabled(False)
+        left.addWidget(self.column_undo_remove)
         left.addStretch(1)
         layout.addLayout(left, 1)
         self.column_preview = self._new_preview()
+        self.column_preview.regionClicked.connect(self._select_column)
         layout.addWidget(self.column_preview, 2)
         self.pages.addWidget(page)
 
@@ -575,6 +636,8 @@ class StepVerificationDialog(QDialog):
         self.columns = {}
         self.column_errors = {}
         self.column_confirmed.clear()
+        self._selected_column = None
+        self.removed_column_candidates = {}
         self.matches = []
         self.unresolved = []
         self.annotations = []
@@ -844,11 +907,11 @@ class StepVerificationDialog(QDialog):
         normalized = []
         for region in regions:
             normalized.append({**region, "image_width": image_width, "image_height": image_height})
-        preview.set_regions(normalized)
+        preview.set_regions(normalized, selectable=preview is self.column_preview)
 
     def _column_regions(self, path: Path) -> list[dict]:
         return [{
-            "kind": "core_column", "label": f"Керн {index}",
+            "kind": "core_column", "label": f"Керн {index}", "selection_key": str(index - 1),
             "polygon": ((left, top), (right, top), (right, bottom), (left, bottom)),
         } for index, (left, top, right, bottom) in enumerate(self.columns.get(path, []), start=1)]
 
@@ -863,9 +926,11 @@ class StepVerificationDialog(QDialog):
         self.column_photo_info.setText(
             f"Фото {self._current_photo + 1} из {len(self.photos)}\n{photo.path.name}\n\n"
             f"Найдено физических столбиков: {len(boxes)}\nСтатус: {confirmation}"
+            f"\nУдалено вручную лишних масок: {len(self.removed_column_candidates.get(photo.path, []))}"
             + (f"\nОшибка чтения: {failure}" if failure else "")
             + "\n\nПроверьте, что выделен каждый столбик керна, включая половинные и одиночные. "
-            "Линейка и подписи не должны быть выделены как керн."
+            "Линейка, чёрные линии и стрелки не должны быть выделены как керн. "
+            "Щёлкните по лишней бирюзовой рамке, чтобы выбрать её, затем удалите; действие можно отменить."
         )
         self.column_confirm.setText(
             "Отменить подтверждение этого фото" if photo.path in self.column_confirmed
@@ -873,7 +938,64 @@ class StepVerificationDialog(QDialog):
         )
         self.column_prev.setEnabled(self._current_photo > 0)
         self.column_next.setEnabled(self._current_photo < len(self.photos) - 1)
+        self.column_remove.setEnabled(
+            self._selected_column is not None and 0 <= self._selected_column < len(boxes)
+        )
+        self.column_undo_remove.setEnabled(bool(self.removed_column_candidates.get(photo.path)))
+        self.column_preview.set_selected_region(
+            "" if self._selected_column is None else str(self._selected_column)
+        )
         self._fill_image(self.column_preview, photo.path, self._column_regions(photo.path))
+
+    def _select_column(self, key: str) -> None:
+        try:
+            index = int(key)
+            if not self.photos or not 0 <= index < len(self.columns.get(self.photos[self._current_photo].path, [])):
+                index = None
+        except (TypeError, ValueError):
+            index = None
+        self._selected_column = index
+        self.column_remove.setEnabled(index is not None)
+
+    def _remove_selected_column(self) -> None:
+        if not self.photos or self._selected_column is None:
+            return
+        photo = self.photos[self._current_photo]
+        boxes = self.columns.get(photo.path, [])
+        index = self._selected_column
+        if not 0 <= index < len(boxes):
+            self._selected_column = None
+            return self._render_column_photo()
+        removed = boxes.pop(index)
+        history = self.removed_column_candidates.setdefault(photo.path, [])
+        history.append((index, removed))
+        self.column_confirmed.discard(photo.path)
+        self.mask_confirmed.discard(photo.path)
+        self._selected_column = None
+        self.audit.append(
+            f"Колонки: вручную удалена лишняя маска №{index + 1} с фото {photo.path.name}; "
+            f"рамка {removed[0]},{removed[1]}–{removed[2]},{removed[3]}."
+        )
+        self._render_column_photo()
+        self.status.setText("Лишняя маска удалена. Проверьте оставшиеся колонки и подтвердите фото.")
+
+    def _undo_remove_column(self) -> None:
+        if not self.photos:
+            return
+        photo = self.photos[self._current_photo]
+        history = self.removed_column_candidates.get(photo.path, [])
+        if not history:
+            return
+        index, box = history.pop()
+        boxes = self.columns.setdefault(photo.path, [])
+        boxes.insert(min(index, len(boxes)), box)
+        if not history:
+            self.removed_column_candidates.pop(photo.path, None)
+        self.column_confirmed.discard(photo.path)
+        self._selected_column = None
+        self.audit.append(f"Колонки: возвращена последняя удалённая маска на фото {photo.path.name}.")
+        self._render_column_photo()
+        self.status.setText("Маска возвращена. Проверьте колонки и подтвердите фото заново.")
 
     def _confirm_columns(self) -> None:
         if not self.photos:
@@ -893,6 +1015,7 @@ class StepVerificationDialog(QDialog):
     def _navigate_photo(self, delta: int) -> None:
         if not self.photos:
             return
+        self._selected_column = None
         self._current_photo = max(0, min(len(self.photos) - 1, self._current_photo + delta))
         if self._stage == 1:
             self._render_column_photo()
@@ -1373,9 +1496,22 @@ class MainWindow(QMainWindow):
         )
         queue_title.setWordWrap(True)
         layout.addWidget(queue_title)
+        training_requirements = QLabel(
+            "Сегментационная YOLO11-модель обучается на GPU CUDA и сохраняется как best.pt. "
+            "Генератор краткого описания обучается отдельной моделью на тех же масках и привязанных строках Excel; "
+            "для него требуется минимум 20 обучающих и 3 проверочных интервала. Если примеров пока меньше, "
+            "segmentation best.pt всё равно будет создан, а причина пропуска генератора будет записана в журнале."
+        )
+        training_requirements.setWordWrap(True)
+        layout.addWidget(training_requirements)
         self.catalog_status = QLabel()
         self.catalog_status.setWordWrap(True)
         layout.addWidget(self.catalog_status)
+        self.catalog_wells = QTextEdit()
+        self.catalog_wells.setReadOnly(True)
+        self.catalog_wells.setMaximumHeight(170)
+        self.catalog_wells.setPlaceholderText("Здесь появится список подтверждённых скважин.")
+        layout.addWidget(self.catalog_wells)
         buttons = QHBoxLayout()
         self.dataset_button = QPushButton("Собрать датасет из накопленных скважин")
         self.dataset_button.clicked.connect(self._build_dataset)
@@ -1787,7 +1923,8 @@ class MainWindow(QMainWindow):
             confirm_project_for_training(project_dir)
             self.project_log.append(
                 "Скважина подтверждена: фото и маски скопированы в локальный накопительный кэш. "
-                "Теперь можно обработать следующую скважину."
+                "Она появится в списке готовых скважин на вкладке «Датасет и best.pt»; "
+                "можно обрабатывать и добавлять следующую."
             )
         except (OSError, ValueError) as exc:
             self.project_log.append(f"Скважина пока не добавлена в датасет: {exc}")
@@ -1982,7 +2119,7 @@ class MainWindow(QMainWindow):
             destination = self.dataset_output.value()
             if not self.dataset_output.edit.text().strip():
                 raise ValueError("Укажите новую папку датасета.")
-            if catalog_summary()["projects"] < 1:
+            if catalog_overview()["summary"]["projects"] < 1:
                 raise ValueError("Сначала обработайте хотя бы одну скважину.")
         except Exception as exc:
             return self._error(str(exc))
@@ -2120,12 +2257,28 @@ class MainWindow(QMainWindow):
     def _update_catalog_status(self) -> None:
         if not hasattr(self, "catalog_status"):
             return
-        summary = catalog_summary()
+        overview = catalog_overview()
+        summary = overview["summary"]
+        wells = overview["wells"]
         self.catalog_status.setText(
-            "Накопительный кэш: фото и маски полностью подтверждённых скважин хранятся локально и не зависят от исходных папок. "
-            f"скважин — {summary['projects']}, фото — {summary['photos']}, "
-            f"масок — {summary['annotations']}. Новые скважины можно добавлять между запусками."
+            "Накопительный кэш: полностью подтверждённые скважины сохранены локально; "
+            f"скважин — {summary['projects']}, фото — {summary['photos']}, масок — {summary['annotations']}. "
+            "Новые скважины можно добавлять в этот же набор между запусками."
         )
+        if wells:
+            lines = ["Подтверждены и готовы к включению в обучение:"]
+            for item in wells:
+                name = ", ".join(str(value) for value in item["well_names"])
+                lines.append(
+                    f"✓ Скважина {name} — фото: {item['photos']}; "
+                    f"маски: {item['masks']}; фаций: {item['facies']}"
+                )
+            self.catalog_wells.setPlainText("\n".join(lines))
+        else:
+            self.catalog_wells.setPlainText(
+                "Пока нет полностью подтверждённых скважин. После проверки всех масок и сохранения "
+                "подтверждений скважина появится здесь."
+            )
 
     def _project_dir(self) -> Path:
         if self.current_project is None:

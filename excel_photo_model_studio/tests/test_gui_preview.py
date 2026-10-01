@@ -13,6 +13,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import cv2
 import numpy as np
 from openpyxl import Workbook
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog
 
 from excel_photo_model_studio.gui import MainWindow, StepVerificationDialog
@@ -180,6 +182,66 @@ class GuiPreviewTests(unittest.TestCase):
             finally:
                 dialog.close()
 
+    def test_step_photo_review_can_remove_and_restore_an_extra_core_mask(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            excel = root / "description.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append([
+                "Скважина", "Интервал фации по бурению Кровля",
+                "Интервал фации по бурению Подошва", "Код фации", "Краткое описание",
+            ])
+            sheet.append(["W-1", 100.0, 101.0, "Dch", "Песчаник"])
+            workbook.save(excel)
+            photo_path = root / "W-1.jpg"
+            image = np.full((300, 180, 3), 255, dtype=np.uint8)
+            cv2.rectangle(image, (25, 30), (80, 270), (130, 130, 130), -1)
+            cv2.rectangle(image, (100, 30), (155, 270), (130, 130, 130), -1)
+            ok, encoded = cv2.imencode(".jpg", image)
+            self.assertTrue(ok)
+            photo_path.write_bytes(encoded.tobytes())
+            dialog = StepVerificationDialog(excel, root, use_ocr=False)
+
+            try:
+                deadline = time.monotonic() + 5
+                while dialog._busy() and time.monotonic() < deadline:
+                    self.application.processEvents()
+                    time.sleep(0.01)
+                self.application.processEvents()
+                self.assertFalse(dialog._busy(), "Excel worker did not finish in time")
+
+                photo = PhotoRecord(photo_path, "W-1", 100.0, 101.0, "manual", True)
+                first, extra = (20, 25, 82, 275), (98, 25, 157, 275)
+                dialog.photos = [photo]
+                dialog.columns = {photo_path: [first, extra]}
+                dialog._current_photo = 0
+                dialog._stage = 1
+                dialog._render_column_photo()
+
+                # Clicking the second cyan contour selects it; deleting it
+                # marks the photo unconfirmed so it must be reviewed again.
+                pixmap = dialog.column_preview.pixmap()
+                self.assertIsNotNone(pixmap)
+                click_x = (dialog.column_preview.width() - pixmap.width()) / 2 + 127 * pixmap.width() / 180
+                click_y = (dialog.column_preview.height() - pixmap.height()) / 2 + 150 * pixmap.height() / 300
+                QTest.mouseClick(
+                    dialog.column_preview, Qt.MouseButton.LeftButton,
+                    pos=QPoint(round(click_x), round(click_y)),
+                )
+                self.assertEqual(1, dialog._selected_column)
+                self.assertTrue(dialog.column_remove.isEnabled())
+                dialog.column_remove.click()
+                self.assertEqual([first], dialog.columns[photo_path])
+                self.assertNotIn(photo_path, dialog.column_confirmed)
+                self.assertTrue(dialog.column_undo_remove.isEnabled())
+
+                dialog.column_undo_remove.click()
+                self.assertEqual([first, extra], dialog.columns[photo_path])
+                self.assertFalse(dialog.column_undo_remove.isEnabled())
+            finally:
+                dialog.close()
+
     def test_workbook_selected_in_step_dialog_is_used_for_project_creation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -270,6 +332,31 @@ class GuiPreviewTests(unittest.TestCase):
         self.assertIn("Фаций Excel с неполным покрытием масками: 1", message)
         self.assertEqual(["Колонка керна не покрыта масками."], window.matching_photo_issues["core.jpg"])
         window.close()
+
+    def test_training_tab_lists_confirmed_wells_ready_to_accumulate(self):
+        empty = {
+            "summary": {"projects": 0, "photos": 0, "annotations": 0, "approved_annotations": 0},
+            "wells": [],
+        }
+        with patch("excel_photo_model_studio.gui.catalog_overview", return_value=empty):
+            window = MainWindow()
+        try:
+            self.assertIn("Пока нет полностью подтверждённых скважин", window.catalog_wells.toPlainText())
+            confirmed = {
+                "summary": {"projects": 1, "photos": 12, "annotations": 38, "approved_annotations": 38},
+                "wells": [{
+                    "well_names": ["671ПО"], "photos": 12, "masks": 38, "facies": 4,
+                }],
+            }
+            with patch("excel_photo_model_studio.gui.catalog_overview", return_value=confirmed):
+                window._update_catalog_status()
+
+            text = window.catalog_wells.toPlainText()
+            self.assertIn("Подтверждены и готовы к включению в обучение", text)
+            self.assertIn("Скважина 671ПО — фото: 12; маски: 38; фаций: 4", text)
+            self.assertIn("скважин — 1", window.catalog_status.text())
+        finally:
+            window.close()
 
 
 if __name__ == "__main__":

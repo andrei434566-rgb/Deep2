@@ -313,17 +313,52 @@ def _write_catalog(path: Path, projects: list[dict]) -> None:
 
 
 def catalog_summary(path: Path | None = None) -> dict[str, int]:
+    return catalog_overview(path)["summary"]
+
+
+def catalog_well_details(path: Path | None = None) -> list[dict[str, object]]:
+    """Describe each fully confirmed well currently included in the cache."""
+    return catalog_overview(path)["wells"]
+
+
+def catalog_overview(path: Path | None = None) -> dict[str, object]:
+    """Load the confirmed-well list and its aggregate counts in one pass."""
     projects = load_confirmed_project_catalog(path)
     photos = annotations = approved = 0
+    details = []
     for project in projects:
         try:
             report = json.loads((project / "report.json").read_text(encoding="utf-8"))
+            with (project / "annotations.csv").open("r", encoding="utf-8-sig", newline="") as source:
+                rows = list(csv.DictReader(source, delimiter=";"))
+            manifest = json.loads((project / "cache_manifest.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
+            # The catalogue loader already checks validity. If a file changes
+            # between that check and this read, omit this entry rather than
+            # showing a stale confirmation as ready.
             continue
-        photos += int(report.get("photos", 0))
-        annotations += int(report.get("annotations", 0))
+        photos += int(report.get("photos", len(manifest.get("photos", {}))))
+        annotations += int(report.get("annotations", manifest.get("annotation_count", len(rows))))
         approved += int(report.get("approved_annotations", 0))
+        well_names = sorted({
+            str(row.get("well", "")).strip() for row in rows if str(row.get("well", "")).strip()
+        }, key=str.casefold)
+        facies_indices = {
+            str(row.get("facies_index", "")).strip().casefold()
+            for row in rows if str(row.get("facies_index", "")).strip()
+        }
+        details.append({
+            "project": project,
+            "well_names": well_names or [project.name],
+            "photos": int(report.get("photos", len(manifest.get("photos", {})))),
+            "masks": int(report.get("annotations", manifest.get("annotation_count", len(rows)))),
+            "facies": len(facies_indices),
+            "confirmed_at": str(manifest.get("created_at", "")),
+        })
     return {
-        "projects": len(projects), "photos": photos,
-        "annotations": annotations, "approved_annotations": approved,
+        "summary": {
+            "projects": len(details), "photos": photos,
+            "annotations": annotations, "approved_annotations": approved,
+        },
+        "wells": details,
     }

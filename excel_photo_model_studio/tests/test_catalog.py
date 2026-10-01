@@ -10,7 +10,8 @@ import cv2
 import numpy as np
 
 from excel_photo_model_studio.catalog import (
-    catalog_summary, confirm_project_for_training, load_confirmed_project_catalog,
+    catalog_overview, catalog_summary, confirm_project_for_training,
+    load_confirmed_project_catalog,
 )
 from excel_photo_model_studio.dataset import build_dataset
 
@@ -61,6 +62,7 @@ class CatalogTests(unittest.TestCase):
 
             loaded = load_confirmed_project_catalog(catalog)
             summary = catalog_summary(catalog)
+            overview = catalog_overview(catalog)
             result = build_dataset(loaded, root / "dataset")
             cataloged_sources = {
                 item["source_project"] for item in json.loads(catalog.read_text(encoding="utf-8"))["projects"]
@@ -74,6 +76,10 @@ class CatalogTests(unittest.TestCase):
             str(Path(source).resolve()) for source in cataloged_sources
         })
         self.assertEqual(2, summary["projects"])
+        self.assertEqual(["W-0", "W-1"], [
+            name for entry in overview["wells"] for name in entry["well_names"]
+        ])
+        self.assertTrue(all(entry["masks"] == 1 for entry in overview["wells"]))
         self.assertEqual(2, result["project_count"])
         self.assertEqual(2, result["photo_count"])
         self.assertTrue(cached_manifests_exist)
