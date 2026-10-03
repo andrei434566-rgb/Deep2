@@ -92,10 +92,18 @@ class VisionTests(unittest.TestCase):
                     [Match(photo, row, 100, 100.25)],
                     detected_columns_by_photo={photo_path: confirmed},
                 )
+            shifted_annotations, _shifted_columns, _shifted_orders = project_matches(
+                [Match(photo, row, 100, 100.25)],
+                detected_columns_by_photo={photo_path: [(82, 102, 178, 699), confirmed[1]]},
+            )
 
         self.assertEqual(confirmed, columns[photo_path])
         self.assertEqual(1, len(annotations))
-        self.assertEqual(81, min(x for x, _y in annotations[0].polygon))
+        xs = [x for x, _y in annotations[0].polygon]
+        self.assertEqual(2, len(set(xs)))
+        self.assertGreaterEqual(min(xs), 81)
+        self.assertLessEqual(min(xs), 90)
+        self.assertNotEqual(annotations[0].annotation_id, shifted_annotations[0].annotation_id)
 
     def test_projected_mask_follows_core_edges_and_does_not_cover_adjacent_arrow(self):
         with tempfile.TemporaryDirectory() as directory:

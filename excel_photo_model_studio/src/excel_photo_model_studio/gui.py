@@ -466,6 +466,12 @@ class StepVerificationDialog(QDialog):
         self.mask_confirm = QPushButton("Маски на этом фото верны")
         self.mask_confirm.clicked.connect(self._confirm_masks)
         left.addWidget(self.mask_confirm)
+        self.mask_confirm_all = QPushButton("Подтвердить маски на всех фото")
+        self.mask_confirm_all.setToolTip(
+            "Отметить все фотографии как проверенные. Используйте после просмотра всех страниц."
+        )
+        self.mask_confirm_all.clicked.connect(self._confirm_all_masks)
+        left.addWidget(self.mask_confirm_all)
         left.addStretch(1)
         layout.addLayout(left, 1)
         self.mask_preview = self._new_preview()
@@ -1226,6 +1232,11 @@ class StepVerificationDialog(QDialog):
             self.mask_confirm.setText("Подтвердить: масок на фото нет")
         self.mask_prev.setEnabled(self._current_photo > 0)
         self.mask_next.setEnabled(self._current_photo < len(self.photos) - 1)
+        all_confirmed = len(self.mask_confirmed) == len(self.photos)
+        self.mask_confirm_all.setEnabled(not all_confirmed)
+        self.mask_confirm_all.setText(
+            "Все фото подтверждены" if all_confirmed else "Подтвердить маски на всех фото"
+        )
         regions = self._column_regions(photo.path) + self._facies_regions(photo.path)
         self._fill_image(self.mask_preview, photo.path, regions)
 
@@ -1241,6 +1252,22 @@ class StepVerificationDialog(QDialog):
             self.audit.append(f"Маски: подтверждено фото {path.name}; сегментов {count}.")
         self._render_mask_photo()
         self.status.setText(f"Подтверждено фото с масками: {len(self.mask_confirmed)} из {len(self.photos)}.")
+
+    def _confirm_all_masks(self) -> None:
+        if not self.photos:
+            return
+        photo_paths = {photo.path for photo in self.photos}
+        newly_confirmed = photo_paths - self.mask_confirmed
+        self.mask_confirmed.update(photo_paths)
+        if newly_confirmed:
+            self.audit.append(
+                f"Маски: пользователь подтвердил все фото ({len(photo_paths)}); "
+                "отдельное подтверждение по-прежнему можно отменить."
+            )
+        self._render_mask_photo()
+        self.status.setText(
+            f"Подтверждены маски на всех фото: {len(self.mask_confirmed)} из {len(self.photos)}."
+        )
 
     def _go_forward(self) -> None:
         if self._busy():
@@ -1362,13 +1389,16 @@ class MainWindow(QMainWindow):
         self._build_project_tab()
         self._build_review_tab()
         self._build_train_tab()
+        self._build_export_tab()
         self._build_analyze_tab()
         self.project_process: QProcess | None = None
         self.dataset_process: QProcess | None = None
+        self.export_dataset_process: QProcess | None = None
         self.process: QProcess | None = None
         self.analysis_process: QProcess | None = None
         self._pending_project_action = ""
         self._ensure_training_output_paths()
+        self._update_catalog_status()
 
     def _build_project_tab(self) -> None:
         page = QWidget(self)
@@ -1435,9 +1465,15 @@ class MainWindow(QMainWindow):
         controls = QHBoxLayout()
         load = QPushButton("Загрузить таблицу проверки")
         load.clicked.connect(self._load_review)
+        approve_all = QPushButton("Подтвердить все маски")
+        approve_all.clicked.connect(lambda: self._set_all_review_approvals(True))
+        unapprove_all = QPushButton("Снять все отметки")
+        unapprove_all.clicked.connect(lambda: self._set_all_review_approvals(False))
         save = QPushButton("Сохранить подтверждения")
         save.clicked.connect(self._save_review)
         controls.addWidget(load)
+        controls.addWidget(approve_all)
+        controls.addWidget(unapprove_all)
         controls.addWidget(save)
         controls.addStretch(1)
         left.addLayout(controls)
@@ -1454,6 +1490,15 @@ class MainWindow(QMainWindow):
         self.preview.setMinimumWidth(380)
         layout.addWidget(self.preview, 2)
         self.tabs.addTab(page, "2. Проверка масок")
+
+    def _set_all_review_approvals(self, approved: bool) -> None:
+        state = Qt.CheckState.Checked if approved else Qt.CheckState.Unchecked
+        for row in range(self.review_table.rowCount()):
+            item = self.review_table.item(row, 0)
+            if item is not None:
+                item.setCheckState(state)
+        action = "отмечены как проверенные" if approved else "сняты отметки"
+        self.project_log.append(f"Маски: {action} для всех строк ({self.review_table.rowCount()}).")
 
     def _build_train_tab(self) -> None:
         page = QWidget(self)
@@ -1513,7 +1558,7 @@ class MainWindow(QMainWindow):
         self.catalog_wells.setPlaceholderText("Здесь появится список подтверждённых скважин.")
         layout.addWidget(self.catalog_wells)
         buttons = QHBoxLayout()
-        self.dataset_button = QPushButton("Собрать датасет из накопленных скважин")
+        self.dataset_button = QPushButton("Собрать датасет для обучения")
         self.dataset_button.clicked.connect(self._build_dataset)
         self.standard_train_button = QPushButton("Обучить YOLO11-seg + генератор описаний на CUDA GPU")
         self.standard_train_button.clicked.connect(self._start_training)
@@ -1524,8 +1569,65 @@ class MainWindow(QMainWindow):
         self.train_log = QTextEdit()
         self.train_log.setReadOnly(True)
         layout.addWidget(self.train_log, 1)
-        self.tabs.addTab(page, "3. Датасет и best.pt")
-        self._update_catalog_status()
+        self.tabs.addTab(page, "3. Накопление и обучение")
+
+    def _build_export_tab(self) -> None:
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        title = QLabel("Независимая выгрузка всего подтверждённого набора в YOLO Segmentation.")
+        title.setStyleSheet("font-size: 16px; font-weight: 650;")
+        title.setWordWrap(True)
+        layout.addWidget(title)
+        explanation = QLabel(
+            "Экспорт берёт все полностью подтверждённые скважины из накопительного кэша и "
+            "не запускает обучение. В папке будут исходные фото, polygon-разметка YOLO "
+            "(одна строка класса и нормализованных точек на маску), data.yaml, разбиение train/val, "
+            "а также метаданные фаций и набор кратких описаний из Excel. "
+            "Проверки качества и требования к независимому val-разбиению сохраняются."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        self.export_catalog_status = QLabel()
+        self.export_catalog_status.setWordWrap(True)
+        layout.addWidget(self.export_catalog_status)
+
+        form = QFormLayout()
+        output_row = QWidget(page)
+        output_layout = QHBoxLayout(output_row)
+        output_layout.setContentsMargins(0, 0, 0, 0)
+        self.export_dataset_output = QLineEdit(output_row)
+        self.export_dataset_output.setPlaceholderText(
+            "Укажите новую папку, например D:\\Datasets\\YOLO_segmentation"
+        )
+        choose_parent = QPushButton("Выбрать место…", output_row)
+        choose_parent.clicked.connect(self._choose_export_destination)
+        output_layout.addWidget(self.export_dataset_output, 1)
+        output_layout.addWidget(choose_parent)
+        form.addRow("Новая папка выгрузки:", output_row)
+        layout.addLayout(form)
+
+        button_row = QHBoxLayout()
+        self.export_dataset_button = QPushButton("Выгрузить весь датасет YOLO Segmentation")
+        self.export_dataset_button.clicked.connect(self._export_dataset)
+        button_row.addWidget(self.export_dataset_button)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
+        self.export_dataset_status = QLabel("Готово к выгрузке.")
+        self.export_dataset_status.setWordWrap(True)
+        layout.addWidget(self.export_dataset_status)
+        self.export_dataset_log = QTextEdit()
+        self.export_dataset_log.setReadOnly(True)
+        self.export_dataset_log.setPlaceholderText("Здесь появится ход и результат отдельного экспорта.")
+        layout.addWidget(self.export_dataset_log, 1)
+
+        local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        default_export = (
+            local_app_data / "ExcelPhotoModelStudio" / "exports"
+            / f"YOLO_seg_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:6]}"
+        )
+        self.export_dataset_output.setText(str(default_export))
+        self.tabs.addTab(page, "4. Экспорт YOLO Segmentation")
 
     def _build_analyze_tab(self) -> None:
         page = QWidget(self)
@@ -1549,7 +1651,7 @@ class MainWindow(QMainWindow):
         self.analysis_log = QTextEdit()
         self.analysis_log.setReadOnly(True)
         layout.addWidget(self.analysis_log, 1)
-        self.tabs.addTab(page, "4. Новый керн → Excel")
+        self.tabs.addTab(page, "5. Новый керн → Excel")
 
     def _create_project(self) -> None:
         try:
@@ -2135,6 +2237,97 @@ class MainWindow(QMainWindow):
         self.train_log.setPlainText("Сборка датасета выполняется в отдельном процессе…")
         self.dataset_process.start()
 
+    def _choose_export_destination(self) -> None:
+        current = Path(self.export_dataset_output.text().strip()).expanduser()
+        initial = current.parent if current.parent.is_dir() else Path.home()
+        parent = QFileDialog.getExistingDirectory(
+            self, "Выберите папку, внутри которой создать выгрузку", str(initial),
+        )
+        if not parent:
+            return
+        base = Path(parent) / "YOLO_segmentation_dataset"
+        destination = base
+        suffix = 2
+        while destination.exists():
+            destination = base.with_name(f"{base.name}_{suffix}")
+            suffix += 1
+        self.export_dataset_output.setText(str(destination))
+
+    def _export_dataset(self) -> None:
+        if self.export_dataset_process and self.export_dataset_process.state() != QProcess.ProcessState.NotRunning:
+            return self._error("Выгрузка YOLO Segmentation уже выполняется.")
+        if self.dataset_process and self.dataset_process.state() != QProcess.ProcessState.NotRunning:
+            return self._error("Дождитесь завершения сборки датасета для обучения.")
+        try:
+            raw_destination = self.export_dataset_output.text().strip()
+            if not raw_destination:
+                raise ValueError("Укажите новую папку для выгрузки датасета.")
+            destination = Path(raw_destination).expanduser().absolute()
+            if destination.exists():
+                raise ValueError(
+                    "Папка выгрузки уже существует. Укажите новое имя папки, "
+                    "чтобы не перезаписать существующие данные."
+                )
+            overview = catalog_overview()
+            summary = overview["summary"]
+            if summary["projects"] < 1:
+                raise ValueError("В накопительном кэше пока нет полностью подтверждённых скважин.")
+        except Exception as exc:
+            return self._error(str(exc))
+
+        self.export_dataset_process = QProcess(self)
+        self.export_dataset_process.setProgram(sys.executable)
+        self.export_dataset_process.setArguments(self._with_launcher([
+            "dataset", "--catalog", str(default_catalog_path()), "--output", str(destination),
+        ]))
+        self.export_dataset_process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.export_dataset_process.readyReadStandardOutput.connect(self._read_export_dataset_output)
+        self.export_dataset_process.finished.connect(self._export_dataset_finished)
+        self.export_dataset_button.setEnabled(False)
+        self.export_dataset_status.setText("Идёт экспорт всех подтверждённых скважин. Обучение не запускается.")
+        self.export_dataset_log.setPlainText(f"Папка выгрузки: {destination}\nЭкспорт запускается…")
+        self.export_dataset_process.start()
+
+    def _read_export_dataset_output(self) -> None:
+        if self.export_dataset_process:
+            text = bytes(self.export_dataset_process.readAllStandardOutput()).decode(errors="replace").strip()
+            if text:
+                self.export_dataset_log.append(text)
+
+    def _export_dataset_finished(self, code: int, _status) -> None:
+        self._read_export_dataset_output()
+        self.export_dataset_button.setEnabled(True)
+        self.export_dataset_log.append(f"\nЭкспорт завершён, код {code}.")
+        if code != 0:
+            self.export_dataset_status.setText(
+                "Выгрузка не завершилась. Подробная причина указана в журнале; "
+                "исходный накопительный кэш не изменён."
+            )
+            return
+        try:
+            destination = Path(self.export_dataset_output.text().strip()).expanduser()
+            manifest = json.loads(
+                (destination / "dataset_manifest.json").read_text(encoding="utf-8")
+            )
+            self.export_dataset_status.setText(
+                "Датасет готов: "
+                f"{manifest.get('photo_count', 0)} фото, "
+                f"{manifest.get('annotation_count', 0)} масок, "
+                f"{manifest.get('facies_count', 0)} классов; train — "
+                f"{manifest.get('train_photo_count', 0)} фото, val — "
+                f"{manifest.get('val_photo_count', 0)} фото. "
+                f"Конфигурация YOLO: {destination / 'data.yaml'}"
+            )
+            self.export_dataset_log.append(
+                f"\nЭкспортированы скважины: {manifest.get('project_count', 0)}; "
+                f"метаданные классов: {destination / 'class_metadata.json'}; "
+                f"краткие описания: {destination / 'caption_dataset.jsonl'}"
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            self.export_dataset_status.setText(
+                f"Процесс завершился успешно, но манифест не удалось прочитать: {exc}"
+            )
+
     def _read_dataset_output(self) -> None:
         if self.dataset_process:
             text = bytes(self.dataset_process.readAllStandardOutput()).decode(errors="replace").strip()
@@ -2279,6 +2472,20 @@ class MainWindow(QMainWindow):
                 "Пока нет полностью подтверждённых скважин. После проверки всех масок и сохранения "
                 "подтверждений скважина появится здесь."
             )
+        self._update_export_catalog_status(summary)
+
+    def _update_export_catalog_status(self, summary: dict | None = None) -> None:
+        if not hasattr(self, "export_catalog_status"):
+            return
+        if summary is None:
+            summary = catalog_overview()["summary"]
+        self.export_catalog_status.setText(
+            "Сейчас в кэше для экспорта: "
+            f"{summary['projects']} полностью подтверждённых скважин, "
+            f"{summary['photos']} фото, "
+            f"{summary['approved_annotations']} подтверждённых масок. "
+            "После подтверждения новых скважин выгрузка автоматически включит и их."
+        )
 
     def _project_dir(self) -> Path:
         if self.current_project is None:

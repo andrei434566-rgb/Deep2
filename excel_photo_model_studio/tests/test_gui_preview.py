@@ -13,9 +13,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import cv2
 import numpy as np
 from openpyxl import Workbook
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, QProcess, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QFileDialog
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QLabel, QTableWidgetItem
 
 from excel_photo_model_studio.gui import MainWindow, StepVerificationDialog
 from excel_photo_model_studio.matching import read_photo_map, write_photo_map
@@ -74,6 +74,70 @@ class GuiPreviewTests(unittest.TestCase):
             self.assertIn("Полный интервал фации: 100–102 м", tooltip)
             report = json.loads((project / "report.json").read_text(encoding="utf-8"))
             self.assertTrue(any("длиннее вместимости найденного керна" in issue["message"] for issue in report["issues"]))
+            window.close()
+
+    def test_mask_review_can_confirm_all_photos_at_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            excel = root / "description.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["Скважина", "Кровля", "Подошва", "Код", "Краткое описание"])
+            sheet.append(["W-1", 100.0, 101.0, "Dch", "Песчаник"])
+            workbook.save(excel)
+            photo_records = []
+            boxes = {}
+            for index in range(2):
+                path = root / f"page-{index}.jpg"
+                image = np.full((100, 80, 3), 255, dtype=np.uint8)
+                cv2.rectangle(image, (20, 10), (60, 90), (120, 120, 120), -1)
+                ok, encoded = cv2.imencode(".jpg", image)
+                self.assertTrue(ok)
+                path.write_bytes(encoded.tobytes())
+                photo_records.append(PhotoRecord(path, "W-1", 100.0, 101.0, "manual", True))
+                boxes[path] = [(18, 8, 62, 92)]
+
+            dialog = StepVerificationDialog(excel, root, use_ocr=False)
+            try:
+                deadline = time.monotonic() + 5
+                while dialog._busy() and time.monotonic() < deadline:
+                    self.application.processEvents()
+                    time.sleep(0.01)
+                self.application.processEvents()
+                dialog.photos = photo_records
+                dialog.columns = boxes
+                dialog._current_photo = 0
+                dialog._render_mask_photo()
+
+                dialog.mask_confirm_all.click()
+
+                self.assertEqual({photo.path for photo in photo_records}, dialog.mask_confirmed)
+                self.assertFalse(dialog.mask_confirm_all.isEnabled())
+                self.assertIn("2 из 2", dialog.status.text())
+                self.assertTrue(any("подтвердил все фото" in item for item in dialog.audit))
+            finally:
+                dialog.close()
+
+    def test_review_tab_can_approve_or_clear_all_mask_rows(self):
+        window = MainWindow()
+        try:
+            window.review_table.setRowCount(3)
+            for row in range(3):
+                item = QTableWidgetItem()
+                item.setCheckState(Qt.CheckState.Unchecked)
+                window.review_table.setItem(row, 0, item)
+
+            window._set_all_review_approvals(True)
+            self.assertTrue(all(
+                window.review_table.item(row, 0).checkState() == Qt.CheckState.Checked
+                for row in range(3)
+            ))
+            window._set_all_review_approvals(False)
+            self.assertTrue(all(
+                window.review_table.item(row, 0).checkState() == Qt.CheckState.Unchecked
+                for row in range(3)
+            ))
+        finally:
             window.close()
 
     def test_step_verification_can_open_and_switch_the_source_workbook(self):
@@ -357,6 +421,68 @@ class GuiPreviewTests(unittest.TestCase):
             self.assertIn("скважин — 1", window.catalog_status.text())
         finally:
             window.close()
+
+    def test_yolo_export_has_own_tab_and_launches_dataset_only(self):
+        overview = {
+            "summary": {"projects": 1, "photos": 8, "annotations": 24, "approved_annotations": 24},
+            "wells": [],
+        }
+        with patch("excel_photo_model_studio.gui.catalog_overview", return_value=overview):
+            window = MainWindow()
+        try:
+            self.assertEqual("4. Экспорт YOLO Segmentation", window.tabs.tabText(3))
+            self.assertEqual("5. Новый керн → Excel", window.tabs.tabText(4))
+            self.assertIn("8 фото", window.export_catalog_status.text())
+            self.assertIn("24 подтверждённых масок", window.export_catalog_status.text())
+            tab_labels = " ".join(label.text() for label in window.tabs.widget(3).findChildren(QLabel))
+            self.assertIn("не запускает обучение", tab_labels)
+
+            with tempfile.TemporaryDirectory() as directory:
+                destination = Path(directory) / "yolo-export"
+                catalog = Path(directory) / "catalog.json"
+                window.export_dataset_output.setText(str(destination))
+                with (
+                    patch("excel_photo_model_studio.gui.catalog_overview", return_value=overview),
+                    patch("excel_photo_model_studio.gui.default_catalog_path", return_value=catalog),
+                    patch.object(QProcess, "start") as start,
+                ):
+                    window._export_dataset()
+
+                start.assert_called_once_with()
+                arguments = window.export_dataset_process.arguments()
+                self.assertIn("dataset", arguments)
+                self.assertNotIn("train", arguments)
+                self.assertEqual(str(catalog), arguments[arguments.index("--catalog") + 1])
+                self.assertEqual(str(destination), arguments[arguments.index("--output") + 1])
+                self.assertFalse(destination.exists())
+
+                existing = Path(directory) / "do-not-overwrite"
+                existing.mkdir()
+                window.export_dataset_output.setText(str(existing))
+                with patch.object(window, "_error") as show_error:
+                    window._export_dataset()
+                show_error.assert_called_once()
+                self.assertIn("уже существует", show_error.call_args.args[0])
+        finally:
+            window.close()
+
+    def test_yolo_export_picker_creates_a_new_child_path_without_overwriting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            (parent / "YOLO_segmentation_dataset").mkdir()
+            with patch("excel_photo_model_studio.gui.catalog_overview", return_value={
+                "summary": {"projects": 0, "photos": 0, "annotations": 0, "approved_annotations": 0},
+                "wells": [],
+            }):
+                window = MainWindow()
+            try:
+                with patch("excel_photo_model_studio.gui.QFileDialog.getExistingDirectory", return_value=str(parent)):
+                    window._choose_export_destination()
+                selected = Path(window.export_dataset_output.text())
+                self.assertEqual(parent / "YOLO_segmentation_dataset_2", selected)
+                self.assertFalse(selected.exists())
+            finally:
+                window.close()
 
 
 if __name__ == "__main__":

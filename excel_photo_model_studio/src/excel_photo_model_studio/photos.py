@@ -10,6 +10,7 @@ from functools import partial
 from pathlib import Path
 from typing import Iterable
 
+from .depth import meters_to_centimeters
 from .models import PhotoRecord
 from .tabular import as_float, display_text
 
@@ -123,13 +124,27 @@ def enrich_core_column_depths(
         if not depths:
             output.append(replace(record, column_ocr_checked=True))
             continue
-        top = min(item[1] for item in depths)
-        base = max(item[2] for item in depths)
-        if base <= top:
+        column_top = min(item[1] for item in depths)
+        column_base = max(item[2] for item in depths)
+        if column_base <= column_top:
             output.append(replace(record, column_ocr_checked=True))
             continue
+        # Manual page boundaries are the user's correction and must not be
+        # silently undone by label OCR during a project refresh. Keep the OCR
+        # depths as per-column calibration metadata only when they agree with
+        # the corrected page span; stale OCR ranges must not block projection.
+        manually_confirmed = record.source == "manual" and record.mapping_confirmed and record.has_interval
+        if manually_confirmed and any(
+            meters_to_centimeters(top) < meters_to_centimeters(record.top) - 2
+            or meters_to_centimeters(base) > meters_to_centimeters(record.base) + 2
+            for _x, top, base in depths
+        ):
+            depths = ()
         output.append(replace(
-            record, top=top, base=base, source="ocr_verified",
+            record,
+            top=record.top if manually_confirmed else column_top,
+            base=record.base if manually_confirmed else column_base,
+            source=record.source if manually_confirmed else "ocr_verified",
             mapping_confirmed=True, column_depths=depths, column_ocr_checked=True,
             depth_basis=depth_metadata.get("depth_basis", record.depth_basis),
         ))

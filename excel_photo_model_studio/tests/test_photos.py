@@ -99,7 +99,7 @@ class PhotoOcrParsingTests(unittest.TestCase):
 
         self.assertEqual((4104.9, 4105.9), (record.top, record.base))
 
-    def test_manual_photo_retries_column_ocr_and_uses_complete_physical_depth_labels(self):
+    def test_manual_photo_retries_column_ocr_without_overwriting_corrected_interval(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "core.jpg"
             path.write_bytes(b"image")
@@ -121,10 +121,11 @@ class PhotoOcrParsingTests(unittest.TestCase):
             ):
                 resolved = enrich_core_column_depths([record], ((4104.9, 4116.9),))[0]
 
-        self.assertEqual((4104.9, 4109.84), (resolved.top, resolved.base))
+        self.assertEqual((4105.0, 4109.84), (resolved.top, resolved.base))
+        self.assertEqual("manual", resolved.source)
         self.assertEqual("gis", resolved.depth_basis)
         self.assertTrue(resolved.column_ocr_checked)
-        self.assertEqual(((0.5, 4104.9, 4109.84),), resolved.column_depths)
+        self.assertEqual((), resolved.column_depths)
 
     def test_rejects_numbers_from_ruler_and_figure_caption_as_depth_pair(self):
         self.assertIsNone(extract_depth_interval(

@@ -765,6 +765,10 @@ def project_matches(
             columns, float(photo.top), float(photo.base), image=image,
             column_depths=photo.column_depths,
         )
+        mask_boxes = {
+            box: _core_rectangle_box(core_foreground, box)
+            for box, _column_top, _column_base in calibrated
+        }
         if depth_ranges_by_photo is not None:
             depth_ranges_by_photo[photo_path] = calibrated
         for column_index, (box, column_top, column_base) in enumerate(calibrated):
@@ -783,10 +787,12 @@ def project_matches(
                 y0 = pixel_top + (overlap_top - column_top) / (column_base - column_top) * (pixel_bottom - pixel_top)
                 y1 = pixel_top + (overlap_base - column_top) / (column_base - column_top) * (pixel_bottom - pixel_top)
                 y0, y1 = _minimum_vertical_span(y0, y1, pixel_top, pixel_bottom)
-                polygon = _core_slice_polygon(core_foreground, box, y0, y1)
+                polygon = _core_slice_rectangle(mask_boxes.get(box, box), y0, y1)
+                geometry_key = ";".join(f"{x:.2f},{y:.2f}" for x, y in polygon)
                 identity = "|".join((
                     str(photo_path.resolve()), match.description.source_id, str(column_index),
                     f"{overlap_top:.6f}", f"{overlap_base:.6f}", match.description.label,
+                    geometry_key,
                 ))
                 annotation_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
                 annotations.append(Annotation(
@@ -807,83 +813,70 @@ def project_matches(
     return annotations, columns_by_photo, orders_by_photo
 
 
-def _core_slice_polygon(
+def _core_rectangle_box(
     foreground: np.ndarray,
     box: tuple[int, int, int, int],
-    y0: float,
-    y1: float,
-) -> tuple[tuple[float, float], ...]:
-    """Trace the visible rock silhouette within one depth slice.
-
-    Column discovery intentionally returns a stable bounding box for user
-    review. Using that whole rectangle as a training polygon also labels tray
-    walls, pale gutters, and any rule/arrow that touches the box. Here we use
-    the same foreground evidence as the detector to follow the rock's left and
-    right edges row by row. Sparse rows (fractures, bright patches, labels) are
-    interpolated from neighboring rock rows; if there is not enough evidence,
-    retain the reviewed rectangle rather than silently discard the facies.
-    """
+) -> tuple[int, int, int, int]:
+    """Estimate stable core edges once per column, excluding sparse marks."""
     image_height, image_width = foreground.shape[:2]
-    left, top, right, bottom = box
-    left = max(0, min(image_width, int(left)))
-    right = max(left, min(image_width, int(right)))
-    top = max(0, min(image_height, int(top)))
-    bottom = max(top, min(image_height, int(bottom)))
+    left, top, right, bottom = map(int, box)
+    left = max(0, min(image_width, left))
+    right = max(left, min(image_width, right))
+    top = max(0, min(image_height, top))
+    bottom = max(top, min(image_height, bottom))
     box_width, box_height = right - left, bottom - top
-    y0 = max(float(top), min(float(bottom), float(y0)))
-    y1 = max(y0, min(float(bottom), float(y1)))
-    if box_width < 4 or box_height < 2 or y1 <= y0:
-        return ((float(left), y0), (float(right), y0), (float(right), y1), (float(left), y1))
+    if box_width < 4 or box_height < 2:
+        return left, top, right, bottom
 
-    lane = foreground[top:bottom, left:right]
-    minimum_run = max(3, round(box_width * 0.36))
     center_left = round(box_width * 0.30)
     center_right = max(center_left + 1, round(box_width * 0.70))
-    left_edges = np.full(box_height, np.nan, dtype=np.float32)
-    right_edges = np.full(box_height, np.nan, dtype=np.float32)
+    minimum_run = max(3, round(box_width * 0.36))
     minimum_center_overlap = max(2, round(box_width * 0.24))
-    for row_index, row in enumerate(lane):
-        runs = _runs(row)
+    left_edges: list[int] = []
+    right_edges: list[int] = []
+    for row in foreground[top:bottom, left:right]:
         candidates = []
-        for run_left, run_right in runs:
+        for run_left, run_right in _runs(row):
             run_width = run_right - run_left
             center_overlap = max(0, min(run_right, center_right) - max(run_left, center_left))
             if run_width >= minimum_run and center_overlap >= minimum_center_overlap:
                 candidates.append((center_overlap, run_width, run_left, run_right))
         if candidates:
             _overlap, _width, run_left, run_right = max(candidates)
-            left_edges[row_index] = left + run_left
-            right_edges[row_index] = left + run_right
+            left_edges.append(left + run_left)
+            right_edges.append(left + run_right)
 
-    known = np.flatnonzero(np.isfinite(left_edges) & np.isfinite(right_edges))
-    if len(known) < max(3, round(box_height * 0.08)):
-        return ((float(left), y0), (float(right), y0), (float(right), y1), (float(left), y1))
+    minimum_support = max(3, round(box_height * 0.08))
+    if len(left_edges) >= minimum_support:
+        stable_left = round(float(np.median(left_edges)))
+        stable_right = round(float(np.median(right_edges)))
+        if stable_right - stable_left >= 4:
+            return stable_left, top, stable_right, bottom
 
-    row_positions = np.arange(box_height, dtype=np.float32)
-    left_edges = np.interp(row_positions, known, left_edges[known]).astype(np.float32)
-    right_edges = np.interp(row_positions, known, right_edges[known]).astype(np.float32)
-    smooth_width = max(3, min(17, round(box_height * 0.012) | 1))
-    radius = smooth_width // 2
-    padded_left = np.pad(left_edges, (radius, radius), mode="edge")
-    padded_right = np.pad(right_edges, (radius, radius), mode="edge")
-    left_edges = np.array([
-        np.median(padded_left[index:index + smooth_width])
-        for index in range(box_height)
-    ], dtype=np.float32)
-    right_edges = np.array([
-        np.median(padded_right[index:index + smooth_width])
-        for index in range(box_height)
-    ], dtype=np.float32)
+    inset = min(max(2, round(box_width * 0.04)), max(0, (box_width - 2) // 2))
+    return left + inset, top, right - inset, bottom
 
-    slice_height = y1 - y0
-    step = max(1, math.ceil(slice_height / 40))
-    sample_y = np.unique(np.append(np.arange(y0, y1, step, dtype=np.float32), [y0, y1]))
-    local_y = np.clip(sample_y - top, 0.0, max(0.0, box_height - 1.0))
-    x_left = np.interp(local_y, row_positions, left_edges)
-    x_right = np.interp(local_y, row_positions, right_edges)
-    left_points = [(float(x), float(y)) for x, y in zip(x_left, sample_y)]
-    right_points = [(float(x), float(y)) for x, y in zip(x_right[::-1], sample_y[::-1])]
-    return tuple(left_points + right_points)
+
+def _core_slice_rectangle(
+    box: tuple[int, int, int, int],
+    y0: float,
+    y1: float,
+) -> tuple[tuple[float, float], ...]:
+    """Create a clean rectangular facies mask within a reviewed core column."""
+    left, top, right, bottom = map(int, box)
+    box_width = max(0, right - left)
+    y0 = max(float(top), min(float(bottom), float(y0)))
+    y1 = max(y0, min(float(bottom), float(y1)))
+    # Keep a small, constant inset from the reviewed column edges to avoid
+    # tray rails and nearby whitespace. It does not follow rock striations,
+    # fractures, or scan noise, so all facies masks have exactly four corners.
+    inset = min(max(2, round(box_width * 0.04)), max(0, (box_width - 2) // 2))
+    mask_left = float(left + inset)
+    mask_right = float(right - inset)
+    return (
+        (mask_left, y0), (mask_right, y0),
+        (mask_right, y1), (mask_left, y1),
+    )
 
 
 def detect_column_order(image: np.ndarray, columns: list[tuple[int, int, int, int]]) -> str:

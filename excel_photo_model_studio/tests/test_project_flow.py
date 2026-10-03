@@ -4,6 +4,7 @@ import csv
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,7 +13,7 @@ import numpy as np
 from openpyxl import Workbook
 
 from excel_photo_model_studio.dataset import build_dataset
-from excel_photo_model_studio.matching import read_photo_map
+from excel_photo_model_studio.matching import read_photo_map, write_photo_map
 from excel_photo_model_studio.models import DescriptionRow, Match, PhotoRecord
 from excel_photo_model_studio.project import (
     _write_facies_inventory, create_project, load_annotations,
@@ -59,11 +60,93 @@ class ProjectFlowTests(unittest.TestCase):
             self.assertEqual([list(confirmed_boxes[0])], detected[str(photo.resolve())]["boxes"])
             annotation = load_annotations(project)[0]
             polygon = json.loads(annotation["polygon_json"])
-            # The manually confirmed box is reused, while the training mask
-            # trims its empty margin to the visible rock silhouette.
-            self.assertGreaterEqual(min(point[0] for point in polygon), 50.0)
-            self.assertLessEqual(max(point[0] for point in polygon), 126.0)
+            # The manually confirmed box is reused and the training mask has
+            # a clean, straight four-corner outline.
+            self.assertEqual(4, len(polygon))
+            self.assertEqual(2, len({point[0] for point in polygon}))
+            self.assertGreaterEqual(min(point[0] for point in polygon), 45.0)
+            self.assertLessEqual(max(point[0] for point in polygon), 130.0)
             self.assertEqual(0, report["photos_without_masks"])
+
+    def test_refresh_keeps_manual_interval_and_reprojects_facies_on_all_pages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            excel = root / "description.xlsx"
+            photos = root / "photos"
+            photos.mkdir()
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append([
+                "Скважина", "Интервал фации по бурению Кровля",
+                "Интервал фации по бурению Подошва", "Толщина фации, м",
+                "Индекс фации", "Название фации", "Краткое описание",
+            ])
+            sheet.append([
+                "W-1", 100.5, 101.0, 0.5, "Mstf", "Mstf",
+                "Неровномерный песчаник",
+            ])
+            sheet.append([
+                "W-1", 101.0, 102.0, 1.0, "Dch", "Dch",
+                "Каналы песчаника",
+            ])
+            workbook.save(excel)
+            image = np.full((240, 180, 3), 255, dtype=np.uint8)
+            cv2.rectangle(image, (50, 20), (125, 220), (100, 100, 100), -1)
+            ok, encoded = cv2.imencode(".jpg", image)
+            self.assertTrue(ok)
+            photo_path = photos / "W-1 100.00-102.00.jpg"
+            photo_path.write_bytes(encoded.tobytes())
+            next_photo_path = photos / "W-1 101.00-102.00.jpg"
+            next_photo_path.write_bytes(encoded.tobytes())
+
+            project = root / "project"
+            create_project(excel, photos, project)
+            photo_map = read_photo_map(project / "photo_map.csv")
+            photo = next(item for item in photo_map if item.path == photo_path.resolve())
+            corrected = replace(
+                photo, top=100.5, base=101.0, source="manual",
+                mapping_confirmed=True, column_depths=(), column_ocr_checked=False,
+                depth_basis="unknown",
+            )
+            write_photo_map(
+                project / "photo_map.csv",
+                [corrected if item.path == photo.path else item for item in photo_map],
+            )
+            config_path = project / "project.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["use_ocr"] = True
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            boxes = {path: [(45, 18, 130, 222)] for path in (photo_path, next_photo_path)}
+            write_verified_columns(project, boxes, {path: "left_to_right" for path in boxes})
+
+            def read_depth_labels(*_args, metadata, reference_interval, **_kwargs):
+                metadata["depth_basis"] = "drilling"
+                if reference_interval and reference_interval[0] >= 101:
+                    return ((0.5, 101.0, 102.0),)
+                return ((0.5, 100.0, 102.0),)
+
+            with (
+                patch("excel_photo_model_studio.photos._configure_tesseract", return_value=True),
+                patch("excel_photo_model_studio.vision.detect_core_columns", return_value=[(45, 18, 130, 222)]),
+                patch("excel_photo_model_studio.vision.extract_core_column_depths", side_effect=read_depth_labels),
+            ):
+                report = refresh_project(project)
+
+            refreshed_map = read_photo_map(project / "photo_map.csv")
+            refreshed = next(item for item in refreshed_map if item.path == photo.path)
+            annotations = load_annotations(project)
+
+        self.assertEqual((100.5, 101.0), (refreshed.top, refreshed.base))
+        self.assertEqual("manual", refreshed.source)
+        self.assertEqual((), refreshed.column_depths)
+        self.assertEqual(2, report["photos_with_facies"])
+        self.assertEqual(2, len(annotations), report)
+        intervals_by_photo = {
+            Path(item["photo"]).name: (float(item["depth_top"]), float(item["depth_base"]))
+            for item in annotations
+        }
+        self.assertEqual((100.5, 101.0), intervals_by_photo[photo_path.name])
+        self.assertEqual((101.0, 102.0), intervals_by_photo[next_photo_path.name])
 
     def test_all_ten_pages_and_all_core_columns_receive_facies_masks(self):
         with tempfile.TemporaryDirectory() as directory:

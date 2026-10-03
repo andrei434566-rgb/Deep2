@@ -172,7 +172,7 @@ jobs:
           name: Excel Photo Model Studio ${{ github.ref_name }}
           generate_release_notes: true
           make_latest: false
-          body_path: excel_photo_model_studio/RELEASE_NOTES_0.6.6.md
+          body_path: excel_photo_model_studio/RELEASE_NOTES_0.6.7.md
           files: |
             excel_photo_model_studio/release/*.zip
             excel_photo_model_studio/release/SHA256SUMS.txt
