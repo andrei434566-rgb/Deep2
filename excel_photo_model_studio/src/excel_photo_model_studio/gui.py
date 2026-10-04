@@ -1534,10 +1534,10 @@ class MainWindow(QMainWindow):
         form.addRow("Устройство:", QLabel("CUDA GPU 0 — обязательно; перехода на CPU нет"))
         layout.addLayout(form)
         queue_title = QLabel(
-            "Скважина попадает в накопительный кэш только после ручного подтверждения всех масок "
-            "и успешной проверки покрытия. Обработайте и подтвердите одну скважину, затем следующую. "
-            "Здесь датасет каждый раз собирается заново из всего подтверждённого кэша, поэтому новые "
-            "скважины добавляются к предыдущим без изменения исходных Excel и фото."
+            "В накопительный кэш попадают только вручную подтверждённые и корректные маски; "
+            "для сохранения достаточно подтвердить хотя бы один интервал. Остальные маски и ошибки "
+            "по другим фото не мешают продолжить позже. Датасет собирается из всех подтверждённых "
+            "масок кэша. Для запуска обучения дополнительно понадобится независимая выборка val."
         )
         queue_title.setWordWrap(True)
         layout.addWidget(queue_title)
@@ -1579,8 +1579,9 @@ class MainWindow(QMainWindow):
         title.setWordWrap(True)
         layout.addWidget(title)
         explanation = QLabel(
-            "Экспорт берёт все полностью подтверждённые скважины из накопительного кэша и "
-            "не запускает обучение. В папке будут исходные фото, polygon-разметка YOLO "
+            "Экспорт берёт все подтверждённые маски из накопительного кэша; для сохранения скважины "
+            "достаточно одного корректного подтверждённого интервала. "
+            "Экспорт не запускает обучение. В папке будут исходные фото, polygon-разметка YOLO "
             "(одна строка класса и нормализованных точек на маску), data.yaml, разбиение train/val, "
             "а также метаданные фаций и набор кратких описаний из Excel. "
             "Проверки качества и требования к независимому val-разбиению сохраняются."
@@ -1877,7 +1878,7 @@ class MainWindow(QMainWindow):
     def _show_report(self, report: dict) -> None:
         self._set_photo_issues(report)
         lines = [
-            "Обучение заблокировано: сопоставление содержит ошибки."
+            "Общая проверка проекта нашла ошибки; корректные подтверждённые маски можно сохранить отдельно."
             if report.get("blocking_errors", 0) else "Проверка сопоставления пройдена.",
             f"Служебная папка создана автоматически: {report['project_dir']}",
             f"Excel/CSV-файлов: {report.get('excel_files', 1)}", f"Строк Excel: {report['excel_rows']}", f"Фото: {report['photos']}",
@@ -2024,9 +2025,10 @@ class MainWindow(QMainWindow):
         try:
             confirm_project_for_training(project_dir)
             self.project_log.append(
-                "Скважина подтверждена: фото и маски скопированы в локальный накопительный кэш. "
-                "Она появится в списке готовых скважин на вкладке «Датасет и best.pt»; "
-                "можно обрабатывать и добавлять следующую."
+                f"Сохранено подтверждённых масок: {report['approved_annotations']}. "
+                "Они и нужные фото добавлены в локальный накопительный кэш; "
+                "неподтверждённые маски можно проверить позже. "
+                "Для обучения отдельно потребуется независимая выборка val."
             )
         except (OSError, ValueError) as exc:
             self.project_log.append(f"Скважина пока не добавлена в датасет: {exc}")
@@ -2271,7 +2273,7 @@ class MainWindow(QMainWindow):
             overview = catalog_overview()
             summary = overview["summary"]
             if summary["projects"] < 1:
-                raise ValueError("В накопительном кэше пока нет полностью подтверждённых скважин.")
+                raise ValueError("В накопительном кэше пока нет ни одной подтверждённой маски.")
         except Exception as exc:
             return self._error(str(exc))
 
@@ -2284,7 +2286,7 @@ class MainWindow(QMainWindow):
         self.export_dataset_process.readyReadStandardOutput.connect(self._read_export_dataset_output)
         self.export_dataset_process.finished.connect(self._export_dataset_finished)
         self.export_dataset_button.setEnabled(False)
-        self.export_dataset_status.setText("Идёт экспорт всех подтверждённых скважин. Обучение не запускается.")
+        self.export_dataset_status.setText("Идёт экспорт всех подтверждённых масок. Обучение не запускается.")
         self.export_dataset_log.setPlainText(f"Папка выгрузки: {destination}\nЭкспорт запускается…")
         self.export_dataset_process.start()
 
@@ -2309,6 +2311,10 @@ class MainWindow(QMainWindow):
             manifest = json.loads(
                 (destination / "dataset_manifest.json").read_text(encoding="utf-8")
             )
+            training_note = (
+                manifest.get("training_note", "")
+                if not manifest.get("training_ready", False) else ""
+            )
             self.export_dataset_status.setText(
                 "Датасет готов: "
                 f"{manifest.get('photo_count', 0)} фото, "
@@ -2316,7 +2322,7 @@ class MainWindow(QMainWindow):
                 f"{manifest.get('facies_count', 0)} классов; train — "
                 f"{manifest.get('train_photo_count', 0)} фото, val — "
                 f"{manifest.get('val_photo_count', 0)} фото. "
-                f"Конфигурация YOLO: {destination / 'data.yaml'}"
+                f"{training_note}Конфигурация YOLO: {destination / 'data.yaml'}"
             )
             self.export_dataset_log.append(
                 f"\nЭкспортированы скважины: {manifest.get('project_count', 0)}; "
@@ -2347,6 +2353,11 @@ class MainWindow(QMainWindow):
                     f"{manifest.get('annotation_count', 0)} масок, "
                     f"{manifest.get('photo_count', 0)} фото."
                 )
+                if not manifest.get("training_ready", False):
+                    self.train_log.append(
+                        manifest.get("training_note")
+                        or "Датасет сохранён; для обучения добавьте независимую выборку val."
+                    )
                 for item in stats:
                     self.train_log.append(
                         f"  {item.get('facies_index', '')} — {item.get('facies_name', '')}: "
@@ -2454,12 +2465,12 @@ class MainWindow(QMainWindow):
         summary = overview["summary"]
         wells = overview["wells"]
         self.catalog_status.setText(
-            "Накопительный кэш: полностью подтверждённые скважины сохранены локально; "
+            "Накопительный кэш: проверенные подтверждённые интервалы сохранены локально; "
             f"скважин — {summary['projects']}, фото — {summary['photos']}, масок — {summary['annotations']}. "
             "Новые скважины можно добавлять в этот же набор между запусками."
         )
         if wells:
-            lines = ["Подтверждены и готовы к включению в обучение:"]
+            lines = ["Подтверждённые маски, включённые в накапливаемый датасет:"]
             for item in wells:
                 name = ", ".join(str(value) for value in item["well_names"])
                 lines.append(
@@ -2469,8 +2480,8 @@ class MainWindow(QMainWindow):
             self.catalog_wells.setPlainText("\n".join(lines))
         else:
             self.catalog_wells.setPlainText(
-                "Пока нет полностью подтверждённых скважин. После проверки всех масок и сохранения "
-                "подтверждений скважина появится здесь."
+                "Пока нет подтверждённых масок. Отметьте хотя бы одну корректную маску и нажмите "
+                "«Сохранить подтверждения» — ждать проверки всей скважины не нужно."
             )
         self._update_export_catalog_status(summary)
 
@@ -2481,7 +2492,7 @@ class MainWindow(QMainWindow):
             summary = catalog_overview()["summary"]
         self.export_catalog_status.setText(
             "Сейчас в кэше для экспорта: "
-            f"{summary['projects']} полностью подтверждённых скважин, "
+            f"{summary['projects']} скважин с подтверждёнными масками, "
             f"{summary['photos']} фото, "
             f"{summary['approved_annotations']} подтверждённых масок. "
             "После подтверждения новых скважин выгрузка автоматически включит и их."

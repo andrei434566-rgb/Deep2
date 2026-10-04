@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+from contextlib import redirect_stdout
+import io
 import json
 import tempfile
 import unittest
@@ -13,10 +15,109 @@ from excel_photo_model_studio.catalog import (
     catalog_overview, catalog_summary, confirm_project_for_training,
     load_confirmed_project_catalog,
 )
+from excel_photo_model_studio.cli import main as run_cli
 from excel_photo_model_studio.dataset import build_dataset
+from excel_photo_model_studio.project import set_annotation_approvals
 
 
 class CatalogTests(unittest.TestCase):
+    def test_one_approved_mask_is_cached_and_dataset_built_despite_other_project_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = root / "training_catalog.json"
+            project = root / "project"
+            project.mkdir()
+            (project / "project.json").write_text("{}", encoding="utf-8")
+            photo_folder = project / "photos"
+            photo_folder.mkdir()
+            photos = []
+            annotations = []
+            for index in range(2):
+                photo = photo_folder / f"photo_{index}.jpg"
+                image = np.full((80, 60, 3), 90 + index * 30, dtype=np.uint8)
+                ok, encoded = cv2.imencode(".jpg", image)
+                self.assertTrue(ok)
+                photo.write_bytes(encoded.tobytes())
+                photos.append(photo)
+                annotations.append({
+                    "annotation_id": f"a{index}", "photo": str(photo), "preview": "",
+                    "well": "W-1", "photo_top": "100", "photo_base": "101",
+                    "depth_top": "100", "depth_base": "101", "label": "Dch",
+                    "facies_index": "Dch", "facies_name": "Каналы",
+                    "polygon_json": json.dumps([[5, 5], [50, 5], [50, 70], [5, 70]]),
+                    "image_width": "60", "image_height": "80", "source_sheet": "Data",
+                    "source_row": str(index + 2), "source_file": "source.xlsx",
+                    "target_text": "Песчаник светло-серый.", "approved": "1" if index == 0 else "0",
+                })
+            annotations_path = project / "annotations.csv"
+            with annotations_path.open("w", encoding="utf-8-sig", newline="") as target:
+                writer = csv.DictWriter(target, fieldnames=annotations[0].keys(), delimiter=";")
+                writer.writeheader()
+                writer.writerows(annotations)
+            report = {
+                "photos": 2, "confirmed_photos": 1, "annotations": 2,
+                "approved_annotations": 1, "blocking_errors": 4,
+                "projection_errors": 1, "photos_without_masks": 1,
+                "validation_snapshot": {
+                    "files": {
+                        str(path.resolve()): [path.stat().st_size, path.stat().st_mtime_ns]
+                        for path in (*photos, annotations_path)
+                    },
+                    "photos_dir": str(photo_folder),
+                    "photos": sorted(str(photo.resolve()) for photo in photos),
+                },
+            }
+            (project / "report.json").write_text(json.dumps(report), encoding="utf-8")
+
+            confirm_project_for_training(project, catalog)
+            cached_projects = load_confirmed_project_catalog(catalog)
+            overview = catalog_overview(catalog)
+            result = build_dataset(cached_projects, root / "dataset")
+            cli_destination = root / "dataset_from_catalog"
+            with redirect_stdout(io.StringIO()):
+                cli_result = run_cli([
+                    "dataset", "--catalog", str(catalog), "--output", str(cli_destination),
+                ])
+            cli_manifest = json.loads((cli_destination / "dataset_manifest.json").read_text(encoding="utf-8"))
+
+            with (cached_projects[0] / "annotations.csv").open(
+                "r", encoding="utf-8-sig", newline="",
+            ) as source:
+                cached_rows = list(csv.DictReader(source, delimiter=";"))
+            cache_manifest = json.loads((cached_projects[0] / "cache_manifest.json").read_text(encoding="utf-8"))
+            first_snapshot = cached_projects[0]
+
+            set_annotation_approvals(project, {"a1": True})
+            confirm_project_for_training(project, catalog)
+            updated_projects = load_confirmed_project_catalog(catalog)
+            updated_overview = catalog_overview(catalog)
+            first_snapshot_exists = first_snapshot.is_dir()
+            with (updated_projects[0] / "annotations.csv").open(
+                "r", encoding="utf-8-sig", newline="",
+            ) as source:
+                updated_rows = list(csv.DictReader(source, delimiter=";"))
+
+        self.assertEqual(1, len(cached_projects))
+        self.assertEqual(1, len(cached_rows), "unchecked masks must not leak into the approved snapshot")
+        self.assertEqual("1", cached_rows[0]["approved"])
+        self.assertTrue(cache_manifest["partial_confirmation"])
+        self.assertEqual(1, overview["summary"]["photos"])
+        self.assertEqual(1, overview["summary"]["annotations"])
+        self.assertEqual(1, result["photo_count"])
+        self.assertEqual(1, result["annotation_count"])
+        self.assertFalse(result["training_ready"], "a one-photo set must not pretend to have independent validation")
+        self.assertEqual(0, result["val_photo_count"])
+        self.assertEqual(1, result["train_photo_count"])
+        self.assertEqual(0, cli_result, "the application's catalog export route must also allow one approved interval")
+        self.assertEqual(1, cli_manifest["photo_count"])
+        self.assertEqual(1, cli_manifest["annotation_count"])
+        self.assertFalse(cli_manifest["training_ready"])
+        self.assertEqual(2, len(updated_rows), "later approvals should extend the current well snapshot")
+        self.assertNotEqual(first_snapshot, updated_projects[0])
+        self.assertTrue(first_snapshot_exists, "older snapshots remain recoverable")
+        self.assertEqual(2, updated_overview["summary"]["photos"])
+        self.assertEqual(2, updated_overview["summary"]["annotations"])
+
     def test_separate_well_projects_accumulate_into_one_dataset(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

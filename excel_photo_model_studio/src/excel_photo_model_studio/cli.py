@@ -70,7 +70,10 @@ def main(argv: list[str] | None = None) -> int:
             from .dataset import build_dataset
             projects = load_confirmed_project_catalog(args.catalog) if args.catalog else args.project
             if args.catalog and not projects:
-                raise ValueError("В накопительном каталоге пока нет полностью подтверждённых скважин.")
+                raise ValueError(
+                    "В накопительном каталоге пока нет подтверждённых масок; "
+                    "сначала сохраните хотя бы один интервал."
+                )
             result = build_dataset(projects, args.output)
         elif args.command == "train":
             from .training import train_model

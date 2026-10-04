@@ -24,10 +24,21 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
     seen_annotations = set()
     source_target_headers = []
     for current_project in project_dirs:
+        cache_manifest = {}
+        cache_manifest_path = current_project / "cache_manifest.json"
+        if cache_manifest_path.is_file():
+            try:
+                cache_manifest = json.loads(cache_manifest_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                cache_manifest = {}
+        is_approved_snapshot = (
+            cache_manifest.get("schema") == "confirmed-well-cache-v2"
+            and cache_manifest.get("confirmation_scope") == "approved_annotations"
+        )
         report_path = current_project / "report.json"
         if report_path.is_file():
             report = json.loads(report_path.read_text(encoding="utf-8"))
-            blockers = _report_blockers(report)
+            blockers = [] if is_approved_snapshot else _report_blockers(report)
             if blockers:
                 raise ValueError(
                     f"{current_project.name}: датасет заблокирован: " + "; ".join(blockers)
@@ -40,6 +51,12 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
             project_rows = list(csv.DictReader(source, delimiter=";"))
             if any(row.get("approved") != "1" for row in project_rows):
                 raise ValueError(f"{current_project.name}: есть неподтверждённые маски. Нельзя обучать на части скважины.")
+            if is_approved_snapshot:
+                if len(project_rows) != int(cache_manifest.get("annotation_count", -1)):
+                    raise ValueError(f"{current_project.name}: число подтверждённых масок не совпадает с кэшем.")
+                cached_photos = {str(Path(row["photo"]).expanduser().resolve()) for row in project_rows}
+                if len(cached_photos) != int(cache_manifest.get("photo_count", -1)):
+                    raise ValueError(f"{current_project.name}: список фото не совпадает с кэшем подтверждённых масок.")
             if report_path.is_file() and len(project_rows) != int(report.get("annotations", len(project_rows))):
                 raise ValueError(f"{current_project.name}: число масок не совпадает с проверенным отчётом; пересчитайте проект.")
             if (current_project / "project.json").is_file():
@@ -78,8 +95,6 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
     for row in rows:
         _validate_annotation(row)
         by_photo[row["photo"]].append(row)
-    if len(by_photo) < 2:
-        raise ValueError("Нужно минимум два разных фото: одно фото нельзя одновременно использовать для train и val.")
     labels = [item["facies_index"] for item in facies_statistics]
     class_ids = {label: index for index, label in enumerate(labels)}
     content_ids = {}
@@ -87,8 +102,9 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
         with Path(photo_name).open("rb") as source:
             content_ids[photo_name] = hashlib.file_digest(source, "sha256").hexdigest()
     split_by_photo, strategy = _split_sources(by_photo, content_ids)
-    if "val" not in split_by_photo.values():
-        raise ValueError("Не удалось выделить независимый val без удаления класса из train. Добавьте разные фото тех же классов; копии одного фото не являются независимой проверкой.")
+    # Preserve every reviewed interval in the export even before an independent
+    # validation set exists. train_model deliberately refuses to start until a
+    # real, non-leaking val split is available.
     for split in ("train", "val"):
         (destination / "images" / split).mkdir(parents=True, exist_ok=False)
         (destination / "labels" / split).mkdir(parents=True, exist_ok=False)
@@ -227,6 +243,11 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
         "caption_dataset": str(caption_path),
         "train_photo_count": sum(value == "train" for value in split_by_photo.values()),
         "val_photo_count": sum(value == "val" for value in split_by_photo.values()),
+        "training_ready": "val" in split_by_photo.values(),
+        "training_note": "" if "val" in split_by_photo.values() else (
+            "Датасет сохранён, но для обучения добавьте независимые фото для val "
+            "с представленными в train классами."
+        ),
         "class_counts": {item["facies_index"]: item["mask_count"] for item in facies_statistics},
         "samples": samples,
     }

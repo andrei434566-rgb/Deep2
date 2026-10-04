@@ -391,7 +391,7 @@ class GuiPreviewTests(unittest.TestCase):
         }
         window._show_report(report)
         message = window.project_log.toPlainText()
-        self.assertIn("Обучение заблокировано", message)
+        self.assertIn("Общая проверка проекта нашла ошибки", message)
         self.assertIn("Ошибок привязки масок к колонкам керна: 1", message)
         self.assertIn("Фаций Excel с неполным покрытием масками: 1", message)
         self.assertEqual(["Колонка керна не покрыта масками."], window.matching_photo_issues["core.jpg"])
@@ -405,7 +405,7 @@ class GuiPreviewTests(unittest.TestCase):
         with patch("excel_photo_model_studio.gui.catalog_overview", return_value=empty):
             window = MainWindow()
         try:
-            self.assertIn("Пока нет полностью подтверждённых скважин", window.catalog_wells.toPlainText())
+            self.assertIn("Пока нет подтверждённых масок", window.catalog_wells.toPlainText())
             confirmed = {
                 "summary": {"projects": 1, "photos": 12, "annotations": 38, "approved_annotations": 38},
                 "wells": [{
@@ -416,7 +416,7 @@ class GuiPreviewTests(unittest.TestCase):
                 window._update_catalog_status()
 
             text = window.catalog_wells.toPlainText()
-            self.assertIn("Подтверждены и готовы к включению в обучение", text)
+            self.assertIn("Подтверждённые маски, включённые в накапливаемый датасет", text)
             self.assertIn("Скважина 671ПО — фото: 12; маски: 38; фаций: 4", text)
             self.assertIn("скважин — 1", window.catalog_status.text())
         finally:

@@ -47,8 +47,7 @@ def _confirmation_error(project_dir: Path) -> str:
         report = json.loads(report_path.read_text(encoding="utf-8"))
         with annotations_path.open("r", encoding="utf-8-sig", newline="") as source:
             rows = list(csv.DictReader(source, delimiter=";"))
-        from .dataset import _report_blockers, _verify_validation_snapshot
-        blockers = _report_blockers(report)
+        from .dataset import _validate_annotation, _verify_validation_snapshot
         _verify_validation_snapshot(project_dir, report)
     except Exception as exc:
         return str(exc)
@@ -59,11 +58,26 @@ def _confirmation_error(project_dir: Path) -> str:
     approved_count = sum(row.get("approved") == "1" for row in rows)
     if int(report.get("approved_annotations", -1)) != approved_count:
         return "число подтверждённых масок не совпадает с отчётом; сохраните подтверждения ещё раз"
-    pending = sum(row.get("approved") != "1" for row in rows)
-    if pending:
-        return f"не подтверждены маски: {pending} из {len(rows)}"
-    if blockers:
-        return "проверка качества не пройдена: " + "; ".join(blockers)
+    approved_rows = [row for row in rows if row.get("approved") == "1"]
+    pending = len(rows) - len(approved_rows)
+    is_cache = (project_dir / "cache_manifest.json").is_file()
+    if is_cache and pending:
+        return f"в подтверждённом кэше найдены неподтверждённые маски: {pending}"
+    if not approved_rows:
+        return f"не подтверждены маски: {pending} из {len(rows)}; отметьте хотя бы одну маску"
+    snapshot = report.get("validation_snapshot") or {}
+    snapshot_photos = {
+        os.path.normcase(str(Path(value).expanduser().resolve()))
+        for value in snapshot.get("photos", [])
+    }
+    for row in approved_rows:
+        try:
+            _validate_annotation(row)
+            photo = Path(row["photo"]).expanduser().resolve(strict=True)
+        except (KeyError, OSError, ValueError) as exc:
+            return f"подтверждённая маска {row.get('annotation_id', '')} некорректна: {exc}"
+        if os.path.normcase(str(photo)) not in snapshot_photos:
+            return f"Фото для подтверждённой маски {row.get('annotation_id', '')} не входит в проверенный проект"
     return ""
 
 
@@ -123,7 +137,26 @@ def confirm_project_for_training(project_dir: Path, path: Path | None = None) ->
 def _snapshot_confirmed_project(source_project: Path, cache_root: Path) -> Path:
     report = json.loads((source_project / "report.json").read_text(encoding="utf-8"))
     snapshot = report["validation_snapshot"]
+    all_rows = list(csv.DictReader(
+        io.StringIO((source_project / "annotations.csv").read_text(encoding="utf-8-sig"), newline=""),
+        delimiter=";",
+    ))
+    rows = [row for row in all_rows if row.get("approved") == "1"]
+    if not rows:
+        raise ValueError("Отметьте и сохраните хотя бы одну проверенную маску.")
+    from .dataset import _validate_annotation, _verify_validation_snapshot
+    _verify_validation_snapshot(source_project, report)
     source_photos = [Path(value).expanduser().resolve(strict=True) for value in snapshot["photos"]]
+    photos_by_key = {os.path.normcase(str(photo)): photo for photo in source_photos}
+    referenced_photos = {}
+    for row in rows:
+        _validate_annotation(row)
+        photo = Path(row["photo"]).expanduser().resolve(strict=True)
+        key = os.path.normcase(str(photo))
+        if key not in photos_by_key:
+            raise ValueError(f"Фото для маски {row.get('annotation_id', '')} не входит в проверенный проект.")
+        referenced_photos[key] = photos_by_key[key]
+    source_photos = sorted(referenced_photos.values(), key=lambda item: item.name.casefold())
     if not source_photos:
         raise ValueError("В подтверждённой скважине нет фотографий для кэширования.")
     cache_root.mkdir(parents=True, exist_ok=True)
@@ -174,13 +207,18 @@ def _snapshot_confirmed_project(source_project: Path, cache_root: Path) -> Path:
         source_annotation_digest = hashlib.sha256(annotations_raw).hexdigest()
         reader = csv.DictReader(io.StringIO(annotations_raw.decode("utf-8-sig"), newline=""), delimiter=";")
         fieldnames = list(reader.fieldnames or [])
-        rows = list(reader)
+        current_rows = list(reader)
         if (
-            not rows or len(rows) != int(report.get("annotations", -1))
-            or any(row.get("approved") != "1" for row in rows)
+            len(current_rows) != int(report.get("annotations", -1))
+            or sum(row.get("approved") == "1" for row in current_rows)
+            != int(report.get("approved_annotations", -1))
         ):
             raise ValueError("Маски изменились во время кэширования. Повторите проверку и подтверждение.")
+        rows = [row for row in current_rows if row.get("approved") == "1"]
+        if not rows:
+            raise ValueError("Отметьте и сохраните хотя бы одну проверенную маску.")
         for row in rows:
+            _validate_annotation(row)
             original = str(Path(row["photo"]).expanduser().resolve(strict=True))
             if original not in photo_map:
                 raise ValueError(f"Маска ссылается на фото вне проверенного снимка: {Path(original).name}")
@@ -200,6 +238,12 @@ def _snapshot_confirmed_project(source_project: Path, cache_root: Path) -> Path:
         cached_snapshot["files"][str((final_dir / "annotations.csv").resolve())] = [
             cached_annotations.stat().st_size, cached_annotations.stat().st_mtime_ns,
         ]
+        cached_report["photos"] = len(source_photos)
+        cached_report["confirmed_photos"] = len(source_photos)
+        cached_report["unconfirmed_photos"] = 0
+        cached_report["annotations"] = len(rows)
+        cached_report["approved_annotations"] = len(rows)
+        cached_report["confirmation_scope"] = "approved_annotations"
         cached_report["validation_snapshot"] = cached_snapshot
         cached_report["project_dir"] = str(final_dir)
         (staging / "report.json").write_text(
@@ -207,11 +251,15 @@ def _snapshot_confirmed_project(source_project: Path, cache_root: Path) -> Path:
         )
         (staging / "project.json").write_text("{}\n", encoding="utf-8")
         (staging / "cache_manifest.json").write_text(json.dumps({
-            "schema": "confirmed-well-cache-v1", "source_project": str(source_project),
+            "schema": "confirmed-well-cache-v2", "confirmation_scope": "approved_annotations",
+            "source_project": str(source_project),
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "photos": photo_hashes, "annotation_count": len(rows),
+            "photo_count": len(source_photos), "approved_annotation_count": len(rows),
+            "partial_confirmation": len(rows) < len(all_rows),
             "source_signature": _source_signature(report, source_annotation_digest),
         }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _verify_validation_snapshot(source_project, report)
         staging.rename(final_dir)
     return final_dir
 
@@ -232,7 +280,7 @@ def _source_signature(report: dict, annotations_digest: str) -> str:
 
 
 def load_confirmed_project_catalog(path: Path | None = None) -> list[Path]:
-    """Return confirmed local snapshots, upgrading valid legacy path entries once."""
+    """Return local snapshots containing at least one individually confirmed mask."""
     catalog_path = Path(path or default_catalog_path()).expanduser().absolute()
     for project in load_project_catalog(catalog_path):
         if (project / "cache_manifest.json").is_file() or _confirmation_error(project):
@@ -317,7 +365,7 @@ def catalog_summary(path: Path | None = None) -> dict[str, int]:
 
 
 def catalog_well_details(path: Path | None = None) -> list[dict[str, object]]:
-    """Describe each fully confirmed well currently included in the cache."""
+    """Describe each well represented by individually confirmed masks in the cache."""
     return catalog_overview(path)["wells"]
 
 
@@ -337,8 +385,8 @@ def catalog_overview(path: Path | None = None) -> dict[str, object]:
             # between that check and this read, omit this entry rather than
             # showing a stale confirmation as ready.
             continue
-        photos += int(report.get("photos", len(manifest.get("photos", {}))))
-        annotations += int(report.get("annotations", manifest.get("annotation_count", len(rows))))
+        photos += int(manifest.get("photo_count", report.get("photos", len(manifest.get("photos", {})))))
+        annotations += int(manifest.get("annotation_count", report.get("annotations", len(rows))))
         approved += int(report.get("approved_annotations", 0))
         well_names = sorted({
             str(row.get("well", "")).strip() for row in rows if str(row.get("well", "")).strip()
@@ -350,8 +398,8 @@ def catalog_overview(path: Path | None = None) -> dict[str, object]:
         details.append({
             "project": project,
             "well_names": well_names or [project.name],
-            "photos": int(report.get("photos", len(manifest.get("photos", {})))),
-            "masks": int(report.get("annotations", manifest.get("annotation_count", len(rows)))),
+            "photos": int(manifest.get("photo_count", report.get("photos", len(manifest.get("photos", {}))))),
+            "masks": int(manifest.get("annotation_count", report.get("annotations", len(rows)))),
             "facies": len(facies_indices),
             "confirmed_at": str(manifest.get("created_at", "")),
         })
