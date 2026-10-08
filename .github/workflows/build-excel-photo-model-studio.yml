@@ -60,16 +60,21 @@ jobs:
           QT_QPA_PLATFORM: offscreen
           PYTHONPATH: src
         run: |
-          $stdout = Join-Path $env:RUNNER_TEMP 'studio-tests-stdout.log'
-          $stderr = Join-Path $env:RUNNER_TEMP 'studio-tests-stderr.log'
-          $process = Start-Process -FilePath (Get-Command python).Source `
-            -ArgumentList @('-B', '-m', 'unittest', 'discover', '-s', 'tests', '-v') `
-            -RedirectStandardOutput $stdout -RedirectStandardError $stderr `
-            -WindowStyle Hidden -Wait -PassThru
-          Get-Content -LiteralPath $stdout
-          Get-Content -LiteralPath $stderr
-          Write-Host "Unit test process exit code: $($process.ExitCode)"
-          if ($process.ExitCode -ne 0) { throw "Unit tests failed with exit code $($process.ExitCode)" }
+          $testFiles = @(Get-ChildItem -LiteralPath 'tests' -Filter 'test_*.py' -File | Sort-Object Name)
+          if (-not $testFiles) { throw 'No unit test files found.' }
+          foreach ($file in $testFiles) {
+            Write-Host "Running $($file.Name)"
+            $stdout = Join-Path $env:RUNNER_TEMP "$($file.BaseName)-stdout.log"
+            $stderr = Join-Path $env:RUNNER_TEMP "$($file.BaseName)-stderr.log"
+            $process = Start-Process -FilePath (Get-Command python).Source `
+              -ArgumentList @('-B', '-m', 'unittest', 'discover', '-s', 'tests', '-p', $file.Name, '-v') `
+              -RedirectStandardOutput $stdout -RedirectStandardError $stderr `
+              -WindowStyle Hidden -Wait -PassThru
+            Get-Content -LiteralPath $stdout
+            Get-Content -LiteralPath $stderr
+            Write-Host "$($file.Name) exit code: $($process.ExitCode)"
+            if ($process.ExitCode -ne 0) { throw "$($file.Name) failed with exit code $($process.ExitCode)" }
+          }
 
       - name: Build portable application
         if: github.event_name != 'workflow_dispatch' || inputs.tests_only != true
