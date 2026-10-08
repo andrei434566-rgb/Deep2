@@ -648,6 +648,7 @@ class GuiPreviewTests(unittest.TestCase):
                 destination = Path(directory) / "dataset"
                 window.dataset_output.set_value(destination)
                 with (
+                    patch("excel_photo_model_studio.gui.catalog_overview", return_value=overview),
                     patch("excel_photo_model_studio.gui.load_confirmed_project_catalog", return_value=[Path("approved")]),
                     patch("excel_photo_model_studio.gui.build_dataset", return_value=manifest) as build,
                     patch.object(QProcess, "start", side_effect=AssertionError(

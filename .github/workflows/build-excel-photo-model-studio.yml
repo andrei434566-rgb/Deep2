@@ -1,6 +1,7 @@
 name: Build Excel Photo Model Studio for Windows
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - 'excel-photo-studio-v*'
