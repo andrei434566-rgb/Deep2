@@ -11,6 +11,7 @@ permissions:
 env:
   PYTHONUTF8: '1'
   PYTHONIOENCODING: 'utf-8'
+  STUDIO_DIST: 'C:\studio-dist'
 
 jobs:
   build:
@@ -56,16 +57,17 @@ jobs:
 
       - name: Build portable application
         working-directory: excel_photo_model_studio
-        run: python -m PyInstaller --noconfirm --clean Excel_Photo_Model_Studio.spec
+        run: python -m PyInstaller --noconfirm --clean --distpath "${{ env.STUDIO_DIST }}" Excel_Photo_Model_Studio.spec
 
       - name: Verify packaged application
         shell: pwsh
         working-directory: excel_photo_model_studio
         run: |
-          $cudaRuntime = Get-ChildItem -LiteralPath 'dist/Excel_Photo_Model_Studio' -Filter '*.dll' -Recurse -File -ErrorAction SilentlyContinue |
+          $portableDir = Join-Path $env:STUDIO_DIST 'Excel_Photo_Model_Studio'
+          $cudaRuntime = Get-ChildItem -LiteralPath $portableDir -Filter '*.dll' -Recurse -File -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -match '(cublas|cudnn|cufft|curand|cusolver|cusparse|nvrtc|nvjitlink|cudart|c10_cuda|torch_cuda).*\.dll$' }
           if (-not $cudaRuntime) {
-            $dllNames = (Get-ChildItem -LiteralPath 'dist/Excel_Photo_Model_Studio' -Filter '*.dll' -Recurse -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name -Unique) -join ', '
+            $dllNames = (Get-ChildItem -LiteralPath $portableDir -Filter '*.dll' -Recurse -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name -Unique) -join ', '
             Write-Host "::error title=CUDA runtime verification failed::No expected CUDA DLL names found. Packaged DLLs: $dllNames"
             throw "PyTorch CUDA runtime DLLs were not bundled. DLLs found: $dllNames"
           }
@@ -75,7 +77,8 @@ jobs:
         shell: pwsh
         working-directory: excel_photo_model_studio
         run: |
-          $process = Start-Process -FilePath 'dist/Excel_Photo_Model_Studio/Excel_Photo_Model_Studio.exe' -ArgumentList 'self-test --output portable-self-test.json' -WindowStyle Hidden -Wait -PassThru
+          $portableExe = Join-Path (Join-Path $env:STUDIO_DIST 'Excel_Photo_Model_Studio') 'Excel_Photo_Model_Studio.exe'
+          $process = Start-Process -FilePath $portableExe -ArgumentList 'self-test --output portable-self-test.json' -WindowStyle Hidden -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Portable application smoke test failed: $($process.ExitCode)" }
           Get-Content portable-self-test.json
 
@@ -88,7 +91,7 @@ jobs:
           if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Unexpected release tag: $env:GITHUB_REF_NAME" }
           New-Item -ItemType Directory -Force -Path release | Out-Null
           $releaseRoot = (Resolve-Path 'release').Path
-          $distRoot = (Resolve-Path 'dist/Excel_Photo_Model_Studio').Path
+          $distRoot = (Resolve-Path (Join-Path $env:STUDIO_DIST 'Excel_Photo_Model_Studio')).Path
           $files = @(Get-ChildItem -LiteralPath $distRoot -Recurse -File | Sort-Object Length -Descending)
           if ($files.Count -eq 0) { throw 'Portable application folder is empty.' }
           $totalBytes = [int64](($files | Measure-Object Length -Sum).Sum)
