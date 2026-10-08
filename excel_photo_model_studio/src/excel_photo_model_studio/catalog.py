@@ -6,13 +6,16 @@ import csv
 import hashlib
 import io
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
+from .paths import resolve_existing_path
+from .storage import app_data_dir, replace_or_write
+
 
 def default_catalog_path() -> Path:
-    local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-    return local_app_data / "ExcelPhotoModelStudio" / "training_catalog.json"
+    return app_data_dir() / "training_catalog.json"
 
 
 def load_project_catalog(path: Path | None = None) -> list[Path]:
@@ -73,7 +76,7 @@ def _confirmation_error(project_dir: Path) -> str:
     for row in approved_rows:
         try:
             _validate_annotation(row)
-            photo = Path(row["photo"]).expanduser().resolve(strict=True)
+            photo = resolve_existing_path(row["photo"])
         except (KeyError, OSError, ValueError) as exc:
             return f"подтверждённая маска {row.get('annotation_id', '')} некорректна: {exc}"
         if os.path.normcase(str(photo)) not in snapshot_photos:
@@ -83,7 +86,7 @@ def _confirmation_error(project_dir: Path) -> str:
 
 def confirm_project_for_training(project_dir: Path, path: Path | None = None) -> Path:
     """Snapshot approved photos and masks into the persistent cache and catalog."""
-    project_dir = Path(project_dir).expanduser().resolve(strict=True)
+    project_dir = resolve_existing_path(project_dir)
     catalog_path = Path(path or default_catalog_path()).expanduser().absolute()
     source_key = os.path.normcase(str(project_dir))
     payload = _read_catalog_payload(catalog_path)
@@ -146,12 +149,12 @@ def _snapshot_confirmed_project(source_project: Path, cache_root: Path) -> Path:
         raise ValueError("Отметьте и сохраните хотя бы одну проверенную маску.")
     from .dataset import _validate_annotation, _verify_validation_snapshot
     _verify_validation_snapshot(source_project, report)
-    source_photos = [Path(value).expanduser().resolve(strict=True) for value in snapshot["photos"]]
+    source_photos = [resolve_existing_path(value) for value in snapshot["photos"]]
     photos_by_key = {os.path.normcase(str(photo)): photo for photo in source_photos}
     referenced_photos = {}
     for row in rows:
         _validate_annotation(row)
-        photo = Path(row["photo"]).expanduser().resolve(strict=True)
+        photo = resolve_existing_path(row["photo"])
         key = os.path.normcase(str(photo))
         if key not in photos_by_key:
             raise ValueError(f"Фото для маски {row.get('annotation_id', '')} не входит в проверенный проект.")
@@ -159,23 +162,18 @@ def _snapshot_confirmed_project(source_project: Path, cache_root: Path) -> Path:
     source_photos = sorted(referenced_photos.values(), key=lambda item: item.name.casefold())
     if not source_photos:
         raise ValueError("В подтверждённой скважине нет фотографий для кэширования.")
-    cache_root.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     suffix = hashlib.sha256(str(source_project).encode("utf-8")).hexdigest()[:8]
-    # Resolve the existing cache root before constructing report paths. On
-    # Windows, TEMP can contain an 8.3 alias (e.g. RUNNER~1); the verifier
-    # compares canonical resolved photo paths, so snapshots must store the
-    # same canonical form even before the final directory is renamed into place.
-    final_dir = cache_root.resolve() / f"{source_project.name}_{stamp}_{suffix}"
-    if final_dir.exists():
-        raise FileExistsError(f"Папка кэша уже существует: {final_dir}")
-
-    with tempfile.TemporaryDirectory(prefix=".pending_", dir=cache_root) as temporary:
-        staging = Path(temporary)
+    snapshot_name = f"{source_project.name}_{stamp}_{suffix}"
+    with _confirmed_snapshot_directory(source_project, snapshot, cache_root, snapshot_name) as final_dir:
+        # Build directly in a uniquely named destination. Some Windows
+        # sandboxed AppData locations deny creating .pending_* subdirectories
+        # or renaming them, even though ordinary file writes are allowed.
+        staging = final_dir
         photos_dir = staging / "photos"
-        photos_dir.mkdir()
         photo_map: dict[str, str] = {}
         photo_hashes = {}
+        photo_names = {}
         photo_file_stats = {}
         for source in source_photos:
             expected = snapshot.get("files", {}).get(str(source))
@@ -193,6 +191,7 @@ def _snapshot_confirmed_project(source_project: Path, cache_root: Path) -> Path:
             final_target = final_dir / "photos" / target_name
             photo_map[str(source)] = str(final_target)
             photo_hashes[str(final_target)] = digest
+            photo_names[str(final_target)] = source.name
             photo_file_stats[str(final_target)] = [staged_target.stat().st_size, staged_target.stat().st_mtime_ns]
 
         annotations_path = source_project / "annotations.csv"
@@ -219,7 +218,7 @@ def _snapshot_confirmed_project(source_project: Path, cache_root: Path) -> Path:
             raise ValueError("Отметьте и сохраните хотя бы одну проверенную маску.")
         for row in rows:
             _validate_annotation(row)
-            original = str(Path(row["photo"]).expanduser().resolve(strict=True))
+            original = str(resolve_existing_path(row["photo"]))
             if original not in photo_map:
                 raise ValueError(f"Маска ссылается на фото вне проверенного снимка: {Path(original).name}")
             row["photo"] = photo_map[original]
@@ -254,14 +253,60 @@ def _snapshot_confirmed_project(source_project: Path, cache_root: Path) -> Path:
             "schema": "confirmed-well-cache-v2", "confirmation_scope": "approved_annotations",
             "source_project": str(source_project),
             "created_at": datetime.now().isoformat(timespec="seconds"),
-            "photos": photo_hashes, "annotation_count": len(rows),
+            "photos": photo_hashes, "photo_names": photo_names,
+            "annotation_count": len(rows),
             "photo_count": len(source_photos), "approved_annotation_count": len(rows),
             "partial_confirmation": len(rows) < len(all_rows),
             "source_signature": _source_signature(report, source_annotation_digest),
         }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         _verify_validation_snapshot(source_project, report)
-        staging.rename(final_dir)
     return final_dir
+
+
+@contextmanager
+def _confirmed_snapshot_directory(
+    source_project: Path,
+    snapshot: dict,
+    preferred_root: Path,
+    snapshot_name: str,
+):
+    photo_directory = Path(snapshot.get("photos_dir") or source_project.parent).expanduser()
+    roots = (
+        preferred_root,
+        source_project / "confirmed_wells",
+        photo_directory.parent / "ExcelPhotoModelStudio_cache" / "confirmed_wells",
+        Path.home() / "Documents" / "ExcelPhotoModelStudio" / "confirmed_wells",
+        Path(tempfile.gettempdir()) / "ExcelPhotoModelStudio" / "confirmed_wells",
+    )
+    seen = set()
+    errors = []
+    destination = None
+    for root in roots:
+        key = os.path.normcase(str(root.absolute()))
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            candidate = root / snapshot_name
+            candidate.mkdir()
+            try:
+                (candidate / "photos").mkdir()
+            except PermissionError:
+                try:
+                    candidate.rmdir()
+                except OSError:
+                    pass
+                raise
+            destination = resolve_existing_path(candidate)
+            break
+        except PermissionError as exc:
+            errors.append(exc)
+    if destination is None:
+        if errors:
+            raise errors[-1]
+        raise PermissionError("Не удалось создать папку накопительного кэша скважины.")
+    yield destination
 
 
 def _source_signature(report: dict, annotations_digest: str) -> str:
@@ -282,6 +327,7 @@ def _source_signature(report: dict, annotations_digest: str) -> str:
 def load_confirmed_project_catalog(path: Path | None = None) -> list[Path]:
     """Return local snapshots containing at least one individually confirmed mask."""
     catalog_path = Path(path or default_catalog_path()).expanduser().absolute()
+    _recover_unlisted_approved_projects(catalog_path)
     for project in load_project_catalog(catalog_path):
         if (project / "cache_manifest.json").is_file() or _confirmation_error(project):
             continue
@@ -298,8 +344,33 @@ def load_confirmed_project_catalog(path: Path | None = None) -> list[Path]:
     ]
 
 
+def _recover_unlisted_approved_projects(catalog_path: Path) -> None:
+    """Retry previously saved approvals whose first cache write was interrupted."""
+    projects_root = catalog_path.parent / "projects"
+    if not projects_root.is_dir():
+        return
+    payload = _read_catalog_payload(catalog_path)
+    known_sources = {
+        os.path.normcase(str(Path(item.get("source_project", "")).expanduser().absolute()))
+        for item in payload.get("projects", []) if isinstance(item, dict) and item.get("source_project")
+    }
+    for project in sorted(projects_root.iterdir(), key=lambda item: item.name.casefold()):
+        if not project.is_dir() or not (project / "project.json").is_file():
+            continue
+        key = os.path.normcase(str(project.expanduser().absolute()))
+        if key in known_sources or _confirmation_error(project):
+            continue
+        try:
+            confirm_project_for_training(project, catalog_path)
+            known_sources.add(key)
+        except (OSError, ValueError):
+            # Keep the app usable if a stale project can't be recovered now;
+            # the next catalog refresh will retry it.
+            continue
+
+
 def register_project(project_dir: Path, path: Path | None = None) -> Path:
-    project_dir = Path(project_dir).expanduser().resolve(strict=True)
+    project_dir = resolve_existing_path(project_dir)
     path = Path(path or default_catalog_path()).expanduser().absolute()
     existing = load_project_catalog(path)
     key = os.path.normcase(str(project_dir))
@@ -357,7 +428,7 @@ def _write_catalog(path: Path, projects: list[dict]) -> None:
     }
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    replace_or_write(temporary, path)
 
 
 def catalog_summary(path: Path | None = None) -> dict[str, int]:
@@ -367,6 +438,18 @@ def catalog_summary(path: Path | None = None) -> dict[str, int]:
 def catalog_well_details(path: Path | None = None) -> list[dict[str, object]]:
     """Describe each well represented by individually confirmed masks in the cache."""
     return catalog_overview(path)["wells"]
+
+
+def _cached_photo_name(row: dict[str, str], manifest: dict) -> str:
+    photo_path = str(row.get("photo", ""))
+    source_names = manifest.get("photo_names", {})
+    if isinstance(source_names, dict) and source_names.get(photo_path):
+        return str(source_names[photo_path])
+    name = Path(photo_path).name
+    digests = manifest.get("photos", {})
+    digest = digests.get(photo_path, "") if isinstance(digests, dict) else ""
+    prefix = f"{str(digest)[:12]}_" if digest else ""
+    return name[len(prefix):] if prefix and name.startswith(prefix) else name
 
 
 def catalog_overview(path: Path | None = None) -> dict[str, object]:
@@ -395,12 +478,27 @@ def catalog_overview(path: Path | None = None) -> dict[str, object]:
             str(row.get("facies_index", "")).strip().casefold()
             for row in rows if str(row.get("facies_index", "")).strip()
         }
+        mask_details = [
+            {
+                "annotation_id": str(row.get("annotation_id", "")),
+                "well": str(row.get("well", "")).strip(),
+                "photo": _cached_photo_name(row, manifest),
+                "depth_top": str(row.get("depth_top", "")).strip(),
+                "depth_base": str(row.get("depth_base", "")).strip(),
+                "facies_index": str(row.get("facies_index", "")).strip(),
+                "facies_name": str(row.get("facies_name", "")).strip(),
+                "label": str(row.get("label", "")).strip(),
+                "target_text": " ".join(str(row.get("target_text", "")).split()),
+            }
+            for row in rows if row.get("approved") == "1"
+        ]
         details.append({
             "project": project,
             "well_names": well_names or [project.name],
             "photos": int(manifest.get("photo_count", report.get("photos", len(manifest.get("photos", {}))))),
             "masks": int(manifest.get("annotation_count", report.get("annotations", len(rows)))),
             "facies": len(facies_indices),
+            "mask_details": mask_details,
             "confirmed_at": str(manifest.get("created_at", "")),
         })
     return {

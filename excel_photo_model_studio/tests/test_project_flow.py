@@ -16,12 +16,24 @@ from excel_photo_model_studio.dataset import build_dataset
 from excel_photo_model_studio.matching import read_photo_map, write_photo_map
 from excel_photo_model_studio.models import DescriptionRow, Match, PhotoRecord
 from excel_photo_model_studio.project import (
-    _write_facies_inventory, create_project, load_annotations,
+    _write_facies_inventory, _write_table_cache, create_project, load_annotations,
     refresh_project, set_annotation_approvals, write_verified_columns,
 )
 
 
 class ProjectFlowTests(unittest.TestCase):
+    def test_table_cache_falls_back_when_windows_denies_atomic_rename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "project"
+            project.mkdir()
+
+            with patch.object(Path, "replace", side_effect=PermissionError("rename denied")):
+                _write_table_cache(project, [], [], [], [])
+
+            cached = json.loads((project / "table_cache.json").read_text(encoding="utf-8"))
+            self.assertEqual("excel-photo-table-cache-v3", cached["schema"])
+            self.assertFalse((project / "table_cache.json.tmp").exists())
+
     def test_refresh_reuses_guided_core_boxes_instead_of_running_detector_again(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -10,6 +10,8 @@ from typing import Callable
 import cv2
 import numpy as np
 
+from .paths import resolve_existing_path
+
 
 SPECIAL_TOKENS = ("<pad>", "<bos>", "<eos>", "<unk>")
 MODEL_SCHEMA = "excel-photo-description-v5"
@@ -30,7 +32,7 @@ def train_description_model(
     progress: Callable[[str], None] = print,
 ) -> dict:
     """Train a small interval-image + facies-conditioned character decoder."""
-    dataset_dir = Path(dataset_dir).expanduser().resolve(strict=True)
+    dataset_dir = resolve_existing_path(dataset_dir)
     output_dir = Path(output_dir).expanduser().absolute()
     caption_path = dataset_dir / "caption_dataset.jsonl"
     if not caption_path.is_file():

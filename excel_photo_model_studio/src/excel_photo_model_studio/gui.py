@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
-from PySide6.QtCore import QPointF, Qt, QProcess, QThread, Signal
+from PySide6.QtCore import QPointF, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QImageReader, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout,
@@ -20,7 +20,14 @@ from PySide6.QtWidgets import (
 
 from .catalog import (
     catalog_overview, confirm_project_for_training, default_catalog_path,
+    load_confirmed_project_catalog,
 )
+from .archive_queue import (
+    discover_archive, load_archive_queue, merge_archive_queue, prepare_archive_queue,
+    project_matches_pair, save_archive_queue,
+)
+from .dataset import build_dataset
+from .storage import app_data_dir
 from .depth import format_depth
 from .matching import match_photos, read_photo_map, suggest_missing_intervals, write_photo_map
 from .models import (
@@ -28,7 +35,11 @@ from .models import (
     PhotoRecord, normalize_column_order,
 )
 from .photos import confirm_manual_photo_interval, discover_photos, enrich_core_column_depths
-from .project import load_annotations, set_annotation_approvals, write_verified_columns
+from .project import (
+    create_project, load_annotations, refresh_project, set_annotation_approvals,
+    write_verified_columns,
+)
+from .inference import analyze_photos_to_excel
 from .tabular import as_float, read_many_tables, read_workbook_sheets
 from .vision import detect_column_order, detect_core_columns_from_path, project_matches, read_image
 
@@ -1373,6 +1384,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Excel Photo Model Studio")
         self.resize(1180, 760)
         self.current_project: Path | None = None
+        self._last_review_saved_to_cache = False
         self._pending_verified_photo_records: list[PhotoRecord] | None = None
         self._pending_verified_columns: dict[Path, list[tuple[int, int, int, int]]] | None = None
         self._pending_verified_orders: dict[Path, str] | None = None
@@ -1391,12 +1403,18 @@ class MainWindow(QMainWindow):
         self._build_train_tab()
         self._build_export_tab()
         self._build_analyze_tab()
-        self.project_process: QProcess | None = None
-        self.dataset_process: QProcess | None = None
-        self.export_dataset_process: QProcess | None = None
-        self.process: QProcess | None = None
-        self.analysis_process: QProcess | None = None
+        self.archive_queue = load_archive_queue()
+        self._build_archive_tab()
+        self.project_worker: _DiagnosticWorker | None = None
+        self.archive_scan_worker: _DiagnosticWorker | None = None
+        self.archive_prepare_worker: _DiagnosticWorker | None = None
+        self.dataset_worker: _DiagnosticWorker | None = None
+        self.export_dataset_worker: _DiagnosticWorker | None = None
+        self.training_worker: _DiagnosticWorker | None = None
+        self.analysis_worker: _DiagnosticWorker | None = None
         self._pending_project_action = ""
+        self._auto_train_after_dataset = False
+        self._auto_dataset_ready = False
         self._ensure_training_output_paths()
         self._update_catalog_status()
 
@@ -1419,9 +1437,12 @@ class MainWindow(QMainWindow):
         self.verify_button.clicked.connect(self._open_step_verification)
         self.recalculate_button = QPushButton("Пересчитать после исправлений")
         self.recalculate_button.clicked.connect(self._save_photo_map)
+        archive_button = QPushButton("Много Excel и фото → массовый архив")
+        archive_button.clicked.connect(lambda: self.tabs.setCurrentIndex(5))
         row.addWidget(self.create_button)
         row.addWidget(self.verify_button)
         row.addWidget(self.recalculate_button)
+        row.addWidget(archive_button)
         row.addStretch(1)
         layout.addLayout(row)
         self.project_progress = QProgressBar()
@@ -1458,6 +1479,335 @@ class MainWindow(QMainWindow):
         layout.addLayout(content, 1)
         self.tabs.addTab(page, "1. Сопоставление")
 
+    def _build_archive_tab(self) -> None:
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        introduction = QLabel(
+            "Массовый архив: выберите папки Excel и фото. Программа предложит пары и может "
+            "автоматически распознать все однозначные скважины в фоне. Затем проверьте интервалы "
+            "и маски, сохраните верные — только они попадут в обучение обеих моделей."
+        )
+        introduction.setWordWrap(True)
+        layout.addWidget(introduction)
+        form = QFormLayout()
+        self.archive_excel_root = PathField(directory=True)
+        self.archive_photo_root = PathField(directory=True)
+        self.archive_excel_root.set_value(self.archive_queue.get("excel_root", ""))
+        self.archive_photo_root.set_value(self.archive_queue.get("photo_root", ""))
+        form.addRow("Папка со всеми Excel:", self.archive_excel_root)
+        form.addRow("Папка со всеми фото:", self.archive_photo_root)
+        layout.addLayout(form)
+        actions = QHBoxLayout()
+        self.archive_scan_button = QPushButton("Найти скважины")
+        self.archive_scan_button.clicked.connect(self._scan_archive)
+        self.archive_prepare_button = QPushButton("Распознать все новые")
+        self.archive_prepare_button.clicked.connect(self._prepare_archive)
+        choose = QPushButton("Указать фото для строки…")
+        choose.clicked.connect(self._archive_choose_photos)
+        open_pair = QPushButton("Открыть выбранную для проверки")
+        open_pair.clicked.connect(self._archive_open_selected)
+        next_pair = QPushButton("Следующая непроверенная")
+        next_pair.clicked.connect(self._archive_open_next)
+        for button in (self.archive_scan_button, self.archive_prepare_button, choose, open_pair, next_pair):
+            actions.addWidget(button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        self.archive_auto_prepare = QCheckBox("После поиска автоматически распознать все однозначные пары")
+        self.archive_auto_prepare.setChecked(True)
+        layout.addWidget(self.archive_auto_prepare)
+        self.archive_table = QTableWidget(0, 5)
+        self.archive_table.setHorizontalHeaderLabels((
+            "Excel", "Папка фото", "Фото", "Этап", "Примечание",
+        ))
+        for column in (0, 1, 4):
+            self.archive_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
+        self.archive_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        layout.addWidget(self.archive_table, 1)
+        self.archive_status = QLabel()
+        self.archive_status.setWordWrap(True)
+        layout.addWidget(self.archive_status)
+        lower = QHBoxLayout()
+        build = QPushButton("Собрать датасет из подтверждённых")
+        build.clicked.connect(self._archive_build_dataset)
+        train = QPushButton("Настроить и запустить обучение →")
+        train.clicked.connect(lambda: self.tabs.setCurrentIndex(2))
+        build_train = QPushButton("Собрать датасет и обучить YOLO + VLM")
+        build_train.clicked.connect(self._archive_build_and_train)
+        lower.addWidget(build)
+        lower.addWidget(build_train)
+        lower.addWidget(train)
+        lower.addStretch(1)
+        layout.addLayout(lower)
+        self.archive_log = QTextEdit()
+        self.archive_log.setReadOnly(True)
+        self.archive_log.setMaximumHeight(170)
+        layout.addWidget(self.archive_log)
+        self.tabs.addTab(page, "6. Массовый архив")
+        self._refresh_archive_table()
+
+    def _archive_confirmed_sources(self) -> set[str]:
+        sources = set()
+        for snapshot in load_confirmed_project_catalog():
+            try:
+                manifest = json.loads((snapshot / "cache_manifest.json").read_text(encoding="utf-8"))
+                source = str(manifest.get("source_project", ""))
+                if source:
+                    sources.add(os.path.normcase(str(Path(source).expanduser().absolute())))
+            except (OSError, ValueError):
+                continue
+        return sources
+
+    def _archive_stage(self, entry: dict, confirmed_sources: set[str]) -> str:
+        if not entry.get("photos"):
+            return "Нужна папка фото"
+        project = str(entry.get("project", ""))
+        if project and os.path.normcase(str(Path(project).expanduser().absolute())) in confirmed_sources:
+            return "Подтверждено ✓"
+        if project and (Path(project) / "project.json").is_file():
+            return "Проверить маски"
+        if entry.get("error"):
+            return "Ошибка распознавания"
+        return "Новая"
+
+    def _refresh_archive_table(self) -> None:
+        if not hasattr(self, "archive_table"):
+            return
+        selected = self.archive_table.currentRow()
+        confirmed = self._archive_confirmed_sources()
+        entries = self.archive_queue.get("entries", [])
+        self.archive_table.setRowCount(len(entries))
+        counts = {"Подтверждено ✓": 0, "Проверить маски": 0, "Нужна папка фото": 0}
+        for row, entry in enumerate(entries):
+            stage = self._archive_stage(entry, confirmed)
+            counts[stage] = counts.get(stage, 0) + 1
+            notes = [str(entry.get(key, "")) for key in ("reason", "excel_probe_error", "error")]
+            if int(entry.get("blocking_errors", 0) or 0):
+                notes.append(f"Ошибок проверки: {entry['blocking_errors']}")
+            if int(entry.get("mask_count", 0) or 0):
+                notes.append(f"Масок: {entry['mask_count']}")
+            if int(entry.get("excel_rows", 0) or 0):
+                notes.append(f"Строк Excel: {entry['excel_rows']}")
+            values = (
+                str(entry.get("excel", "")), str(entry.get("photos", "")),
+                str(entry.get("photo_count", 0)), stage, "; ".join(value for value in notes if value),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.archive_table.setItem(row, column, item)
+        if 0 <= selected < len(entries):
+            self.archive_table.selectRow(selected)
+        self.archive_status.setText(
+            f"Excel: {self.archive_queue.get('workbooks_found', len(entries))}; "
+            f"фото: {self.archive_queue.get('photos_found', 0)}; "
+            f"подтверждено: {counts['Подтверждено ✓']}; "
+            f"проверить маски: {counts['Проверить маски']}; "
+            f"ошибки распознавания: {counts.get('Ошибка распознавания', 0)}; "
+            f"без пары: {counts['Нужна папка фото']}. "
+            "Промежуточная очередь сохраняется между запусками."
+        )
+
+    def _scan_archive(self) -> None:
+        if self.archive_scan_worker and self.archive_scan_worker.isRunning():
+            return self._error("Сканирование архива уже идёт.")
+        if self.archive_prepare_worker and self.archive_prepare_worker.isRunning():
+            return self._error("Дождитесь окончания пакетного распознавания.")
+        excel_root = self.archive_excel_root.value()
+        photo_root = self.archive_photo_root.value()
+        if not self.archive_excel_root.edit.text().strip() or not excel_root.is_dir():
+            return self._error("Выберите папку с Excel/CSV-файлами.")
+        if not self.archive_photo_root.edit.text().strip() or not photo_root.is_dir():
+            return self._error("Выберите папку с фотографиями.")
+        self.archive_scan_button.setEnabled(False)
+        self.archive_log.setPlainText("Сканирую папки без OCR; исходные файлы не изменяются…")
+        worker = _DiagnosticWorker(lambda progress: discover_archive(excel_root, photo_root), self)
+        self.archive_scan_worker = worker
+        worker.completed.connect(self._archive_scan_completed)
+        worker.failed.connect(self._archive_scan_failed)
+        worker.finished.connect(lambda worker=worker: self._archive_scan_finished(worker))
+        worker.start()
+
+    def _archive_scan_completed(self, discovered: dict) -> None:
+        self.archive_queue = merge_archive_queue(discovered, self.archive_queue)
+        try:
+            save_archive_queue(self.archive_queue)
+        except OSError as exc:
+            self.archive_log.append(f"Очередь найдена, но пока не сохранена на диск: {exc}")
+        self._refresh_archive_table()
+        self.archive_log.append(
+            f"Найдено Excel: {discovered['workbooks_found']}; фото: {discovered['photos_found']}. "
+            "Строки без однозначной пары требуют выбора папки вручную."
+        )
+        if self.archive_auto_prepare.isChecked() and any(
+            item.get("photos") and not item.get("project")
+            for item in self.archive_queue.get("entries", [])
+        ):
+            self._prepare_archive()
+
+    def _archive_scan_failed(self, message: str) -> None:
+        self.archive_log.append("Ошибка сканирования: " + message)
+        self._error("Архив не просканирован. Подробности в журнале вкладки 6.")
+
+    def _archive_scan_finished(self, worker: _DiagnosticWorker) -> None:
+        if self.archive_scan_worker is worker:
+            self.archive_scan_worker = None
+            worker.deleteLater()
+        self.archive_scan_button.setEnabled(not (
+            self.archive_prepare_worker and self.archive_prepare_worker.isRunning()
+        ))
+
+    def _prepare_archive(self) -> None:
+        if self.archive_prepare_worker and self.archive_prepare_worker.isRunning():
+            return self._error("Пакетное распознавание уже выполняется.")
+        if self.project_worker and self.project_worker.isRunning():
+            return self._error("Дождитесь окончания сопоставления текущей скважины.")
+        if not any(item.get("photos") for item in self.archive_queue.get("entries", [])):
+            return self._error("В очереди нет однозначных пар. Сначала найдите скважины или укажите папки фото вручную.")
+        queue = self.archive_queue
+        use_ocr = self.ocr.isChecked()
+        self.archive_prepare_button.setEnabled(False)
+        self.archive_scan_button.setEnabled(False)
+        self.archive_log.append("Начинаю пакетное распознавание. Обучающие маски пока не подтверждаются.")
+        worker = _DiagnosticWorker(
+            lambda progress: prepare_archive_queue(queue, use_ocr=use_ocr, progress=progress), self,
+        )
+        self.archive_prepare_worker = worker
+        worker.progress.connect(self.archive_log.append)
+        worker.completed.connect(self._archive_prepare_completed)
+        worker.failed.connect(self._archive_prepare_failed)
+        worker.finished.connect(lambda worker=worker: self._archive_prepare_finished(worker))
+        worker.start()
+
+    def _archive_prepare_completed(self, result: dict) -> None:
+        self.archive_queue = result
+        self._refresh_archive_table()
+        self.archive_log.append(
+            "Пакетное распознавание завершено. Откройте строку с масками, "
+            "исправьте ошибки и сохраните подтверждённые интервалы."
+        )
+
+    def _archive_prepare_failed(self, message: str) -> None:
+        self.archive_log.append("Пакет прерван: " + message)
+        self.archive_queue = load_archive_queue()
+        self._refresh_archive_table()
+
+    def _archive_prepare_finished(self, worker: _DiagnosticWorker) -> None:
+        if self.archive_prepare_worker is worker:
+            self.archive_prepare_worker = None
+            worker.deleteLater()
+        self.archive_scan_button.setEnabled(True)
+        self.archive_prepare_button.setEnabled(True)
+
+    def _archive_selected_entry(self) -> dict | None:
+        row = self.archive_table.currentRow()
+        entries = self.archive_queue.get("entries", [])
+        return entries[row] if 0 <= row < len(entries) else None
+
+    def _archive_choose_photos(self) -> None:
+        if self.archive_prepare_worker and self.archive_prepare_worker.isRunning():
+            return self._error("Дождитесь окончания пакетного распознавания перед изменением пары.")
+        entry = self._archive_selected_entry()
+        if entry is None:
+            return self._error("Выберите строку Excel в очереди.")
+        initial = entry.get("photos") or self.archive_queue.get("photo_root") or ""
+        folder = QFileDialog.getExistingDirectory(self, "Папка фото для этого Excel", str(initial))
+        if not folder:
+            return
+        from .autodiscovery import IMAGE_EXTENSIONS
+        count = sum(1 for path in Path(folder).rglob("*")
+                    if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS)
+        if not count:
+            return self._error("В выбранной папке нет поддерживаемых фотографий.")
+        existing_project = str(entry.get("project", ""))
+        keep_project = bool(existing_project and project_matches_pair(
+            Path(existing_project), Path(str(entry["excel"])), Path(folder),
+        ))
+        entry.update(photos=str(Path(folder).absolute()), photo_count=count,
+                     manual_pair=True, reason="Выбрано вручную — проверьте скважину на фото")
+        if not keep_project:
+            entry["project"] = ""
+            entry["error"] = ""
+        try:
+            save_archive_queue(self.archive_queue)
+        except OSError as exc:
+            self.archive_log.append(f"Папка выбрана, но очередь не сохранилась на диск: {exc}")
+        self._refresh_archive_table()
+
+    def _archive_open_selected(self) -> None:
+        if self.archive_prepare_worker and self.archive_prepare_worker.isRunning():
+            return self._error("Дождитесь окончания пакетного распознавания.")
+        if self.project_worker and self.project_worker.isRunning():
+            return self._error("Дождитесь окончания текущего сопоставления.")
+        entry = self._archive_selected_entry()
+        if entry is None:
+            return self._error("Выберите строку архива.")
+        excel = Path(str(entry.get("excel", "")))
+        photos = Path(str(entry.get("photos", "")))
+        if not excel.is_file() or not str(entry.get("photos", "")) or not photos.is_dir():
+            return self._error("Пара неполная или исходные файлы перенесены. Выберите папку фото либо пересканируйте архив.")
+        self.excel.set_value(excel)
+        self.photos.set_value(photos)
+        self.tabs.setCurrentIndex(0)
+        project = Path(str(entry.get("project", ""))) if entry.get("project") else None
+        if project is not None and project_matches_pair(project, excel, photos):
+            self._start_project_process(
+                lambda progress: (progress("Обновляю сохранённый проект и его маски…"), refresh_project(project))[1],
+                project, "refresh",
+            )
+        else:
+            self._create_project()
+
+    def _archive_open_next(self) -> None:
+        confirmed = self._archive_confirmed_sources()
+        for row, entry in enumerate(self.archive_queue.get("entries", [])):
+            if entry.get("photos") and self._archive_stage(entry, confirmed) not in {
+                "Подтверждено ✓", "Ошибка распознавания",
+            }:
+                self.archive_table.selectRow(row)
+                self._archive_open_selected()
+                return
+        self.archive_log.append(
+            "Следующей готовой пары нет. Если остались строки без папки фото — укажите её вручную; "
+            "если все скважины подтверждены, можно собирать датасет."
+        )
+
+    def _archive_mark_project(self, project_dir: Path) -> None:
+        for entry in self.archive_queue.get("entries", []):
+            if (os.path.normcase(str(Path(entry.get("excel", "")).absolute()))
+                    == os.path.normcase(str(self.excel.value().absolute()))
+                    and entry.get("photos")
+                    and os.path.normcase(str(Path(entry["photos"]).absolute()))
+                    == os.path.normcase(str(self.photos.value().absolute()))):
+                entry["project"] = str(project_dir)
+                save_archive_queue(self.archive_queue)
+                self._refresh_archive_table()
+                break
+
+    def _archive_build_dataset(self) -> bool:
+        if self.dataset_worker and self.dataset_worker.isRunning():
+            self._error("Дождитесь окончания текущей сборки датасета.")
+            return False
+        if self.training_worker and self.training_worker.isRunning():
+            self._error("Дождитесь окончания текущего обучения.")
+            return False
+        self.tabs.setCurrentIndex(2)
+        if self.dataset_output.value().exists():
+            run = (
+                app_data_dir() / "training_runs"
+                / f"run_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:6]}"
+            )
+            self.dataset_output.set_value(run / "dataset")
+            self.model_output.set_value(run / "model")
+            self.train_log.append(f"Предыдущая сборка сохранена. Новая папка: {run}")
+        return self._build_dataset()
+
+    def _archive_build_and_train(self) -> None:
+        """Build from approved masks, then train both models if data is ready."""
+        self._auto_train_after_dataset = True
+        self._auto_dataset_ready = False
+        if not self._archive_build_dataset():
+            self._auto_train_after_dataset = False
+
     def _build_review_tab(self) -> None:
         page = QWidget(self)
         layout = QHBoxLayout(page)
@@ -1471,10 +1821,13 @@ class MainWindow(QMainWindow):
         unapprove_all.clicked.connect(lambda: self._set_all_review_approvals(False))
         save = QPushButton("Сохранить подтверждения")
         save.clicked.connect(self._save_review)
+        save_next = QPushButton("Сохранить и следующая из архива →")
+        save_next.clicked.connect(self._save_review_and_next)
         controls.addWidget(load)
         controls.addWidget(approve_all)
         controls.addWidget(unapprove_all)
         controls.addWidget(save)
+        controls.addWidget(save_next)
         controls.addStretch(1)
         left.addLayout(controls)
         self.review_table = QTableWidget(0, 9)
@@ -1511,6 +1864,23 @@ class MainWindow(QMainWindow):
         self.pretrained_weights.addItem("YOLO11 small — баланс скорости и качества", "yolo11s-seg.pt")
         self.pretrained_weights.addItem("YOLO11 medium — требовательнее к GPU", "yolo11m-seg.pt")
         self.pretrained_weights.setCurrentIndex(1)
+        self.local_weights = PathField(
+            file_filter="Checkpoint PyTorch (*.pt);;Все файлы (*)",
+        )
+        self.local_weights.setToolTip(
+            "Если компьютер без интернета, укажите локальный yolo11*-seg.pt. "
+            "Этот файл будет использован вместо автоматической загрузки."
+        )
+        from .vlm_description import default_vlm_paths
+        default_vlm_base, default_vlm_adapter = default_vlm_paths()
+        self.vlm_base_model = PathField(directory=True)
+        self.vlm_initial_adapter = PathField(
+            file_filter="LoRA адаптер Qwen3-VL (adapter_model.safetensors);;Все файлы (*)",
+        )
+        if default_vlm_base:
+            self.vlm_base_model.set_value(default_vlm_base)
+        if default_vlm_adapter:
+            self.vlm_initial_adapter.set_value(default_vlm_adapter / "adapter_model.safetensors")
         self.epochs = QSpinBox()
         self.epochs.setRange(1, 10000)
         self.epochs.setValue(300)
@@ -1527,6 +1897,9 @@ class MainWindow(QMainWindow):
         form.addRow("Новая папка CVAT/YOLO-датасета:", self.dataset_output)
         form.addRow("Новая папка результата обучения:", self.model_output)
         form.addRow("Предобученные веса:", self.pretrained_weights)
+        form.addRow("Локальный .pt (если нет интернета):", self.local_weights)
+        form.addRow("Локальная базовая Qwen3-VL:", self.vlm_base_model)
+        form.addRow("Начальный LoRA (adapter_model.safetensors):", self.vlm_initial_adapter)
         form.addRow("Эпохи (верхний предел):", self.epochs)
         form.addRow("Early stopping patience:", self.patience)
         form.addRow("Размер изображения:", self.image_size)
@@ -1542,25 +1915,34 @@ class MainWindow(QMainWindow):
         queue_title.setWordWrap(True)
         layout.addWidget(queue_title)
         training_requirements = QLabel(
-            "Сегментационная YOLO11-модель обучается на GPU CUDA и сохраняется как best.pt. "
-            "Генератор краткого описания обучается отдельной моделью на тех же масках и привязанных строках Excel; "
-            "для него требуется минимум 20 обучающих и 3 проверочных интервала. Если примеров пока меньше, "
-            "segmentation best.pt всё равно будет создан, а причина пропуска генератора будет записана в журнале."
+            "Одна команда обучает обе модели на подтверждённом датасете: сначала YOLO11-seg для масок "
+            "и классов фаций, затем Qwen3-VL LoRA для кратких описаний тех же интервалов. "
+            "Они используют CUDA GPU последовательно, чтобы не держать обе модели в памяти одновременно. "
+            "Для запуска нужны локальные базовая Qwen3-VL и начальный adapter_model.safetensors, "
+            "зависимости из requirements-vlm.txt, минимум 20 train и 3 независимых val-примера "
+            "с описаниями. Если чего-то не хватает, совместный запуск останавливается до обучения YOLO. "
+            "При сбое VLM после YOLO частичная модель не публикуется; checkpoint YOLO остаётся в папке запусков. "
+            "При анализе VLM создаёт только черновой текст — границы и класс остаются от YOLO. "
+            "Текущий pilot LoRA содержит только 4 image/text примера и не прошёл качественную проверку даже на обучающем фото; "
+            "любое сгенерированное описание обязательно проверять."
         )
         training_requirements.setWordWrap(True)
         layout.addWidget(training_requirements)
         self.catalog_status = QLabel()
         self.catalog_status.setWordWrap(True)
         layout.addWidget(self.catalog_status)
+        self.catalog_save_status = QLabel("После сохранения подтверждений результат появится здесь.")
+        self.catalog_save_status.setWordWrap(True)
+        layout.addWidget(self.catalog_save_status)
         self.catalog_wells = QTextEdit()
         self.catalog_wells.setReadOnly(True)
-        self.catalog_wells.setMaximumHeight(170)
+        self.catalog_wells.setMaximumHeight(230)
         self.catalog_wells.setPlaceholderText("Здесь появится список подтверждённых скважин.")
         layout.addWidget(self.catalog_wells)
         buttons = QHBoxLayout()
         self.dataset_button = QPushButton("Собрать датасет для обучения")
         self.dataset_button.clicked.connect(self._build_dataset)
-        self.standard_train_button = QPushButton("Обучить YOLO11-seg + генератор описаний на CUDA GPU")
+        self.standard_train_button = QPushButton("Обучить YOLO11-seg + Qwen3-VL для описаний на CUDA GPU")
         self.standard_train_button.clicked.connect(self._start_training)
         buttons.addWidget(self.dataset_button)
         buttons.addWidget(self.standard_train_button)
@@ -1622,9 +2004,8 @@ class MainWindow(QMainWindow):
         self.export_dataset_log.setPlaceholderText("Здесь появится ход и результат отдельного экспорта.")
         layout.addWidget(self.export_dataset_log, 1)
 
-        local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
         default_export = (
-            local_app_data / "ExcelPhotoModelStudio" / "exports"
+            app_data_dir() / "exports"
             / f"YOLO_seg_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:6]}"
         )
         self.export_dataset_output.setText(str(default_export))
@@ -1637,6 +2018,11 @@ class MainWindow(QMainWindow):
         self.analysis_model = PathField(file_filter="Единая модель best.pt (*.pt)")
         self.analysis_photos = PathField(directory=True)
         self.analysis_output = PathField(save=True, file_filter="Excel (*.xlsx)")
+        self.analysis_vlm_base = PathField(directory=True)
+        self.analysis_vlm_base.setToolTip(
+            "Оставьте пустым, чтобы взять базовую Qwen3-VL из model_contract.json. "
+            "Укажите папку вручную, если перенесли модель на другой компьютер."
+        )
         self.analysis_confidence = QSpinBox()
         self.analysis_confidence.setRange(1, 99)
         self.analysis_confidence.setValue(25)
@@ -1644,6 +2030,7 @@ class MainWindow(QMainWindow):
         form.addRow("Созданный best.pt:", self.analysis_model)
         form.addRow("Папка нового керна:", self.analysis_photos)
         form.addRow("Итоговый Excel с 23 полями фации:", self.analysis_output)
+        form.addRow("Базовая Qwen3-VL для черновых описаний:", self.analysis_vlm_base)
         form.addRow("Минимальная уверенность:", self.analysis_confidence)
         layout.addLayout(form)
         analyze = QPushButton("Распознать фации, сформировать столбец 22 и создать Excel")
@@ -1667,13 +2054,13 @@ class MainWindow(QMainWindow):
             project_dir = self._automatic_project_dir(excel_path)
         except Exception as exc:
             return self._error(str(exc))
-        command = [
-            "create", "--excel", str(excel_path), "--photos", str(photos_path),
-            "--project", str(project_dir),
-        ]
-        if self.ocr.isChecked():
-            command.append("--ocr")
-        self._start_project_process(command, project_dir, "create")
+        use_ocr = self.ocr.isChecked()
+
+        def create(progress):
+            progress("Читаю таблицу и сканирую фотографии…")
+            return create_project(excel_path, photos_path, project_dir, use_ocr=use_ocr)
+
+        self._start_project_process(create, project_dir, "create")
 
     def _open_step_verification(self) -> None:
         excel_path = self.excel.value()
@@ -1792,10 +2179,13 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             return self._error(str(exc))
         self._show_matching_preview()
-        self._start_project_process(["refresh", "--project", str(project_dir)], project_dir, "refresh")
+        self._start_project_process(
+            lambda progress: (progress("Пересчитываю привязку интервалов и масок…"), refresh_project(project_dir))[1],
+            project_dir, "refresh",
+        )
 
-    def _start_project_process(self, command: list[str], project_dir: Path, action: str) -> None:
-        if self.project_process and self.project_process.state() != QProcess.ProcessState.NotRunning:
+    def _start_project_process(self, task, project_dir: Path, action: str) -> None:
+        if self.project_worker and self.project_worker.isRunning():
             return self._error("Сопоставление этой скважины уже выполняется.")
         self.current_project = project_dir
         self._pending_project_action = action
@@ -1804,40 +2194,21 @@ class MainWindow(QMainWindow):
         self.recalculate_button.setEnabled(False)
         self.project_progress.setVisible(True)
         self.project_log.setPlainText(
-            "Обработка выполняется в отдельном процессе. Окно остаётся доступным; "
+            "Обработка выполняется в фоновом потоке приложения. Окно остаётся доступным; "
             "скорость зависит от количества и размера фотографий."
         )
-        arguments = self._with_launcher(command)
-        self.project_process = QProcess(self)
-        self.project_process.setProgram(sys.executable)
-        self.project_process.setArguments(arguments)
-        self.project_process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        self.project_process.readyReadStandardOutput.connect(self._read_project_output)
-        self.project_process.finished.connect(self._project_finished)
-        self.project_process.start()
+        worker = _DiagnosticWorker(task, self)
+        self.project_worker = worker
+        worker.progress.connect(self.project_log.append)
+        worker.completed.connect(self._project_completed)
+        worker.failed.connect(self._project_failed)
+        worker.finished.connect(lambda worker=worker: self._project_worker_finished(worker))
+        worker.start()
 
-    def _read_project_output(self) -> None:
-        if self.project_process:
-            text = bytes(self.project_process.readAllStandardOutput()).decode(errors="replace").strip()
-            if text:
-                self.project_log.append(text)
-
-    def _project_finished(self, code: int, _status) -> None:
-        self._read_project_output()
-        self.create_button.setEnabled(True)
-        self.verify_button.setEnabled(True)
-        self.recalculate_button.setEnabled(True)
-        self.project_progress.setVisible(False)
-        if code != 0:
-            self._pending_verified_photo_records = None
-            self._pending_verified_columns = None
-            self._pending_verified_orders = None
-            return self._error("Обработка не завершена. Подробности показаны в журнале.")
-        try:
-            project_dir = self._project_dir()
-            report = json.loads((project_dir / "report.json").read_text(encoding="utf-8"))
-        except Exception as exc:
-            return self._error(str(exc))
+    def _project_completed(self, report: dict) -> None:
+        project_dir = self.current_project
+        if project_dir is None:
+            return self._project_failed("Не удалось определить текущую папку проекта.")
         if self._pending_project_action == "create" and self._pending_verified_photo_records is not None:
             try:
                 write_photo_map(project_dir / "photo_map.csv", self._pending_verified_photo_records)
@@ -1857,9 +2228,8 @@ class MainWindow(QMainWindow):
             self.matching_column_orders.clear()
             self.matching_column_counts.clear()
             self.matching_column_depths.clear()
-            self._start_project_process(
-                ["refresh", "--project", str(project_dir)], project_dir, "verified_refresh",
-            )
+            self._pending_project_action = "verified_refresh"
+            self._refresh_after_verified_create = True
             return
         if self._pending_project_action in {"create", "verified_refresh"}:
             self.matching_preview_paths.clear()
@@ -1873,7 +2243,35 @@ class MainWindow(QMainWindow):
         self._show_report(report)
         self._load_photo_map()
         self._load_review()
+        try:
+            self._archive_mark_project(project_dir)
+        except OSError as exc:
+            self.archive_log.append(f"Проект создан, но очередь не сохранилась: {exc}")
         self._update_catalog_status()
+
+    def _project_failed(self, message: str) -> None:
+        self._pending_verified_photo_records = None
+        self._pending_verified_columns = None
+        self._pending_verified_orders = None
+        self.project_log.append("Ошибка: " + message)
+        self._error("Обработка не завершена. Подробности показаны в журнале.")
+
+    def _project_worker_finished(self, worker: _DiagnosticWorker) -> None:
+        if self.project_worker is worker:
+            self.project_worker = None
+            worker.deleteLater()
+        self.create_button.setEnabled(True)
+        self.verify_button.setEnabled(True)
+        self.recalculate_button.setEnabled(True)
+        self.project_progress.setVisible(False)
+        if getattr(self, "_refresh_after_verified_create", False):
+            self._refresh_after_verified_create = False
+            project_dir = self.current_project
+            if project_dir is not None:
+                self._start_project_process(
+                    lambda progress: (progress("Применяю подтверждённые интервалы к проекту…"), refresh_project(project_dir))[1],
+                    project_dir, "verified_refresh",
+                )
 
     def _show_report(self, report: dict) -> None:
         self._set_photo_issues(report)
@@ -2013,6 +2411,7 @@ class MainWindow(QMainWindow):
         self._select_first_masked_photo()
 
     def _save_review(self) -> None:
+        self._last_review_saved_to_cache = False
         approvals = {}
         for row in range(self.review_table.rowCount()):
             approvals[self.review_table.item(row, 8).text()] = self.review_table.item(row, 0).checkState() == Qt.CheckState.Checked
@@ -2020,23 +2419,41 @@ class MainWindow(QMainWindow):
             project_dir = self._project_dir()
             report = set_annotation_approvals(project_dir, approvals)
         except Exception as exc:
+            if hasattr(self, "catalog_save_status"):
+                self.catalog_save_status.setText(f"Подтверждения не сохранены: {exc}")
             return self._error(str(exc))
         self.project_log.append(f"Сохранено подтверждений: {report['approved_annotations']}")
         try:
             confirm_project_for_training(project_dir)
+            self.catalog_save_status.setText(
+                f"Сохранено в накопительный датасет: {report['approved_annotations']} подтверждённых масок. "
+                "Список отдельных интервалов ниже обновлён."
+            )
             self.project_log.append(
                 f"Сохранено подтверждённых масок: {report['approved_annotations']}. "
                 "Они и нужные фото добавлены в локальный накопительный кэш; "
                 "неподтверждённые маски можно проверить позже. "
                 "Для обучения отдельно потребуется независимая выборка val."
             )
-        except (OSError, ValueError) as exc:
+            self._last_review_saved_to_cache = True
+            self._refresh_archive_table()
+        except Exception as exc:
+            self.catalog_save_status.setText(
+                f"Подтверждения сохранены в проекте ({report['approved_annotations']}), "
+                f"но в накопительный датасет не добавлены: {exc}"
+            )
             self.project_log.append(f"Скважина пока не добавлена в датасет: {exc}")
             self.project_log.append(
                 "Если проект уже был подтверждён, его устаревший снимок исключён из текущей сборки, "
                 "но сохранён на диске."
             )
         self._update_catalog_status()
+
+    def _save_review_and_next(self) -> None:
+        self._save_review()
+        if self._last_review_saved_to_cache:
+            self.tabs.setCurrentIndex(5)
+            self._archive_open_next()
 
     def _show_preview(self) -> None:
         row = self.review_table.currentRow()
@@ -2216,9 +2633,10 @@ class MainWindow(QMainWindow):
         if hasattr(self, "review_table"):
             self._show_preview()
 
-    def _build_dataset(self) -> None:
-        if self.dataset_process and self.dataset_process.state() != QProcess.ProcessState.NotRunning:
-            return self._error("Сборка датасета уже выполняется.")
+    def _build_dataset(self) -> bool:
+        if self.dataset_worker and self.dataset_worker.isRunning():
+            self._error("Сборка датасета уже выполняется.")
+            return False
         try:
             destination = self.dataset_output.value()
             if not self.dataset_output.edit.text().strip():
@@ -2226,18 +2644,26 @@ class MainWindow(QMainWindow):
             if catalog_overview()["summary"]["projects"] < 1:
                 raise ValueError("Сначала обработайте хотя бы одну скважину.")
         except Exception as exc:
-            return self._error(str(exc))
-        self.dataset_process = QProcess(self)
-        self.dataset_process.setProgram(sys.executable)
-        self.dataset_process.setArguments(self._with_launcher([
-            "dataset", "--catalog", str(default_catalog_path()), "--output", str(destination),
-        ]))
-        self.dataset_process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        self.dataset_process.readyReadStandardOutput.connect(self._read_dataset_output)
-        self.dataset_process.finished.connect(self._dataset_finished)
+            self._error(str(exc))
+            return False
+        catalog_path = default_catalog_path()
+
+        def build(progress):
+            progress("Читаю накопительный кэш подтверждённых масок…")
+            projects = load_confirmed_project_catalog(catalog_path)
+            progress(f"Собираю YOLO-датасет из {len(projects)} скважин…")
+            return build_dataset(projects, destination)
+
+        worker = _DiagnosticWorker(build, self)
+        self.dataset_worker = worker
+        worker.progress.connect(self.train_log.append)
+        worker.completed.connect(self._dataset_completed)
+        worker.failed.connect(self._dataset_failed)
+        worker.finished.connect(lambda worker=worker: self._dataset_worker_finished(worker))
         self.dataset_button.setEnabled(False)
-        self.train_log.setPlainText("Сборка датасета выполняется в отдельном процессе…")
-        self.dataset_process.start()
+        self.train_log.setPlainText("Сборка датасета выполняется в фоновом потоке приложения…")
+        worker.start()
+        return True
 
     def _choose_export_destination(self) -> None:
         current = Path(self.export_dataset_output.text().strip()).expanduser()
@@ -2256,9 +2682,9 @@ class MainWindow(QMainWindow):
         self.export_dataset_output.setText(str(destination))
 
     def _export_dataset(self) -> None:
-        if self.export_dataset_process and self.export_dataset_process.state() != QProcess.ProcessState.NotRunning:
+        if self.export_dataset_worker and self.export_dataset_worker.isRunning():
             return self._error("Выгрузка YOLO Segmentation уже выполняется.")
-        if self.dataset_process and self.dataset_process.state() != QProcess.ProcessState.NotRunning:
+        if self.dataset_worker and self.dataset_worker.isRunning():
             return self._error("Дождитесь завершения сборки датасета для обучения.")
         try:
             raw_destination = self.export_dataset_output.text().strip()
@@ -2277,133 +2703,253 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             return self._error(str(exc))
 
-        self.export_dataset_process = QProcess(self)
-        self.export_dataset_process.setProgram(sys.executable)
-        self.export_dataset_process.setArguments(self._with_launcher([
-            "dataset", "--catalog", str(default_catalog_path()), "--output", str(destination),
-        ]))
-        self.export_dataset_process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        self.export_dataset_process.readyReadStandardOutput.connect(self._read_export_dataset_output)
-        self.export_dataset_process.finished.connect(self._export_dataset_finished)
+        catalog_path = default_catalog_path()
+
+        def export(progress):
+            progress("Читаю подтверждённый накопительный датасет…")
+            projects = load_confirmed_project_catalog(catalog_path)
+            progress(f"Экспортирую маски из {len(projects)} скважин…")
+            return build_dataset(projects, destination)
+
+        worker = _DiagnosticWorker(export, self)
+        self.export_dataset_worker = worker
+        worker.progress.connect(self.export_dataset_log.append)
+        worker.completed.connect(self._export_dataset_completed)
+        worker.failed.connect(self._export_dataset_failed)
+        worker.finished.connect(lambda worker=worker: self._export_dataset_worker_finished(worker))
         self.export_dataset_button.setEnabled(False)
         self.export_dataset_status.setText("Идёт экспорт всех подтверждённых масок. Обучение не запускается.")
-        self.export_dataset_log.setPlainText(f"Папка выгрузки: {destination}\nЭкспорт запускается…")
-        self.export_dataset_process.start()
+        self.export_dataset_log.setPlainText(f"Папка выгрузки: {destination}\nЭкспорт выполняется в фоновом потоке…")
+        worker.start()
 
-    def _read_export_dataset_output(self) -> None:
-        if self.export_dataset_process:
-            text = bytes(self.export_dataset_process.readAllStandardOutput()).decode(errors="replace").strip()
-            if text:
-                self.export_dataset_log.append(text)
-
-    def _export_dataset_finished(self, code: int, _status) -> None:
-        self._read_export_dataset_output()
+    def _export_dataset_completed(self, manifest: dict) -> None:
         self.export_dataset_button.setEnabled(True)
-        self.export_dataset_log.append(f"\nЭкспорт завершён, код {code}.")
-        if code != 0:
-            self.export_dataset_status.setText(
-                "Выгрузка не завершилась. Подробная причина указана в журнале; "
-                "исходный накопительный кэш не изменён."
+        self.export_dataset_log.append("\nЭкспорт завершён.")
+        destination = Path(self.export_dataset_output.text().strip()).expanduser()
+        training_note = manifest.get("training_note", "") if not manifest.get("training_ready", False) else ""
+        self.export_dataset_status.setText(
+            "Датасет готов: "
+            f"{manifest.get('photo_count', 0)} фото, "
+            f"{manifest.get('annotation_count', 0)} масок, "
+            f"{manifest.get('facies_count', 0)} классов; train — "
+            f"{manifest.get('train_photo_count', 0)} фото, val — "
+            f"{manifest.get('val_photo_count', 0)} фото. "
+            f"{training_note}Конфигурация YOLO: {destination / 'data.yaml'}"
+        )
+        self.export_dataset_log.append(
+            f"\nЭкспортированы скважины: {manifest.get('project_count', 0)}; "
+            f"метаданные классов: {destination / 'class_metadata.json'}; "
+            f"краткие описания: {destination / 'caption_dataset.jsonl'}"
+        )
+
+    def _export_dataset_failed(self, message: str) -> None:
+        self.export_dataset_log.append("\nОшибка экспорта: " + message)
+        self.export_dataset_status.setText(
+            "Выгрузка не завершилась. Подробная причина указана в журнале; "
+            "исходный накопительный кэш не изменён."
+        )
+
+    def _export_dataset_worker_finished(self, worker: _DiagnosticWorker) -> None:
+        if self.export_dataset_worker is worker:
+            self.export_dataset_worker = None
+            worker.deleteLater()
+        self.export_dataset_button.setEnabled(True)
+
+    def _dataset_completed(self, manifest: dict) -> None:
+        stats = manifest.get("facies_statistics", [])
+        self.train_log.append(
+            f"\nНовый справочник из текущих Excel: {len(stats)} фаций; "
+            f"{manifest.get('annotation_count', 0)} масок, "
+            f"{manifest.get('photo_count', 0)} фото."
+        )
+        from .vlm_description import MIN_TRAIN_SAMPLES, MIN_VAL_SAMPLES
+        caption_train = int(manifest.get("train_caption_count", 0) or 0)
+        caption_val = int(manifest.get("val_caption_count", 0) or 0)
+        self._auto_dataset_ready = bool(
+            manifest.get("training_ready", False)
+            and caption_train >= MIN_TRAIN_SAMPLES
+            and caption_val >= MIN_VAL_SAMPLES
+        )
+        self.train_log.append(
+            f"Краткие описания для VLM: train — {caption_train}/{MIN_TRAIN_SAMPLES}, "
+            f"val — {caption_val}/{MIN_VAL_SAMPLES}."
+        )
+        if caption_train < MIN_TRAIN_SAMPLES or caption_val < MIN_VAL_SAMPLES:
+            self.train_log.append(
+                "Совместное обучение пока не готово: добавьте подтверждённые интервалы "
+                "с краткими описаниями Excel в обе выборки."
             )
-            return
-        try:
-            destination = Path(self.export_dataset_output.text().strip()).expanduser()
-            manifest = json.loads(
-                (destination / "dataset_manifest.json").read_text(encoding="utf-8")
+        if not manifest.get("training_ready", False):
+            self.train_log.append(
+                manifest.get("training_note")
+                or "Датасет сохранён; для обучения добавьте независимую выборку val."
             )
-            training_note = (
-                manifest.get("training_note", "")
-                if not manifest.get("training_ready", False) else ""
-            )
-            self.export_dataset_status.setText(
-                "Датасет готов: "
-                f"{manifest.get('photo_count', 0)} фото, "
-                f"{manifest.get('annotation_count', 0)} масок, "
-                f"{manifest.get('facies_count', 0)} классов; train — "
-                f"{manifest.get('train_photo_count', 0)} фото, val — "
-                f"{manifest.get('val_photo_count', 0)} фото. "
-                f"{training_note}Конфигурация YOLO: {destination / 'data.yaml'}"
-            )
-            self.export_dataset_log.append(
-                f"\nЭкспортированы скважины: {manifest.get('project_count', 0)}; "
-                f"метаданные классов: {destination / 'class_metadata.json'}; "
-                f"краткие описания: {destination / 'caption_dataset.jsonl'}"
-            )
-        except (OSError, ValueError, TypeError) as exc:
-            self.export_dataset_status.setText(
-                f"Процесс завершился успешно, но манифест не удалось прочитать: {exc}"
+        for item in stats:
+            self.train_log.append(
+                f"  {item.get('facies_index', '')} — {item.get('facies_name', '')}: "
+                f"{item.get('mask_count', 0)} масок, "
+                f"{item.get('description_count', 0)} описаний."
             )
 
-    def _read_dataset_output(self) -> None:
-        if self.dataset_process:
-            text = bytes(self.dataset_process.readAllStandardOutput()).decode(errors="replace").strip()
-            if text:
-                self.train_log.append(text)
+    def _dataset_failed(self, message: str) -> None:
+        self._auto_dataset_ready = False
+        self.train_log.append("\nОшибка сборки датасета: " + message)
 
-    def _dataset_finished(self, code: int, _status) -> None:
-        self._read_dataset_output()
+    def _dataset_worker_finished(self, worker: _DiagnosticWorker) -> None:
+        if self.dataset_worker is worker:
+            self.dataset_worker = None
+            worker.deleteLater()
         self.dataset_button.setEnabled(True)
-        self.train_log.append(f"\nСборка датасета завершена, код {code}.")
-        if code == 0:
-            try:
-                manifest = json.loads((self.dataset_output.value() / "dataset_manifest.json").read_text(encoding="utf-8"))
-                stats = manifest.get("facies_statistics", [])
-                self.train_log.append(
-                    f"Новый справочник из текущих Excel: {len(stats)} фаций; "
-                    f"{manifest.get('annotation_count', 0)} масок, "
-                    f"{manifest.get('photo_count', 0)} фото."
-                )
-                if not manifest.get("training_ready", False):
-                    self.train_log.append(
-                        manifest.get("training_note")
-                        or "Датасет сохранён; для обучения добавьте независимую выборку val."
-                    )
-                for item in stats:
-                    self.train_log.append(
-                        f"  {item.get('facies_index', '')} — {item.get('facies_name', '')}: "
-                        f"{item.get('mask_count', 0)} масок, "
-                        f"{item.get('description_count', 0)} описаний."
-                    )
-            except (OSError, ValueError, TypeError):
-                pass
+        start_training = self._auto_train_after_dataset and self._auto_dataset_ready
+        if self._auto_train_after_dataset and not start_training:
+            self.train_log.append(
+                "Автозапуск обучения не выполнен: датасет сохранён, но пока не готов "
+                "для обеих моделей. Добавьте подтверждённые маски и описания в train/val."
+            )
+        self._auto_train_after_dataset = False
+        self._auto_dataset_ready = False
+        if start_training:
+            self.train_log.append("Датасет готов. Запускаю обучение YOLO11-seg и VLM…")
+            self._start_training()
 
     def _start_training(self) -> None:
-        if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
+        if self.training_worker and self.training_worker.isRunning():
             return self._error("Обучение уже запущено.")
+        if self.dataset_worker and self.dataset_worker.isRunning():
+            return self._error("Дождитесь завершения сборки датасета перед обучением.")
+        if self.export_dataset_worker and self.export_dataset_worker.isRunning():
+            return self._error("Дождитесь завершения экспорта датасета перед обучением.")
         if not self.dataset_output.edit.text().strip() or not self.model_output.edit.text().strip():
             return self._error("Укажите папки датасета и результата обучения.")
-        command = [
-            "train",
-            "--dataset", str(self.dataset_output.value()),
-            "--output", str(self.model_output.value()), "--epochs", str(self.epochs.value()),
-            "--patience", str(self.patience.value()), "--imgsz", str(self.image_size.value()),
-            "--batch-size", str(self.batch_size.value()), "--device", "0",
-            "--weights", str(self.pretrained_weights.currentData()),
-        ]
-        self.process = QProcess(self)
-        self.process.setProgram(sys.executable)
-        self.process.setArguments(self._with_launcher(command))
-        self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        self.process.readyReadStandardOutput.connect(self._read_training_output)
-        self.process.finished.connect(self._training_finished)
+        local_weights = self.local_weights.edit.text().strip()
+        selected_weights = local_weights or str(self.pretrained_weights.currentData())
+        dataset_dir = self.dataset_output.value()
+        output_dir = self.model_output.value()
+        epochs = self.epochs.value()
+        patience = self.patience.value()
+        image_size = self.image_size.value()
+        batch_size = self.batch_size.value()
+        vlm_base_text = self.vlm_base_model.edit.text().strip()
+        vlm_adapter_text = self.vlm_initial_adapter.edit.text().strip()
         self.train_log.clear()
-        self.process.start()
+        manifest_path = self.dataset_output.value() / "dataset_manifest.json"
+        if not manifest_path.is_file():
+            return self._error("Сначала соберите датасет из подтверждённых масок (вкладка 3 или 6).")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            current_projects = {
+                os.path.normcase(str(path.absolute()))
+                for path in load_confirmed_project_catalog()
+            }
+            built_projects = {
+                os.path.normcase(str(Path(path).expanduser().absolute()))
+                for path in manifest.get("projects", [])
+            }
+            if current_projects and built_projects and current_projects != built_projects:
+                return self._error(
+                    "После сборки датасета изменился список подтверждённых скважин. "
+                    "Соберите новый датасет перед обучением, иначе новые маски в модель не попадут."
+                )
+            from .training import training_data_warnings
+            warnings = training_data_warnings(manifest)
+        except (OSError, ValueError, TypeError):
+            warnings = []
+        if warnings:
+            self.train_log.append("Проверка объёма и разнообразия данных:")
+            for warning in warnings:
+                self.train_log.append("⚠ " + warning)
+            self.train_log.append(
+                "Это не блокирует запуск, но маленький/синтетический набор не даст надёжную модель.\n"
+            )
+        self.train_log.append(
+            "Локальные веса: " + selected_weights + "\n"
+            "Если выбранное имя отсутствует в кэше, для официальной модели понадобится интернет; "
+            "без сети укажите файл .pt в поле выше.\n"
+        )
+        self.train_log.append(
+            "VLM base: " + (vlm_base_text or "не указана") + "\n"
+            "Стартовый VLM LoRA: " + (vlm_adapter_text or "не указан") + "\n"
+            "Совместный запуск: YOLO11-seg → Qwen3-VL LoRA. Обе модели обязательны; "
+            "описания берутся только из подтверждённых масок с текстом Excel.\n"
+        )
+        self.train_log.append(
+            "Обучение запускается в фоновом потоке текущего приложения — повторный запуск Python исключён.\n"
+        )
+        from .training import train_model
 
-    def _read_training_output(self) -> None:
-        if self.process:
-            self.train_log.append(bytes(self.process.readAllStandardOutput()).decode(errors="replace"))
+        self.training_worker = _DiagnosticWorker(
+            lambda progress: train_model(
+                dataset_dir, output_dir, weights=selected_weights,
+                epochs=epochs, patience=patience, image_size=image_size,
+                batch_size=batch_size, device=0,
+                vlm_base_model_dir=vlm_base_text or None,
+                vlm_initial_adapter=vlm_adapter_text or None,
+                require_vlm=True,
+                progress=progress,
+            ),
+            self,
+        )
+        worker = self.training_worker
+        worker.progress.connect(self.train_log.append)
+        worker.completed.connect(self._training_succeeded)
+        worker.failed.connect(self._training_failed)
+        worker.finished.connect(lambda worker=worker: self._training_worker_finished(worker))
+        self.standard_train_button.setEnabled(False)
+        self.dataset_button.setEnabled(False)
+        worker.start()
 
-    def _training_finished(self, code: int, _status) -> None:
-        self.train_log.append(f"\nПроцесс завершён, код {code}.")
-        if hasattr(self, "dataset_button"):
-            self.dataset_button.setEnabled(True)
-        if hasattr(self, "standard_train_button"):
-            self.standard_train_button.setEnabled(True)
-        if code == 0:
-            self.analysis_model.set_value(self.model_output.value() / "best.pt")
+    def _training_succeeded(self, info: dict) -> None:
+        model_path = Path(info.get("best_model") or self.model_output.value() / "best.pt")
+        self.analysis_model.set_value(model_path)
+        self.train_log.append(f"\nОбучение завершено. Модель сохранена: {model_path}")
+        if info.get("description_model_status") != "trained_candidate_requires_review":
+            reason = info.get("description_model_reason", "")
+            self.train_log.append("VLM для описаний не дообучен: " + str(reason))
+        else:
+            base_dir = info.get("description_base_model_dir")
+            if base_dir:
+                self.analysis_vlm_base.set_value(base_dir)
+            self.train_log.append(
+                "Qwen3-VL LoRA сохранена как кандидат. Проверьте описания на независимых фото; "
+                "пилотный адаптер не считается геологически валидированным."
+            )
+
+    def _training_failed(self, message: str) -> None:
+        self.train_log.append("\nОшибка обучения: " + message)
+
+    def _training_worker_finished(self, worker: _DiagnosticWorker) -> None:
+        if self.training_worker is worker:
+            self.training_worker = None
+            worker.deleteLater()
+        self.dataset_button.setEnabled(True)
+        self.standard_train_button.setEnabled(True)
+
+    def closeEvent(self, event) -> None:
+        running = [
+            label for label, worker in (
+                ("сопоставление", self.project_worker),
+                ("сканирование архива", self.archive_scan_worker),
+                ("пакетное распознавание архива", self.archive_prepare_worker),
+                ("сборка датасета", self.dataset_worker),
+                ("экспорт датасета", self.export_dataset_worker),
+                ("обучение", self.training_worker),
+                ("анализ", self.analysis_worker),
+            ) if worker is not None and worker.isRunning()
+        ]
+        if running:
+            QMessageBox.information(
+                self,
+                "Выполняется задача",
+                "Сейчас выполняется: " + ", ".join(running) + ".\n"
+                "Задача работает внутри приложения. Дождитесь её завершения, "
+                "прежде чем закрывать окно.",
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _start_analysis(self) -> None:
-        if self.analysis_process and self.analysis_process.state() != QProcess.ProcessState.NotRunning:
+        if self.analysis_worker and self.analysis_worker.isRunning():
             return self._error("Анализ уже запущен.")
         model = self.analysis_model.value()
         photos = self.analysis_photos.value()
@@ -2414,45 +2960,52 @@ class MainWindow(QMainWindow):
             return self._error("Выберите папку с фотографиями нового керна.")
         if not self.analysis_output.edit.text().strip() or output.suffix.lower() != ".xlsx":
             return self._error("Укажите новый итоговый файл с расширением .xlsx.")
-        command = [
-            "analyze", "--model", str(model), "--photos", str(photos),
-            "--output-excel", str(output),
-            "--confidence", f"{self.analysis_confidence.value() / 100:.2f}",
-        ]
-        self.analysis_process = QProcess(self)
-        self.analysis_process.setProgram(sys.executable)
-        self.analysis_process.setArguments(self._with_launcher(command))
-        self.analysis_process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        self.analysis_process.readyReadStandardOutput.connect(self._read_analysis_output)
-        self.analysis_process.finished.connect(self._analysis_finished)
+        confidence = self.analysis_confidence.value() / 100
+        vlm_base_text = self.analysis_vlm_base.edit.text().strip()
         self.analysis_log.clear()
-        self.analysis_process.start()
+        self.analysis_log.append("Анализ выполняется в фоновом потоке приложения…")
+        worker = _DiagnosticWorker(
+            lambda progress: (
+                progress("Загружаю модель и обрабатываю фотографии…"),
+                analyze_photos_to_excel(
+                    model, photos, output, confidence=confidence,
+                    vlm_base_model_dir=vlm_base_text or None,
+                ),
+            )[1],
+            self,
+        )
+        self.analysis_worker = worker
+        worker.progress.connect(self.analysis_log.append)
+        worker.completed.connect(lambda info, output=output: self._analysis_completed(info, output))
+        worker.failed.connect(lambda message: self.analysis_log.append("\nОшибка анализа: " + message))
+        worker.finished.connect(lambda worker=worker: self._analysis_worker_finished(worker))
+        worker.start()
 
-    def _read_analysis_output(self) -> None:
-        if self.analysis_process:
-            self.analysis_log.append(bytes(self.analysis_process.readAllStandardOutput()).decode(errors="replace"))
+    def _analysis_completed(self, info: dict, output: Path) -> None:
+        self.analysis_log.append(
+            "\nАнализ завершён. "
+            f"Фото: {info.get('photos', 0)}, интервалов: {info.get('rows', 0)}. "
+            f"Итоговый Excel: {output}"
+        )
+        if info.get("description_model_warning"):
+            self.analysis_log.append("VLM отключена, применено описание из справочника: " + str(info["description_model_warning"]))
+        elif info.get("description_model_available"):
+            self.analysis_log.append("Краткие описания созданы VLM как черновик; обязательно проверьте их перед использованием.")
 
-    def _analysis_finished(self, code: int, _status) -> None:
-        self.analysis_log.append(f"\nАнализ завершён, код {code}.")
-
-    @staticmethod
-    def _with_launcher(command: list[str]) -> list[str]:
-        if getattr(sys, "frozen", False):
-            return command
-        launcher = Path(__file__).resolve().parents[2] / "run.py"
-        return [str(launcher), *command]
+    def _analysis_worker_finished(self, worker: _DiagnosticWorker) -> None:
+        if self.analysis_worker is worker:
+            self.analysis_worker = None
+            worker.deleteLater()
 
     def _automatic_project_dir(self, excel_path: Path) -> Path:
-        local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
         safe_stem = re.sub(r"[^0-9A-Za-zА-Яа-я_-]+", "_", excel_path.stem).strip("_") or "project"
         unique_name = f"{safe_stem}_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:6]}"
-        return local_app_data / "ExcelPhotoModelStudio" / "projects" / unique_name
+        return app_data_dir() / "projects" / unique_name
 
     def _ensure_training_output_paths(self) -> None:
         if self.dataset_output.edit.text().strip() and self.model_output.edit.text().strip():
             return
-        local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-        run = local_app_data / "ExcelPhotoModelStudio" / "training_runs" / f"run_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:6]}"
+        run = app_data_dir() / "training_runs" / f"run_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:6]}"
         if not self.dataset_output.edit.text().strip():
             self.dataset_output.set_value(run / "dataset")
         if not self.model_output.edit.text().strip():
@@ -2470,13 +3023,30 @@ class MainWindow(QMainWindow):
             "Новые скважины можно добавлять в этот же набор между запусками."
         )
         if wells:
-            lines = ["Подтверждённые маски, включённые в накапливаемый датасет:"]
+            lines = ["Отдельные подтверждённые маски фаций, включённые в накапливаемый датасет:"]
             for item in wells:
-                name = ", ".join(str(value) for value in item["well_names"])
-                lines.append(
-                    f"✓ Скважина {name} — фото: {item['photos']}; "
-                    f"маски: {item['masks']}; фаций: {item['facies']}"
-                )
+                default_well = ", ".join(str(value) for value in item["well_names"])
+                for mask in item.get("mask_details", []):
+                    well = mask.get("well") or default_well
+                    photo = mask.get("photo") or "фото не указано"
+                    top = mask.get("depth_top") or "?"
+                    base = mask.get("depth_base") or "?"
+                    label = mask.get("facies_name") or mask.get("label") or "фация не указана"
+                    code = mask.get("facies_index", "")
+                    if code and code.casefold() != label.casefold():
+                        label = f"{label} ({code})"
+                    lines.append(f"✓ {well} | {photo} | {top}–{base} м | {label}")
+                    description = mask.get("target_text", "")
+                    if description:
+                        lines.append(f"    Описание: {description}")
+                if not item.get("mask_details"):
+                    # Keep older/test catalog payloads readable while making
+                    # missing row-level data visible instead of implying that
+                    # individual intervals were displayed.
+                    lines.append(
+                        f"Скважина {default_well}: подтверждено масок — {item['masks']}; "
+                        f"фаций — {item['facies']}; детали отсутствуют в каталоге."
+                    )
             self.catalog_wells.setPlainText("\n".join(lines))
         else:
             self.catalog_wells.setPlainText(

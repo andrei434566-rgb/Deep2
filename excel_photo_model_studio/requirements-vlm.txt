@@ -1,0 +1,7 @@
+# Install after the base application and the matching CUDA-enabled PyTorch build.
+# Qwen3-VL base weights are loaded from the user's local model directory and are not downloaded here.
+transformers==5.19.0
+peft==0.21.2
+accelerate==1.15.0
+Pillow>=10
+safetensors==0.8.0

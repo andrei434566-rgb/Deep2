@@ -7,6 +7,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -25,8 +26,8 @@ class CatalogTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             catalog = root / "training_catalog.json"
-            project = root / "project"
-            project.mkdir()
+            project = root / "projects" / "project"
+            project.mkdir(parents=True)
             (project / "project.json").write_text("{}", encoding="utf-8")
             photo_folder = project / "photos"
             photo_folder.mkdir()
@@ -69,8 +70,28 @@ class CatalogTests(unittest.TestCase):
             }
             (project / "report.json").write_text(json.dumps(report), encoding="utf-8")
 
-            confirm_project_for_training(project, catalog)
-            cached_projects = load_confirmed_project_catalog(catalog)
+            primary_cache_root = root / "confirmed_wells"
+            original_mkdir = Path.mkdir
+
+            def deny_primary_cache_child(path, *args, **kwargs):
+                if path.parent == primary_cache_root and path.name.startswith("project_"):
+                    raise PermissionError("simulated AppData subdirectory restriction")
+                return original_mkdir(path, *args, **kwargs)
+
+            with patch(
+                "excel_photo_model_studio.catalog._snapshot_confirmed_project",
+                side_effect=PermissionError("simulated first-attempt AppData failure"),
+            ):
+                with self.assertRaises(PermissionError):
+                    confirm_project_for_training(project, catalog)
+
+            with patch.object(Path, "mkdir", new=deny_primary_cache_child):
+                cached_projects = load_confirmed_project_catalog(catalog)
+            self.assertEqual(project / "confirmed_wells", cached_projects[0].parent)
+            cache_manifest_path = cached_projects[0] / "cache_manifest.json"
+            initial_manifest = json.loads(cache_manifest_path.read_text(encoding="utf-8"))
+            initial_manifest.pop("photo_names", None)  # Existing 0.6.8 caches have only the hashed path.
+            cache_manifest_path.write_text(json.dumps(initial_manifest), encoding="utf-8")
             overview = catalog_overview(catalog)
             result = build_dataset(cached_projects, root / "dataset")
             cli_destination = root / "dataset_from_catalog"
@@ -103,6 +124,10 @@ class CatalogTests(unittest.TestCase):
         self.assertTrue(cache_manifest["partial_confirmation"])
         self.assertEqual(1, overview["summary"]["photos"])
         self.assertEqual(1, overview["summary"]["annotations"])
+        self.assertEqual(1, len(overview["wells"][0]["mask_details"]))
+        self.assertEqual("photo_0.jpg", overview["wells"][0]["mask_details"][0]["photo"])
+        self.assertEqual("100", overview["wells"][0]["mask_details"][0]["depth_top"])
+        self.assertEqual("Каналы", overview["wells"][0]["mask_details"][0]["facies_name"])
         self.assertEqual(1, result["photo_count"])
         self.assertEqual(1, result["annotation_count"])
         self.assertFalse(result["training_ready"], "a one-photo set must not pretend to have independent validation")
@@ -117,6 +142,7 @@ class CatalogTests(unittest.TestCase):
         self.assertTrue(first_snapshot_exists, "older snapshots remain recoverable")
         self.assertEqual(2, updated_overview["summary"]["photos"])
         self.assertEqual(2, updated_overview["summary"]["annotations"])
+        self.assertEqual(2, len(updated_overview["wells"][0]["mask_details"]))
 
     def test_separate_well_projects_accumulate_into_one_dataset(self):
         with tempfile.TemporaryDirectory() as directory:

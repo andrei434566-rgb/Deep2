@@ -12,6 +12,7 @@ from typing import Iterable
 
 from .depth import meters_to_centimeters
 from .models import PhotoRecord
+from .paths import resolve_existing_path
 from .tabular import as_float, display_text
 
 
@@ -69,7 +70,7 @@ def discover_photos(
     use_ocr: bool = False,
     expected_intervals: Iterable[tuple[float, float]] = (),
 ) -> list[PhotoRecord]:
-    folder = Path(folder).expanduser().resolve(strict=True)
+    folder = resolve_existing_path(folder)
     iterator = folder.rglob("*") if recursive else folder.glob("*")
     paths = sorted((path for path in iterator if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS), key=lambda item: item.name.casefold())
     records = [parse_filename(path) for path in paths]

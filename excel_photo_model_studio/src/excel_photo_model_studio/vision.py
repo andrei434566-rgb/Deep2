@@ -15,6 +15,8 @@ from .models import (
     Annotation, COLUMN_ORDER_AUTO, COLUMN_ORDER_LEFT_TO_RIGHT,
     COLUMN_ORDER_RIGHT_TO_LEFT, Match, normalize_column_order,
 )
+from .paths import resolve_existing_path
+from .storage import replace_or_write
 
 
 def read_image(path: Path) -> np.ndarray:
@@ -30,7 +32,7 @@ def read_image(path: Path) -> np.ndarray:
 
 def detect_core_columns_from_path(path: Path) -> list[tuple[int, int, int, int]]:
     """Detect columns once per unchanged source file during project creation."""
-    resolved = Path(path).expanduser().resolve(strict=True)
+    resolved = resolve_existing_path(path)
     stat = resolved.stat()
     return list(_cached_core_columns(str(resolved), stat.st_size, stat.st_mtime_ns))
 
@@ -1014,7 +1016,7 @@ def render_previews(annotations: list[Annotation], destination: Path) -> dict[Pa
             new_manifest[str(photo_path)] = {"signature": signature, "target": target_name}
     temporary_manifest = manifest_path.with_suffix(".json.tmp")
     temporary_manifest.write_text(json.dumps(new_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary_manifest.replace(manifest_path)
+    replace_or_write(temporary_manifest, manifest_path)
     return output
 
 

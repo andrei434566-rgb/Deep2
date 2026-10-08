@@ -3,4 +3,4 @@
 from .models import Annotation, ColumnMapping, DescriptionRow, PhotoRecord
 
 __all__ = ["Annotation", "ColumnMapping", "DescriptionRow", "PhotoRecord"]
-__version__ = "0.6.8"
+__version__ = "0.7.0"

@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
 import sysconfig
+import importlib.util
 
 from PyInstaller.utils.hooks import collect_all, collect_dynamic_libs, collect_submodules
 
@@ -10,6 +11,7 @@ datas = [
     (str(project_root / "README.md"), "."),
     (str(project_root / "PORTABLE_README.txt"), "."),
     (str(project_root / "requirements.txt"), "."),
+    (str(project_root / "requirements-vlm.txt"), "."),
 ]
 portable_tesseract = project_root.parent / "tools" / "tesseract"
 if portable_tesseract.is_dir():
@@ -38,6 +40,21 @@ if nvidia_root.is_dir():
 
 for package in ("ultralytics", "cv2", "openpyxl", "xlrd", "numpy", "pytesseract"):
     collected = collect_all(package)
+    datas += collected[0]
+    binaries += collected[1]
+    hiddenimports += collected[2]
+
+# The GUI trains YOLO and VLM together, so never produce a portable EXE that
+# silently omits the VLM runtime. The 4GB+ Qwen base weights stay external.
+vlm_modules = ("transformers", "peft", "accelerate", "PIL", "safetensors", "tokenizers")
+missing_vlm_modules = [name for name in vlm_modules if importlib.util.find_spec(name) is None]
+if missing_vlm_modules:
+    raise RuntimeError(
+        "Нельзя собрать совместный YOLO+VLM EXE: установите requirements-vlm.txt; "
+        "не найдены " + ", ".join(missing_vlm_modules)
+    )
+for module_name in vlm_modules:
+    collected = collect_all(module_name)
     datas += collected[0]
     binaries += collected[1]
     hiddenimports += collected[2]

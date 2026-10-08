@@ -14,7 +14,7 @@ import torch
 
 from excel_photo_model_studio.inference import (
     analyze_photos_to_excel, polygon_depth_interval, _uncovered_intervals,
-    _resolve_prediction_overlaps, _apply_interval_descriptions,
+    _resolve_prediction_overlaps, _apply_interval_descriptions, _masked_description_crop,
 )
 from excel_photo_model_studio.models import PhotoRecord
 
@@ -75,6 +75,43 @@ class InferenceTests(unittest.TestCase):
         self.assertEqual(((60, 10, 3), "Dch", "Channels", 2.0), generator.calls[0])
         self.assertEqual(["Описание полного интервала."] * 2, [row["description"] for row in rows])
         self.assertTrue(all("_interval_crop" not in row for row in rows))
+
+    def test_vlm_generates_text_for_yolo_interval_without_changing_its_boundaries(self):
+        class FakeVLM:
+            def __init__(self):
+                self.arguments = None
+
+            def generate(self, image, **kwargs):
+                self.arguments = (image.shape, kwargs)
+                return "Керн серый, тонкослоистый."
+
+        generator = FakeVLM()
+        rows = [{
+            "well": "W", "facies_index": "Mstf", "facies_name": "Тонкослоистая фация",
+            "association": "межрусловый залив", "environment": "дельтовая равнина",
+            "description": "Из Excel.", "facies_top": 4100.25, "facies_base": 4102.0,
+            "source_photo": "a.jpg", "prediction_index": 1,
+            "_interval_crop": np.zeros((50, 20, 3), np.uint8),
+        }]
+
+        generated, fallback = _apply_interval_descriptions(rows, generator)
+
+        self.assertEqual((1, 0), (generated, fallback))
+        self.assertEqual((4100.25, 4102.0), (rows[0]["facies_top"], rows[0]["facies_base"]))
+        self.assertEqual("Керн серый, тонкослоистый.", rows[0]["description"])
+        self.assertEqual("Mstf", generator.arguments[1]["facies_index"])
+        self.assertEqual(1.75, generator.arguments[1]["interval_m"])
+
+    def test_vlm_crop_contains_only_the_yolo_mask_not_ruler_or_neighbouring_pixels(self):
+        image = np.zeros((20, 20, 3), dtype=np.uint8)
+        polygon = np.array([[5, 5], [10, 5], [10, 15], [5, 15]], dtype=np.float32)
+        original = image.copy()
+
+        crop = _masked_description_crop(image, polygon, (2, 2, 15, 18), 4, 16)
+
+        self.assertIsNotNone(crop)
+        self.assertTrue(np.all(crop[:, :3] == 255))
+        self.assertTrue(np.all(image == original))
 
     def _analysis_context(self, root, records, polygons):
         from contextlib import ExitStack

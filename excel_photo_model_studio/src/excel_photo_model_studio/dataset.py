@@ -12,9 +12,11 @@ from typing import Iterable
 import cv2
 import numpy as np
 
+from .paths import resolve_existing_path
+
 def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict:
     raw_projects = [project_dir] if isinstance(project_dir, (str, Path)) else list(project_dir)
-    project_dirs = [Path(value).expanduser().resolve(strict=True) for value in raw_projects]
+    project_dirs = [resolve_existing_path(value) for value in raw_projects]
     if not project_dirs:
         raise ValueError("В обучающем каталоге пока нет обработанных скважин.")
     destination = Path(destination).expanduser().absolute()
@@ -112,7 +114,7 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
     samples = []
     caption_samples = []
     for photo_index, (photo_name, annotations) in enumerate(sorted(by_photo.items()), start=1):
-        photo = Path(photo_name).resolve(strict=True)
+        photo = resolve_existing_path(photo_name)
         split = split_by_photo[photo_name]
         photo_bytes = photo.read_bytes()
         digest = hashlib.sha256(photo_bytes).hexdigest()
@@ -208,8 +210,9 @@ def build_dataset(project_dir: Path | Iterable[Path], destination: Path) -> dict
             for class_id in range(len(labels))
         ],
         "description_policy": (
-            "YOLO predicts the interval mask and facies class. A separate character decoder is trained "
-            "from approved interval crops and the Excel short-description field."
+            "YOLO predicts the interval mask and facies class. A Qwen3-VL LoRA adapter can be continued "
+            "from the reviewed interval crops and their confirmed Excel short-description targets; "
+            "VLM generates text only and does not predict depth, boundaries, or facies."
         ),
     }
     class_metadata_path = destination / "class_metadata.json"
@@ -306,7 +309,7 @@ def _restore_facies_targets_from_excel(project: Path, annotations: list[dict[str
         if not str(source_file or "").strip():
             return None
         try:
-            source = str(Path(source_file).expanduser().resolve(strict=True)).casefold()
+            source = str(resolve_existing_path(source_file)).casefold()
             row = str(int(row_number))
         except (OSError, TypeError, ValueError):
             return None

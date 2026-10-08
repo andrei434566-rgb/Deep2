@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
 import tempfile
@@ -58,6 +59,7 @@ class GuiPreviewTests(unittest.TestCase):
             self.assertEqual(1, window.photo_table.rowCount())
             self.assertTrue(window.ocr.isChecked())
             self.assertEqual("yolo11s-seg.pt", window.pretrained_weights.currentData())
+            self.assertEqual("", window.local_weights.edit.text())
             self.assertEqual("auto", window.photo_table.cellWidget(0, 5).currentData())
             self.assertIn("Колонок керна найдено: 1", window.matching_preview_title.text())
             self.assertIn("Интервалы колонок: 1) 100–101 м", window.matching_preview_title.text())
@@ -410,19 +412,264 @@ class GuiPreviewTests(unittest.TestCase):
                 "summary": {"projects": 1, "photos": 12, "annotations": 38, "approved_annotations": 38},
                 "wells": [{
                     "well_names": ["671ПО"], "photos": 12, "masks": 38, "facies": 4,
+                    "mask_details": [{
+                        "annotation_id": "a1", "well": "671ПО", "photo": "photo_001.jpg",
+                        "depth_top": "4105.00", "depth_base": "4105.20",
+                        "facies_index": "Dch", "facies_name": "Каналы", "label": "Каналы",
+                        "target_text": "Песчаник светло-серый.",
+                    }],
                 }],
             }
             with patch("excel_photo_model_studio.gui.catalog_overview", return_value=confirmed):
                 window._update_catalog_status()
 
             text = window.catalog_wells.toPlainText()
-            self.assertIn("Подтверждённые маски, включённые в накапливаемый датасет", text)
-            self.assertIn("Скважина 671ПО — фото: 12; маски: 38; фаций: 4", text)
+            self.assertIn("Отдельные подтверждённые маски фаций", text)
+            self.assertIn("671ПО | photo_001.jpg | 4105.00–4105.20 м | Каналы (Dch)", text)
+            self.assertIn("Описание: Песчаник светло-серый.", text)
             self.assertIn("скважин — 1", window.catalog_status.text())
         finally:
             window.close()
 
-    def test_yolo_export_has_own_tab_and_launches_dataset_only(self):
+    def test_saving_one_reviewed_mask_refreshes_its_row_on_training_tab(self):
+        empty = {
+            "summary": {"projects": 0, "photos": 0, "annotations": 0, "approved_annotations": 0},
+            "wells": [],
+        }
+        confirmed = {
+            "summary": {"projects": 1, "photos": 1, "annotations": 1, "approved_annotations": 1},
+            "wells": [{
+                "well_names": ["671ПО"], "photos": 1, "masks": 1, "facies": 1,
+                "mask_details": [{
+                    "annotation_id": "mask-1", "well": "671ПО", "photo": "page_01.jpg",
+                    "depth_top": "4105.00", "depth_base": "4105.20",
+                    "facies_index": "Dch", "facies_name": "Каналы", "label": "Каналы",
+                    "target_text": "Песчаник светло-серый.",
+                }],
+            }],
+        }
+        with (
+            patch("excel_photo_model_studio.gui.catalog_overview", side_effect=[empty, confirmed]),
+            patch("excel_photo_model_studio.gui.set_annotation_approvals", return_value={"approved_annotations": 1}),
+            patch("excel_photo_model_studio.gui.confirm_project_for_training") as save_to_cache,
+        ):
+            window = MainWindow()
+            try:
+                project = Path("reviewed-project")
+                window.current_project = project
+                window.review_table.setRowCount(1)
+                approval = QTableWidgetItem()
+                approval.setCheckState(Qt.CheckState.Checked)
+                window.review_table.setItem(0, 0, approval)
+                window.review_table.setItem(0, 8, QTableWidgetItem("mask-1"))
+
+                window._save_review()
+
+                save_to_cache.assert_called_once_with(project)
+                self.assertIn("671ПО | page_01.jpg | 4105.00–4105.20 м | Каналы (Dch)",
+                              window.catalog_wells.toPlainText())
+                self.assertIn("Описание: Песчаник светло-серый.", window.catalog_wells.toPlainText())
+                self.assertIn("масок — 1", window.catalog_status.text())
+                self.assertIn("Сохранено в накопительный датасет: 1", window.catalog_save_status.text())
+            finally:
+                window.close()
+
+    def test_save_review_persists_one_real_mask_to_catalog_and_training_tab(self):
+        from excel_photo_model_studio.catalog import catalog_overview
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            photos_dir = project / "photos"
+            photos_dir.mkdir(parents=True)
+            photo = photos_dir / "page_01.jpg"
+            image = np.full((80, 60, 3), 120, dtype=np.uint8)
+            ok, encoded = cv2.imencode(".jpg", image)
+            self.assertTrue(ok)
+            photo.write_bytes(encoded.tobytes())
+            (project / "project.json").write_text("{}", encoding="utf-8")
+
+            annotation = {
+                "annotation_id": "mask-1", "photo": str(photo), "preview": "",
+                "well": "671ПО", "photo_top": "4105.00", "photo_base": "4106.00",
+                "depth_top": "4105.00", "depth_base": "4105.20", "label": "Dch",
+                "facies_index": "Dch", "facies_name": "Каналы",
+                "polygon_json": json.dumps([[5, 5], [50, 5], [50, 70], [5, 70]]),
+                "image_width": "60", "image_height": "80", "source_sheet": "Data",
+                "source_row": "2", "source_file": "source.xlsx",
+                "target_text": "Песчаник светло-серый.", "approved": "0",
+            }
+            annotations_path = project / "annotations.csv"
+            with annotations_path.open("w", encoding="utf-8-sig", newline="") as target:
+                writer = csv.DictWriter(target, fieldnames=annotation.keys(), delimiter=";")
+                writer.writeheader()
+                writer.writerow(annotation)
+            stamp = lambda path: [path.stat().st_size, path.stat().st_mtime_ns]
+            report = {
+                "photos": 1, "annotations": 1, "approved_annotations": 0,
+                "validation_snapshot": {
+                    "files": {
+                        str(photo.resolve()): stamp(photo),
+                        str(annotations_path.resolve()): stamp(annotations_path),
+                    },
+                    "photos_dir": str(photos_dir.resolve()),
+                    "photos": [str(photo.resolve())],
+                },
+            }
+            (project / "report.json").write_text(json.dumps(report), encoding="utf-8")
+            catalog_path = root / "training_catalog.json"
+
+            with patch("excel_photo_model_studio.catalog.default_catalog_path", return_value=catalog_path):
+                window = MainWindow()
+                try:
+                    window.current_project = project
+                    window.review_table.setRowCount(1)
+                    approval = QTableWidgetItem()
+                    approval.setCheckState(Qt.CheckState.Checked)
+                    window.review_table.setItem(0, 0, approval)
+                    window.review_table.setItem(0, 8, QTableWidgetItem("mask-1"))
+
+                    window._save_review()
+
+                    saved = catalog_overview(catalog_path)
+                    self.assertEqual(1, saved["summary"]["annotations"])
+                    self.assertEqual(1, saved["summary"]["approved_annotations"])
+                    self.assertEqual(1, len(saved["wells"][0]["mask_details"]))
+                    self.assertIn("671ПО | page_01.jpg | 4105.00–4105.20 м | Каналы (Dch)",
+                                  window.catalog_wells.toPlainText())
+                    self.assertIn("Описание: Песчаник светло-серый.", window.catalog_wells.toPlainText())
+                    self.assertIn("Сохранено в накопительный датасет: 1", window.catalog_save_status.text())
+                finally:
+                    window.close()
+
+    def test_save_failure_is_reported_on_training_tab(self):
+        empty = {
+            "summary": {"projects": 0, "photos": 0, "annotations": 0, "approved_annotations": 0},
+            "wells": [],
+        }
+        with (
+            patch("excel_photo_model_studio.gui.catalog_overview", return_value=empty),
+            patch("excel_photo_model_studio.gui.set_annotation_approvals",
+                  return_value={"approved_annotations": 1}),
+            patch("excel_photo_model_studio.gui.confirm_project_for_training",
+                  side_effect=ValueError("тестовая причина отказа")),
+            patch.object(MainWindow, "_error"),
+        ):
+            window = MainWindow()
+            try:
+                window.current_project = Path("reviewed-project")
+                window.review_table.setRowCount(1)
+                approval = QTableWidgetItem()
+                approval.setCheckState(Qt.CheckState.Checked)
+                window.review_table.setItem(0, 0, approval)
+                window.review_table.setItem(0, 8, QTableWidgetItem("mask-1"))
+
+                window._save_review()
+
+                self.assertIn("не добавлены: тестовая причина отказа", window.catalog_save_status.text())
+                self.assertIn("Пока нет подтверждённых масок", window.catalog_wells.toPlainText())
+            finally:
+                window.close()
+
+    def test_training_runs_in_background_thread_without_relaunching_python(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "candidate_model"
+            received_training_options = {}
+
+            def fake_train(_dataset_dir, output_dir, **kwargs):
+                received_training_options.update(kwargs)
+                kwargs["progress"]("Тест: обучение началось")
+                output_path = output_dir / "best.pt"
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(b"test checkpoint")
+                return {
+                    "best_model": str(output_path),
+                    "description_model_status": "trained_candidate_requires_review",
+                    "description_base_model_dir": str(root / "vlm-base"),
+                }
+
+            window = MainWindow()
+            try:
+                dataset_dir = root / "dataset"
+                dataset_dir.mkdir()
+                (dataset_dir / "dataset_manifest.json").write_text(
+                    json.dumps({"projects": [], "class_names": ["Sand"]}), encoding="utf-8",
+                )
+                window.dataset_output.set_value(dataset_dir)
+                window.model_output.set_value(output)
+                window.vlm_base_model.set_value(root / "vlm-base")
+                window.vlm_initial_adapter.set_value(root / "adapter" / "adapter_model.safetensors")
+                with (
+                    patch("excel_photo_model_studio.training.train_model", side_effect=fake_train),
+                    patch.object(QProcess, "start", side_effect=AssertionError(
+                        "training must not launch another Python process"
+                    )),
+                ):
+                    window._start_training()
+                    deadline = time.monotonic() + 5
+                    while window.training_worker is not None and time.monotonic() < deadline:
+                        self.application.processEvents()
+                        time.sleep(0.01)
+                    self.application.processEvents()
+
+                self.assertIsNone(window.training_worker)
+                self.assertEqual(b"test checkpoint", (output / "best.pt").read_bytes())
+                self.assertEqual(output / "best.pt", window.analysis_model.value())
+                self.assertEqual(root / "vlm-base", window.analysis_vlm_base.value())
+                self.assertEqual(str(root / "vlm-base"), received_training_options["vlm_base_model_dir"])
+                self.assertEqual(str(root / "adapter" / "adapter_model.safetensors"), received_training_options["vlm_initial_adapter"])
+                self.assertTrue(received_training_options["require_vlm"])
+                self.assertIn("фоновом потоке текущего приложения", window.train_log.toPlainText())
+                self.assertIn("LoRA сохранена как кандидат", window.train_log.toPlainText())
+                self.assertIn("Тест: обучение началось", window.train_log.toPlainText())
+                self.assertTrue(window.standard_train_button.isEnabled())
+            finally:
+                if window.training_worker and window.training_worker.isRunning():
+                    window.training_worker.wait(5000)
+                    self.application.processEvents()
+                window.close()
+
+    def test_dataset_build_runs_in_background_thread_without_relaunching_python(self):
+        overview = {
+            "summary": {"projects": 1, "photos": 4, "annotations": 8, "approved_annotations": 8},
+            "wells": [],
+        }
+        manifest = {
+            "photo_count": 4, "annotation_count": 8, "facies_statistics": [
+                {"facies_index": "A", "facies_name": "Sand", "mask_count": 8, "description_count": 8},
+            ],
+            "training_ready": True,
+        }
+        with patch("excel_photo_model_studio.gui.catalog_overview", return_value=overview):
+            window = MainWindow()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                destination = Path(directory) / "dataset"
+                window.dataset_output.set_value(destination)
+                with (
+                    patch("excel_photo_model_studio.gui.load_confirmed_project_catalog", return_value=[Path("approved")]),
+                    patch("excel_photo_model_studio.gui.build_dataset", return_value=manifest) as build,
+                    patch.object(QProcess, "start", side_effect=AssertionError(
+                        "dataset build must not launch another Python process"
+                    )),
+                ):
+                    window._build_dataset()
+                    deadline = time.monotonic() + 5
+                    while window.dataset_worker is not None and time.monotonic() < deadline:
+                        self.application.processEvents()
+                        time.sleep(0.01)
+                    self.application.processEvents()
+
+                self.assertIsNone(window.dataset_worker)
+                build.assert_called_once_with([Path("approved")], destination)
+                self.assertIn("8 масок", window.train_log.toPlainText())
+                self.assertIn("Sand", window.train_log.toPlainText())
+                self.assertTrue(window.dataset_button.isEnabled())
+        finally:
+            window.close()
+
+    def test_yolo_export_has_own_tab_and_runs_dataset_builder_in_process(self):
         overview = {
             "summary": {"projects": 1, "photos": 8, "annotations": 24, "approved_annotations": 24},
             "wells": [],
@@ -439,21 +686,31 @@ class GuiPreviewTests(unittest.TestCase):
 
             with tempfile.TemporaryDirectory() as directory:
                 destination = Path(directory) / "yolo-export"
-                catalog = Path(directory) / "catalog.json"
+                manifest = {
+                    "photo_count": 8, "annotation_count": 24, "facies_count": 3,
+                    "train_photo_count": 6, "val_photo_count": 2,
+                    "project_count": 1, "training_ready": True,
+                }
                 window.export_dataset_output.setText(str(destination))
                 with (
                     patch("excel_photo_model_studio.gui.catalog_overview", return_value=overview),
-                    patch("excel_photo_model_studio.gui.default_catalog_path", return_value=catalog),
-                    patch.object(QProcess, "start") as start,
+                    patch("excel_photo_model_studio.gui.load_confirmed_project_catalog", return_value=[Path("approved")]),
+                    patch("excel_photo_model_studio.gui.build_dataset", return_value=manifest) as build,
+                    patch.object(QProcess, "start", side_effect=AssertionError(
+                        "YOLO export must not launch another Python process"
+                    )),
                 ):
                     window._export_dataset()
+                    deadline = time.monotonic() + 5
+                    while window.export_dataset_worker is not None and time.monotonic() < deadline:
+                        self.application.processEvents()
+                        time.sleep(0.01)
+                    self.application.processEvents()
 
-                start.assert_called_once_with()
-                arguments = window.export_dataset_process.arguments()
-                self.assertIn("dataset", arguments)
-                self.assertNotIn("train", arguments)
-                self.assertEqual(str(catalog), arguments[arguments.index("--catalog") + 1])
-                self.assertEqual(str(destination), arguments[arguments.index("--output") + 1])
+                self.assertIsNone(window.export_dataset_worker)
+                build.assert_called_once_with([Path("approved")], destination)
+                self.assertIn("8 фото", window.export_dataset_status.text())
+                self.assertIn("data.yaml", window.export_dataset_status.text())
                 self.assertFalse(destination.exists())
 
                 existing = Path(directory) / "do-not-overwrite"

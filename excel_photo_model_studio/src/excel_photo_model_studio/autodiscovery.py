@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from .paths import resolve_existing_path
+
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 EXCEL_EXTENSIONS = {".xlsx", ".xlsm", ".xltx", ".xltm", ".xls", ".csv", ".tsv"}
 PHOTO_FOLDER_NAMES = {"photo", "photos", "image", "images", "фото", "фотографии", "изображения", "кернфото"}
@@ -10,7 +12,7 @@ PHOTO_FOLDER_NAMES = {"photo", "photos", "image", "images", "фото", "фот�
 
 def discover_well_pairs(root: Path) -> dict:
     """Find unambiguous workbook/photo-folder pairs in a dropped archive tree."""
-    root = Path(root).expanduser().resolve(strict=True)
+    root = resolve_existing_path(root)
     if not root.is_dir():
         raise ValueError(f"Это не папка с архивом данных: {root}")
     workbooks: list[Path] = []

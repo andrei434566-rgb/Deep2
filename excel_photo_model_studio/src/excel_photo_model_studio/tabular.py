@@ -17,6 +17,7 @@ from typing import Any, Iterable
 
 from .depth import decimal_tokens, format_depth, meters_to_centimeters, normalize_depth, parse_decimal_value
 from .models import ColumnMapping, DescriptionRow, Issue
+from .paths import resolve_existing_path
 
 
 SUPPORTED_TABLES = {".xlsx", ".xlsm", ".xltx", ".xltm", ".xls", ".csv", ".tsv"}
@@ -350,7 +351,7 @@ def detect_mapping(sheet: str, rows: list[list[Any]]) -> ColumnMapping:
 
 
 def read_table(path: Path, mapping_file: Path | None = None) -> tuple[list[DescriptionRow], list[ColumnMapping], list[Issue]]:
-    path = Path(path).expanduser().resolve(strict=True)
+    path = resolve_existing_path(path)
     if path.suffix.lower() not in SUPPORTED_TABLES:
         raise ValueError(f"Неподдерживаемый формат таблицы: {path.suffix}")
     sheets = _read_sheets(path)
@@ -405,7 +406,7 @@ def discover_table_files(inputs: Path | Iterable[Path]) -> list[Path]:
     values = [inputs] if isinstance(inputs, Path) else list(inputs)
     found: dict[str, Path] = {}
     for raw in values:
-        path = Path(raw).expanduser().resolve(strict=True)
+        path = resolve_existing_path(raw)
         candidates = path.rglob("*") if path.is_dir() else (path,)
         for candidate in candidates:
             if candidate.is_file() and candidate.suffix.lower() in SUPPORTED_TABLES:

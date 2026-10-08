@@ -15,6 +15,8 @@ from .models import (
     Annotation, COLUMN_ORDER_AUTO, COLUMN_ORDER_RIGHT_TO_LEFT, ColumnMapping,
     DescriptionRow, Issue, PhotoRecord, normalize_column_order,
 )
+from .paths import resolve_existing_path
+from .storage import replace_or_write
 from .photos import discover_photos, enrich_core_column_depths
 from .tabular import read_many_tables, save_mappings, well_key
 from .vision import (
@@ -35,7 +37,7 @@ def create_project(
     project_dir = Path(project_dir).expanduser().absolute()
     if project_dir.exists():
         raise FileExistsError(f"Папка проекта уже существует: {project_dir}")
-    photos_dir = Path(photos_dir).expanduser().resolve(strict=True)
+    photos_dir = resolve_existing_path(photos_dir)
     excel_inputs = [Path(excel_path)] if isinstance(excel_path, (str, Path)) else [Path(value) for value in excel_path]
     rows, mappings, issues, excel_files = read_many_tables(excel_inputs, mapping_file)
     expected_intervals = sorted({
@@ -77,7 +79,7 @@ def write_verified_columns(
     """
     payload = {"schema": "verified-core-columns-v1", "photos": {}}
     for source_path, boxes in columns_by_photo.items():
-        path = Path(source_path).expanduser().resolve(strict=True)
+        path = resolve_existing_path(source_path)
         stat = path.stat()
         payload["photos"][str(path)] = {
             "size_bytes": stat.st_size,
@@ -91,7 +93,7 @@ def write_verified_columns(
 
 
 def refresh_project(project_dir: Path) -> dict:
-    project_dir = Path(project_dir).expanduser().resolve(strict=True)
+    project_dir = resolve_existing_path(project_dir)
     config = _read_project(project_dir)
     excel_paths = [Path(value) for value in config.get("excel_paths", ())]
     if not excel_paths and config.get("excel_path"):
@@ -616,7 +618,7 @@ def _load_verified_columns(project_dir: Path, photos: list[PhotoRecord]):
     issues = []
     for source_path, entry in entries.items():
         try:
-            original_path = Path(source_path).expanduser().resolve(strict=True)
+            original_path = resolve_existing_path(source_path)
             photo_path = available.get(original_path)
             if photo_path is None:
                 continue
@@ -860,7 +862,7 @@ def _table_source_signature(excel_paths: list[Path], mapping_path: Path) -> str:
 
     values = []
     for path in excel_paths:
-        resolved = Path(path).expanduser().resolve(strict=True)
+        resolved = resolve_existing_path(path)
         stat = resolved.stat()
         values.append((str(resolved), stat.st_size, stat.st_mtime_ns))
     if mapping_path.is_file():
@@ -884,7 +886,7 @@ def _write_table_cache(project_dir: Path, rows, mappings, issues, excel_files) -
     path = project_dir / "table_cache.json"
     temporary = path.with_suffix(".json.tmp")
     _write_json(temporary, payload)
-    temporary.replace(path)
+    replace_or_write(temporary, path)
 
 
 def _load_table_cache(project_dir: Path, excel_paths: list[Path]):

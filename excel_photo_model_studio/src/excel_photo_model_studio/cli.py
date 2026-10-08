@@ -25,7 +25,7 @@ def parser() -> argparse.ArgumentParser:
     dataset_source.add_argument("--catalog", type=Path, help="Внутренний каталог последовательно обработанных скважин")
     dataset.add_argument("--output", type=Path, required=True)
 
-    train = commands.add_parser("train", help="Дообучить YOLO11-seg на CUDA и сохранить best.pt")
+    train = commands.add_parser("train", help="Дообучить YOLO11-seg и при настройке Qwen3-VL LoRA на CUDA")
     train.add_argument("--dataset", type=Path, required=True)
     train.add_argument("--output", type=Path, required=True)
     train.add_argument("--weights", default="yolo11s-seg.pt", help="Предобученный checkpoint YOLO11-seg")
@@ -34,6 +34,8 @@ def parser() -> argparse.ArgumentParser:
     train.add_argument("--imgsz", type=int, default=1024)
     train.add_argument("--batch-size", type=int, default=2)
     train.add_argument("--device", type=int, choices=(0,), default=0, help="Только CUDA GPU 0; CPU не используется")
+    train.add_argument("--vlm-base-model", type=Path, help="Локальная папка базовой модели Qwen3-VL")
+    train.add_argument("--vlm-adapter", type=Path, help="Папка или файл adapter_model.safetensors начальной LoRA")
 
     discovery = commands.add_parser("discover-wells", help="Найти пары Excel + фото в архивной папке")
     discovery.add_argument("--root", type=Path, required=True)
@@ -43,6 +45,7 @@ def parser() -> argparse.ArgumentParser:
     analyze.add_argument("--photos", type=Path, required=True)
     analyze.add_argument("--output-excel", type=Path, required=True)
     analyze.add_argument("--confidence", type=float, default=0.25)
+    analyze.add_argument("--vlm-base-model", type=Path, help="Локальная папка базовой модели Qwen3-VL")
 
     commands.add_parser("gui", help="Открыть графическое приложение")
     self_test = commands.add_parser("self-test", help="Проверить библиотеки, окно, Excel, OCR и нейросеть без загрузок")
@@ -81,6 +84,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.dataset, args.output, weights=args.weights,
                 epochs=args.epochs, patience=args.patience,
                 image_size=args.imgsz, batch_size=args.batch_size, device=args.device,
+                vlm_base_model_dir=args.vlm_base_model,
+                vlm_initial_adapter=args.vlm_adapter,
             )
         elif args.command == "discover-wells":
             from .autodiscovery import discover_well_pairs
@@ -89,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
             from .inference import analyze_photos_to_excel
             result = analyze_photos_to_excel(
                 args.model, args.photos, args.output_excel,
-                confidence=args.confidence,
+                confidence=args.confidence, vlm_base_model_dir=args.vlm_base_model,
             )
         else:
             from .gui import run_gui

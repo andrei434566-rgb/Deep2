@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "excel-photo-model-studio"
-version = "0.6.8"
-description = "Reviewed core-photo dataset, CUDA YOLO11 segmentation, and interval-conditioned description generation"
+version = "0.7.0"
+description = "Reviewed core-photo dataset, CUDA YOLO11 segmentation, and Qwen3-VL description generation"
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=1.26",
@@ -20,6 +20,15 @@ dependencies = [
 
 [project.scripts]
 excel-photo-studio = "excel_photo_model_studio.cli:main"
+
+[project.optional-dependencies]
+vlm = [
+  "transformers>=4.57",
+  "peft>=0.15",
+  "accelerate>=1.6",
+  "Pillow>=10",
+  "safetensors>=0.5",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

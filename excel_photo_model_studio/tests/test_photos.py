@@ -45,6 +45,23 @@ class PhotoOcrParsingTests(unittest.TestCase):
         self.assertEqual(10, len(photos))
         self.assertEqual(10, len({photo.path for photo in photos}))
 
+    def test_discovery_falls_back_when_windows_strict_resolution_is_denied(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "core-4100.00-4101.00.jpg").write_bytes(b"test")
+            original_resolve = Path.resolve
+
+            def deny_strict_resolution(path, strict=False):
+                if strict:
+                    raise PermissionError("strict final-path lookup denied")
+                return original_resolve(path, strict=False)
+
+            with patch.object(Path, "resolve", deny_strict_resolution):
+                photos = discover_photos(root)
+
+        self.assertEqual(1, len(photos))
+        self.assertTrue(photos[0].path.name.startswith("core-4100"))
+
     def test_prefers_adjusted_caption_interval_over_raw_sampling_and_column_numbers(self):
         text = (
             "Глубина по керну 4105.00 4106.00 4107.00 4107.94 4108.94. "

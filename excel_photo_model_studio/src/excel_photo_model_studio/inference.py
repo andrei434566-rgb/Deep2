@@ -10,6 +10,7 @@ import numpy as np
 from .depth import centimeters_to_meters, meters_to_centimeters
 from .matching import sort_photo_records
 from .models import COLUMN_ORDER_RIGHT_TO_LEFT
+from .paths import resolve_existing_path
 from .photos import discover_photos, enrich_core_column_depths
 from .standard_excel import export_standardized_workbook
 from .vision import calibrate_core_columns, detect_column_order, detect_core_columns, read_image
@@ -21,14 +22,15 @@ def analyze_photos_to_excel(
     destination: Path,
     *,
     confidence: float = 0.25,
+    vlm_base_model_dir: str | Path | None = None,
 ) -> dict:
     """Apply a YOLO segmentation model and map class metadata into the Excel output."""
     try:
         from ultralytics import YOLO
     except ImportError as exc:
         raise RuntimeError("Для анализа нужны PyTorch и пакет ultralytics.") from exc
-    model_path = Path(model_path).expanduser().resolve(strict=True)
-    photos_dir = Path(photos_dir).expanduser().resolve(strict=True)
+    model_path = resolve_existing_path(model_path)
+    photos_dir = resolve_existing_path(photos_dir)
     destination = Path(destination).expanduser().absolute()
     if model_path.suffix.lower() != ".pt":
         raise ValueError("Выберите созданный этой системой файл best.pt.")
@@ -46,13 +48,31 @@ def analyze_photos_to_excel(
     }
     description_generator = None
     description_model_warning = ""
-    description_model_path = model_path.with_name("description_best.pt")
-    if description_model_path.is_file():
+    description_model_kind = str(contract.get("description_model_type", ""))
+    description_adapter_value = contract.get("description_model")
+    description_adapter_path = (
+        (model_path.parent / str(description_adapter_value)).resolve()
+        if description_adapter_value else model_path.parent / "description_vlm"
+    )
+    selected_vlm_base = vlm_base_model_dir or contract.get("description_base_model_dir")
+    if description_model_kind == "qwen3_vl_lora" and description_adapter_path.is_dir():
         try:
-            from .description_model import DescriptionGenerator
-            description_generator = DescriptionGenerator(description_model_path)
+            if not selected_vlm_base:
+                raise ValueError("Укажите локальную папку базовой модели Qwen3-VL.")
+            from .vlm_description import VLMDescriptionGenerator
+            description_generator = VLMDescriptionGenerator(selected_vlm_base, description_adapter_path)
         except Exception as exc:
             description_model_warning = str(exc)
+    elif (model_path.with_name("description_best.pt")).is_file():
+        # Keep earlier model packages usable while all new training uses Qwen3-VL.
+        try:
+            from .description_model import DescriptionGenerator
+            description_generator = DescriptionGenerator(model_path.with_name("description_best.pt"))
+            description_model_kind = "legacy_character_decoder"
+        except Exception as exc:
+            description_model_warning = str(exc)
+    elif description_model_kind == "qwen3_vl_lora":
+        description_model_warning = f"Не найдена папка VLM-адаптера: {description_adapter_path}"
 
     records = discover_photos(photos_dir, use_ocr=True)
     records = enrich_core_column_depths(records)
@@ -146,6 +166,7 @@ def analyze_photos_to_excel(
                     "column_index": column_index,
                     "prediction_index": prediction_index,
                     "depth_basis": getattr(record, "depth_basis", "unknown"),
+                    "_interval_polygon": clipped,
                     })
             resolved_rows = []
             for column_index, (box, depth_top, depth_base) in enumerate(calibrated):
@@ -161,11 +182,14 @@ def analyze_photos_to_excel(
                     scale = (bottom - top) / (depth_base - depth_top)
                     y0 = max(0, int(np.floor(top + (row["facies_top"] - depth_top) * scale)))
                     y1 = min(height, int(np.ceil(top + (row["facies_base"] - depth_top) * scale)))
-                    crop = image[y0:y1, max(0, left):min(width, right)]
-                    if crop.size == 0:
+                    crop = _masked_description_crop(
+                        image, row.get("_interval_polygon"), box, y0, y1,
+                    )
+                    if crop is None:
                         problems.append(f"{record.path.name}: пустая вырезка интервала")
                         continue
-                    row["_interval_crop"] = _compact_description_crop(crop)
+                    row["_interval_crop"] = crop
+                    row.pop("_interval_polygon", None)
                     if not row["description"]:
                         row["description"] = row["facies_name"]
                     resolved_rows.append(row)
@@ -202,12 +226,14 @@ def analyze_photos_to_excel(
         "description_model_warning": description_model_warning,
         "generated_descriptions": generated_description_count,
         "fallback_descriptions": fallback_description_count,
+        "description_model_type": description_model_kind or None,
         "description_policy": (
-            "Краткое описание генерируется отдельной символьной моделью из вырезки интервала, "
-            "индекса фации и длины полного непрерывного интервала. Части, продолжающиеся на соседнем фото, "
-            "получают один и тот же текст; при низкой уверенности используется подтверждённый пример класса."
+            "Qwen3-VL creates draft visual text from an interval crop and verified metadata; YOLO owns "
+            "facies class and interval boundaries. Review generated text before geological use."
+            if description_generator is not None and description_model_kind == "qwen3_vl_lora"
+            else "Краткое описание создаётся устаревшим символьным декодером."
             if description_generator is not None
-            else "Текстовая модель отсутствует; используется подтверждённое описание класса из метаданных."
+            else "VLM отсутствует или не загрузилась; используется подтверждённое описание класса из метаданных."
         ),
         "output_excel": str(destination),
         "target_headers": {
@@ -254,12 +280,26 @@ def _apply_interval_descriptions(rows: list[dict], generator) -> tuple[int, int]
             )
             full_thickness = max(0.0, float(group[-1]["facies_base"]) - float(group[0]["facies_top"]))
             if crop is not None:
-                candidate, confidence = generator.generate_with_confidence(
-                    crop, facies=group[0].get("facies_index", ""),
-                    facies_name=group[0].get("facies_name", ""), interval_m=full_thickness,
-                )
-                if candidate and confidence >= 0.10:
-                    description = candidate
+                if hasattr(generator, "generate_with_confidence"):
+                    candidate, confidence = generator.generate_with_confidence(
+                        crop, facies=group[0].get("facies_index", ""),
+                        facies_name=group[0].get("facies_name", ""), interval_m=full_thickness,
+                    )
+                    accepted = bool(candidate) and confidence >= 0.10
+                else:
+                    candidate = generator.generate(
+                        crop,
+                        facies_index=str(group[0].get("facies_index", "")),
+                        facies_name=str(group[0].get("facies_name", "")),
+                        interval_top=float(group[0]["facies_top"]),
+                        interval_base=float(group[-1]["facies_base"]),
+                        interval_m=full_thickness,
+                        association=str(group[0].get("association", "")),
+                        environment=str(group[0].get("environment", "")),
+                    )
+                    accepted = bool(candidate)
+                if accepted:
+                    description = str(candidate).strip()
                     generated_rows += len(group)
         for row in group:
             row["description"] = description
@@ -275,6 +315,30 @@ def _compact_description_crop(image: np.ndarray, max_side: int = 256) -> np.ndar
         return image.copy()
     size = (max(1, round(width * scale)), max(1, round(height * scale)))
     return cv2.resize(image, size, interpolation=cv2.INTER_AREA)
+
+
+def _masked_description_crop(
+    image: np.ndarray,
+    polygon: np.ndarray,
+    box: tuple[int, int, int, int],
+    top: int,
+    bottom: int,
+) -> np.ndarray | None:
+    """Crop a YOLO interval and whiten everything outside its predicted mask."""
+    height, width = image.shape[:2]
+    left, _column_top, right, _column_bottom = box
+    x0, x1 = max(0, int(left)), min(width, int(right))
+    y0, y1 = max(0, int(top)), min(height, int(bottom))
+    crop = image[y0:y1, x0:x1].copy()
+    if crop.size == 0:
+        return None
+    points = np.asarray(polygon, dtype=np.float32)
+    if points.ndim == 2 and points.shape[0] >= 3 and points.shape[1] == 2:
+        local = np.rint(points - np.array([x0, y0], dtype=np.float32)).astype(np.int32)
+        mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+        cv2.fillPoly(mask, [local], 255)
+        crop[mask == 0] = 255
+    return _compact_description_crop(crop)
 
 
 def polygon_depth_interval(
