@@ -15,7 +15,10 @@ def run_self_test(destination: Path) -> dict:
     import pytesseract
     import torch
     import xlrd
+    import accelerate
     from PySide6.QtWidgets import QApplication
+    from peft import PeftModel
+    from transformers import AutoProcessor, Qwen3VLForConditionalGeneration, Trainer, TrainingArguments
     from ultralytics import YOLO
 
     from . import __version__
@@ -52,7 +55,7 @@ def run_self_test(destination: Path) -> dict:
         reopened.close()
     result = {"status": "ok", "version": __version__, "torch": torch.__version__,
               "cuda_build": torch.version.cuda, "ocr": ocr, "gui": "ok", "excel": "ok",
-              "visual_forward": "ok", "xlrd": xlrd.__version__}
+              "visual_forward": "ok", "vlm_runtime": "ok", "xlrd": xlrd.__version__}
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

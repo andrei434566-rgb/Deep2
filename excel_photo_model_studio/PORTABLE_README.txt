@@ -1,4 +1,4 @@
-Excel Photo Model Studio 0.7.2
+Excel Photo Model Studio 0.7.3
 ================================
 
 1. Скачайте все ZIP-части `part01`, `part02` и т. д. из релиза.

@@ -2,6 +2,11 @@ name: Build Excel Photo Model Studio for Windows
 
 on:
   workflow_dispatch:
+    inputs:
+      tests_only:
+        description: 'Only run the application tests; skip packaging'
+        type: boolean
+        default: false
   push:
     tags:
       - 'excel-photo-studio-v*'
@@ -54,13 +59,25 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
           PYTHONPATH: src
-        run: python -B -m unittest discover -s tests -v
+        run: |
+          $stdout = Join-Path $env:RUNNER_TEMP 'studio-tests-stdout.log'
+          $stderr = Join-Path $env:RUNNER_TEMP 'studio-tests-stderr.log'
+          $process = Start-Process -FilePath (Get-Command python).Source `
+            -ArgumentList @('-B', '-m', 'unittest', 'discover', '-s', 'tests', '-v') `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr `
+            -WindowStyle Hidden -Wait -PassThru
+          Get-Content -LiteralPath $stdout
+          Get-Content -LiteralPath $stderr
+          Write-Host "Unit test process exit code: $($process.ExitCode)"
+          if ($process.ExitCode -ne 0) { throw "Unit tests failed with exit code $($process.ExitCode)" }
 
       - name: Build portable application
+        if: github.event_name != 'workflow_dispatch' || inputs.tests_only != true
         working-directory: excel_photo_model_studio
         run: python -m PyInstaller --noconfirm --clean --distpath "${{ env.STUDIO_DIST }}" Excel_Photo_Model_Studio.spec
 
       - name: Verify packaged application
+        if: github.event_name != 'workflow_dispatch' || inputs.tests_only != true
         shell: pwsh
         working-directory: excel_photo_model_studio
         run: |
@@ -75,6 +92,7 @@ jobs:
           Write-Host "Verified $($cudaRuntime.Count) CUDA runtime DLL(s): $(($cudaRuntime | Select-Object -ExpandProperty Name -Unique) -join ', ')."
 
       - name: Run packaged application self-test
+        if: github.event_name != 'workflow_dispatch' || inputs.tests_only != true
         shell: pwsh
         working-directory: excel_photo_model_studio
         run: |
@@ -180,7 +198,7 @@ jobs:
           name: Excel Photo Model Studio ${{ github.ref_name }}
           generate_release_notes: true
           make_latest: true
-          body_path: excel_photo_model_studio/RELEASE_NOTES_0.7.2.md
+          body_path: excel_photo_model_studio/RELEASE_NOTES_0.7.3.md
           files: |
             excel_photo_model_studio/release/*.zip
             excel_photo_model_studio/release/SHA256SUMS.txt
