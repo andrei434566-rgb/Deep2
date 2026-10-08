@@ -36,7 +36,7 @@ class VLMDescriptionTests(unittest.TestCase):
             weights.touch()
 
             self.assertEqual(adapter.resolve(), normalize_adapter_path(weights))
-            self.assertEqual(base, validate_base_model_path(base))
+            self.assertEqual(base.resolve(), validate_base_model_path(base))
 
     def test_insufficient_reviewed_pairs_skip_vlm_without_importing_training_libraries(self):
         with tempfile.TemporaryDirectory() as directory:
