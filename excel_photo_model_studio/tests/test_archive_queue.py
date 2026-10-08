@@ -50,7 +50,7 @@ class ArchiveQueueTests(unittest.TestCase):
 
             result = discover_archive(tables, photos)
 
-            self.assertEqual(str(folder), result["entries"][0]["photos"])
+            self.assertEqual(str(folder.resolve()), result["entries"][0]["photos"])
 
     def test_shared_photo_folder_is_not_silently_assigned_to_multiple_excels(self):
         with tempfile.TemporaryDirectory() as directory:

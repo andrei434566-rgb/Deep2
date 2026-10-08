@@ -35,7 +35,7 @@ class VLMDescriptionTests(unittest.TestCase):
             weights = adapter / "adapter_model.safetensors"
             weights.touch()
 
-            self.assertEqual(adapter, normalize_adapter_path(weights))
+            self.assertEqual(adapter.resolve(), normalize_adapter_path(weights))
             self.assertEqual(base, validate_base_model_path(base))
 
     def test_insufficient_reviewed_pairs_skip_vlm_without_importing_training_libraries(self):

@@ -40,7 +40,12 @@ def _well_pair_key(value: str) -> str:
 
 
 def _path_key(value: str | Path) -> str:
-    return os.path.normcase(str(Path(value).expanduser().absolute()))
+    path = Path(value).expanduser()
+    try:
+        path = resolve_existing_path(path)
+    except OSError:
+        path = path.absolute()
+    return os.path.normcase(str(path))
 
 
 def _photo_groups(root: Path, images: list[Path]) -> dict[Path, list[Path]]:

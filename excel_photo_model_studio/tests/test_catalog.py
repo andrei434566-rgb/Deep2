@@ -87,7 +87,7 @@ class CatalogTests(unittest.TestCase):
 
             with patch.object(Path, "mkdir", new=deny_primary_cache_child):
                 cached_projects = load_confirmed_project_catalog(catalog)
-            self.assertEqual(project / "confirmed_wells", cached_projects[0].parent)
+            self.assertEqual((project / "confirmed_wells").resolve(), cached_projects[0].parent)
             cache_manifest_path = cached_projects[0] / "cache_manifest.json"
             initial_manifest = json.loads(cache_manifest_path.read_text(encoding="utf-8"))
             initial_manifest.pop("photo_names", None)  # Existing 0.6.8 caches have only the hashed path.
